@@ -12,6 +12,7 @@ import (
 	lnta "github.com/sm-me/lnta"
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
+	"github.com/sm-me/lnta/internal/sandbox"
 )
 
 var (
@@ -138,7 +139,10 @@ var undoCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		runID := args[0]
-		fmt.Printf("undo not yet implemented in this phase (run_id=%q)\n", runID)
+		if err := sandbox.RollbackRun(runID); err != nil {
+			return fmt.Errorf("undo %q: %w", runID, err)
+		}
+		fmt.Printf("undone run %q\n", runID)
 		return nil
 	},
 }
