@@ -10,11 +10,14 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +45,7 @@ type ToolDeps struct {
 	Pack     *packs.Pack   // active instruction pack (may be nil)
 	Approve  ApproveFunc   // mutate_system approval callback
 	CWD      string        // working directory for sandboxed commands
+	DryRun   bool          // when true, writes are diff-only previews and mutations are blocked
 }
 
 // ApproveFunc is consulted before executing a mutate_system command. It should
@@ -202,6 +206,29 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 		return "SCOPE_VIOLATION: active pack has no allowed_paths; writing is not permitted.", nil
 	}
 
+	// Dry-run mode: validate scope and show the proposed diff without
+	// persisting anything to disk.
+	if deps.DryRun {
+		diff, perr := previewScopedWrite(in.Path, []byte(in.Content), allowed)
+		if perr != nil {
+			var sve *sandbox.ScopeViolationError
+			if errors.As(perr, &sve) {
+				return fmt.Sprintf(
+					"SCOPE_VIOLATION: %s. Escalate to mutate_system (risk_level=high) to write outside allowed paths %v.",
+					sve.Error(), allowed), nil
+			}
+			return "", fmt.Errorf("write_scoped_file (dry-run): %w", perr)
+		}
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("[dry-run] would write %q (created=%v, mode=%o, size_old=%d, size_new=%d)\n",
+			diff.TargetPath, diff.Created, diff.Mode, diff.SizeOld, diff.SizeNew))
+		if diff.Diff != "" {
+			b.WriteString("--- proposed unified diff ---\n")
+			b.WriteString(diff.Diff)
+		}
+		return b.String(), nil
+	}
+
 	diff, err := sandbox.ScopedWriteFile(deps.RunID, in.Path, []byte(in.Content), allowed)
 	if err != nil {
 		var sve *sandbox.ScopeViolationError
@@ -237,6 +264,11 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	}
 	if in.CWD == "" {
 		in.CWD = deps.CWD
+	}
+
+	// Dry-run mode: block all host mutations.
+	if deps.DryRun {
+		return "[dry-run] mutate_system blocked: host mutations are not permitted in dry-run mode.", nil
 	}
 
 	if deps.Approve == nil || !deps.Approve(in.Command, in.CWD, in.RiskLevel, in.Reason) {
@@ -370,6 +402,229 @@ func stripDesktopFieldCodes(s string) string {
 		b.WriteByte(s[i])
 	}
 	return b.String()
+}
+
+// --- local dry-run preview helpers -----------------------------------------
+
+// previewScopedWrite validates targetPath against allowedGlobs and computes
+// the unified diff between existing and proposed content without persisting
+// anything to disk. It mirrors sandbox.ScopedWriteFile's scope checks but
+// performs no write, so it is safe to use in --dry-run mode.
+func previewScopedWrite(targetPath string, content []byte, allowedGlobs []string) (sandbox.FileDiff, error) {
+	var diff sandbox.FileDiff
+	diff.TargetPath = targetPath
+
+	resolved, err := previewResolveTarget(targetPath)
+	if err != nil {
+		return diff, err
+	}
+	if !previewPathAllowed(resolved, allowedGlobs) {
+		return diff, &sandbox.ScopeViolationError{
+			TargetPath:   targetPath,
+			Resolved:     resolved,
+			AllowedGlobs: allowedGlobs,
+		}
+	}
+
+	fi, statErr := os.Stat(resolved)
+	exists := statErr == nil
+	var oldContent []byte
+	var oldMode os.FileMode = 0o644
+
+	if exists {
+		if !fi.Mode().IsRegular() {
+			return diff, fmt.Errorf("target %q is not a regular file", resolved)
+		}
+		oldContent, err = os.ReadFile(resolved)
+		if err != nil {
+			return diff, err
+		}
+		oldMode = fi.Mode().Perm()
+		diff.OldMode = oldMode
+		sum := sha256.Sum256(oldContent)
+		diff.OldSHA256 = hex.EncodeToString(sum[:])
+		diff.SizeOld = int64(len(oldContent))
+	} else {
+		diff.Created = true
+	}
+
+	sum := sha256.Sum256(content)
+	diff.NewSHA256 = hex.EncodeToString(sum[:])
+	diff.SizeNew = int64(len(content))
+	diff.Diff = previewUnifiedDiff(resolved, resolved, oldContent, content)
+
+	newMode := oldMode
+	if !exists || newMode == 0 {
+		newMode = 0o644
+	}
+	diff.Mode = newMode
+	return diff, nil
+}
+
+// previewResolveTarget expands ~ and resolves symlinks on the parent directory.
+func previewResolveTarget(targetPath string) (string, error) {
+	p := previewExpandPath(targetPath)
+	p = filepath.Clean(p)
+	parent := filepath.Dir(p)
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", fmt.Errorf("resolve parent directory %q: %w", parent, err)
+	}
+	return filepath.Join(resolvedParent, filepath.Base(p)), nil
+}
+
+// previewExpandPath replaces a leading ~ with the HOME directory.
+func previewExpandPath(p string) string {
+	if strings.HasPrefix(p, "~") {
+		home := os.Getenv("HOME")
+		if home == "" {
+			if u, err := os.UserHomeDir(); err == nil {
+				home = u
+			}
+		}
+		if home != "" {
+			p = home + p[1:]
+		}
+	}
+	return p
+}
+
+// previewPathAllowed reports whether resolved matches at least one glob.
+func previewPathAllowed(resolved string, allowedGlobs []string) bool {
+	for _, g := range allowedGlobs {
+		matched, err := filepath.Match(g, resolved)
+		if err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+// previewSplitLines splits content into lines, dropping a trailing empty element.
+func previewSplitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	lines := strings.Split(s, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+// previewEdit is a single line operation produced by the local line diff.
+type previewEdit struct {
+	kind   rune
+	oldIdx int
+	newIdx int
+	line   string
+}
+
+// previewDiffLines computes an edit script transforming old into new (LCS DP).
+func previewDiffLines(old, new []string) []previewEdit {
+	m, n := len(old), len(new)
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			if old[i-1] == new[j-1] {
+				dp[i][j] = dp[i-1][j-1] + 1
+			} else if dp[i-1][j] >= dp[i][j-1] {
+				dp[i][j] = dp[i-1][j]
+			} else {
+				dp[i][j] = dp[i][j-1]
+			}
+		}
+	}
+	var rev []previewEdit
+	i, j := m, n
+	for i > 0 || j > 0 {
+		if i > 0 && j > 0 && old[i-1] == new[j-1] {
+			rev = append(rev, previewEdit{' ', i, j, old[i-1]})
+			i--
+			j--
+		} else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
+			rev = append(rev, previewEdit{'+', 0, j, new[j-1]})
+			j--
+		} else {
+			rev = append(rev, previewEdit{'-', i, 0, old[i-1]})
+			i--
+		}
+	}
+	for a, z := 0, len(rev)-1; a < z; a, z = a+1, z-1 {
+		rev[a], rev[z] = rev[z], rev[a]
+	}
+	return rev
+}
+
+// previewUnifiedDiff returns a standard unified diff comparing oldContent vs newContent.
+func previewUnifiedDiff(oldPath, newPath string, oldContent, newContent []byte) string {
+	oldLines := previewSplitLines(string(oldContent))
+	newLines := previewSplitLines(string(newContent))
+	ops := previewDiffLines(oldLines, newLines)
+
+	const context = 3
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("--- a/%s\n", oldPath))
+	b.WriteString(fmt.Sprintf("+++ b/%s\n", newPath))
+
+	n := len(ops)
+	i := 0
+	for i < n {
+		if ops[i].kind == ' ' {
+			i++
+			continue
+		}
+		runStart := i
+		for i < n && ops[i].kind != ' ' {
+			i++
+		}
+		runEnd := i
+		hStart := runStart - context
+		if hStart < 0 {
+			hStart = 0
+		}
+		hEnd := runEnd + context
+		if hEnd > n {
+			hEnd = n
+		}
+		hunk := ops[hStart:hEnd]
+		oldStart, oldCount := previewHunkRange(hunk, true)
+		newStart, newCount := previewHunkRange(hunk, false)
+		fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", oldStart, oldCount, newStart, newCount)
+		for _, e := range hunk {
+			b.WriteRune(e.kind)
+			b.WriteString(e.line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// previewHunkRange computes the starting line number and count for a hunk.
+func previewHunkRange(hunk []previewEdit, old bool) (start, count int) {
+	for _, e := range hunk {
+		if old && (e.kind == ' ' || e.kind == '-') {
+			if count == 0 {
+				start = e.oldIdx
+			}
+			count++
+		} else if !old && (e.kind == ' ' || e.kind == '+') {
+			if count == 0 {
+				start = e.newIdx
+			}
+			count++
+		}
+	}
+	if old && count == 0 {
+		start = 0
+	}
+	if !old && count == 0 {
+		start = 0
+	}
+	return start, count
 }
 
 // --- OpenAI tool definition conversion -------------------------------------

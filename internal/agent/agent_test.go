@@ -13,8 +13,12 @@ import (
 	"testing"
 
 	"github.com/sashabaranov/go-openai"
+	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
 )
+
+//go:embed testdata/dummy.md
+var embedFS embed.FS
 
 // --- mock LLM + stream ------------------------------------------------------
 
@@ -43,7 +47,7 @@ type mockLLM struct {
 	turn      int
 }
 
-func (m *mockLLM) ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (chatStream, error) {
+func (m *mockLLM) ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (ChatStream, error) {
 	m.mu.Lock()
 	turn := m.turn
 	m.turn++
@@ -87,6 +91,15 @@ func toolCallResponse(name, args string) openai.ChatCompletionStreamResponse {
 	}
 }
 
+// buildArgs marshals args to JSON string.
+func buildArgs(m map[string]any) string {
+	b, err := json.Marshal(m)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
 // --- tests ------------------------------------------------------------------
 
 // testDirUnderHome creates a throwaway directory under $HOME. Files under $HOME
@@ -120,9 +133,9 @@ func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
 	home, _ := os.UserHomeDir()
 
 	pack := packs.Pack{
-		ID:          "test-pack",
-		Name:        "Test Pack",
-		VerifyCmd:   `test -f "${target}"`,
+		ID:           "test-pack",
+		Name:         "Test Pack",
+		VerifyCmd:    `test -f "${target}"`,
 		AllowedPaths: []string{filepath.Join(dir, "*.desktop")},
 	}
 
@@ -216,7 +229,7 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "test-pack.md"), []byte(packFile), 0o644); err != nil {
 		t.Fatalf("write pack: %v", err)
 	}
-	router, err := packs.NewRouter(embed.FS{}, "*.md", dir)
+	router, err := packs.NewRouter(embedFS, "*.md", dir)
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
@@ -250,6 +263,81 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 	}
 	if llm.turnCount() < 2 {
 		t.Fatalf("expected the loop to continue to a second turn after failed verify, got %d turn(s)", llm.turnCount())
+	}
+}
+
+// TestOrchestratorValidDesktop tests the full orchestrator loop with a valid desktop scenario.
+func TestOrchestratorValidDesktop(t *testing.T) {
+	tmpDir := testDirUnderHome(t)
+
+	packFile := fmt.Sprintf(
+		"---\nid: linux-desktop-entries\nname: Eval Desktop\ntriggers:\n  - desktop\nallowed_paths:\n  - \"%s/*.desktop\"\nrequired_bins:\n  - desktop-file-validate\ncontext_cmd: true\nverify_cmd: desktop-file-validate \"${target}\"\n---\n# eval body\n",
+		tmpDir,
+	)
+	if err := os.WriteFile(filepath.Join(tmpDir, "pack.md"), []byte(packFile), 0o644); err != nil {
+		t.Fatalf("write pack: %v", err)
+	}
+	router, err := packs.NewRouter(embedFS, "*.md", tmpDir)
+	if err != nil {
+		t.Fatalf("new router: %v", err)
+	}
+	packs.SetDefaultRouter(router)
+
+	sys, err := fingerprint.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	selected, err := router.SelectPacks("create a desktop launcher", sys)
+	if err != nil {
+		t.Fatalf("select packs: %v", err)
+	}
+	t.Logf("Pre-selected pack: %s", selected[0].ID)
+
+	desktop := `[Desktop Entry]
+Name=Eval App
+Exec=/usr/bin/true
+Type=Application
+Categories=Utility;
+`
+	target := filepath.Join(tmpDir, "app.desktop")
+	responses := [][]openai.ChatCompletionStreamResponse{
+		{toolCallResponse("write_scoped_file", buildArgs(map[string]any{
+			"path": target, "content": desktop, "reason": "create valid desktop launcher", "mode": "0644",
+		}))},
+		{toolCallResponse("complete_task", buildArgs(map[string]any{
+			"summary": "created valid .desktop launcher", "target_artifacts": target,
+			"verification_notes": "native Exec check + desktop-file-validate passed",
+		}))},
+	}
+
+	mock := &mockLLM{
+		scenarios: responses,
+	}
+	opts := []Option{
+		WithRunID("eval-test"),
+		WithCWD(tmpDir),
+		WithApprove(func(_, _, _, _ string) bool { return false }),
+		WithMaxTurns(8),
+		WithDryRun(false),
+		WithConfig(&Config{Model: "test-model"}),
+	}
+	o := New(mock, router, opts...)
+
+	ctx, cancel := WithSignalCancellation()
+	defer cancel()
+
+	result, err := o.Run(ctx, "create a desktop launcher for my app")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	t.Logf("Result: %s", result)
+	t.Logf("Turns: %d", mock.turnCount())
+	
+	if !strings.Contains(result, "TASK_COMPLETE") {
+		t.Fatalf("expected TASK_COMPLETE in result, got %q", result)
+	}
+	if mock.turnCount() != 2 {
+		t.Fatalf("expected 2 turns, got %d", mock.turnCount())
 	}
 }
 

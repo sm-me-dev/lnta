@@ -5,21 +5,28 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 
 	lnta "github.com/sm-me/lnta"
+	"github.com/sm-me/lnta/internal/agent"
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me/lnta/internal/ui"
 )
 
 var (
 	userConfigDir string
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	labelStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
-	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	explainMode   bool
+	dryRunMode    bool
+
+	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	labelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
+	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 func main() {
@@ -34,10 +41,11 @@ var rootCmd = &cobra.Command{
 	Short: "LNTA — Linux Natural-Language Terminal Assistant",
 	Long: `LNTA grounds LLM actions in local system truth.
 
-Use "lnta <prompt>" to route a request to the matching instruction pack(s),
-gather ground-truth context, and show what would be done.
-
-Use "lnta chat" for an interactive session.`,
+Use "lnta <prompt>" for one-shot execution.
+Use "lnta --explain <prompt>" for Explain Mode (no state mutation possible).
+Use "lnta --dry-run <prompt>" to inspect proposed diffs without writing.
+Use "lnta chat" for an interactive multi-turn session.
+Use "lnta undo [run_id]" to revert a previous run.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return cmd.Help()
@@ -54,13 +62,17 @@ func init() {
 	userConfigDir = filepath.Join(home, ".config", "lnta")
 	rootCmd.PersistentFlags().StringVar(&userConfigDir, "config", userConfigDir,
 		"user config directory (default ~/.config/lnta)")
+	rootCmd.PersistentFlags().BoolVar(&explainMode, "explain", false,
+		"Explain Mode: disables write_scoped_file and mutate_system so no state can be mutated")
+	rootCmd.PersistentFlags().BoolVar(&dryRunMode, "dry-run", false,
+		"Dry-run mode: print proposed file diffs and commands, block all writes")
 
 	rootCmd.AddCommand(chatCmd)
 	rootCmd.AddCommand(undoCmd)
 	rootCmd.AddCommand(packsCmd)
 }
 
-// runPrompt routes a free-form prompt to instruction packs and prints results.
+// runPrompt runs one-shot execution mode through the agent orchestrator.
 func runPrompt(cmd *cobra.Command, args []string) error {
 	prompt := strings.Join(args, " ")
 
@@ -75,76 +87,172 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	}
 	packs.SetDefaultRouter(router)
 
-	selected, err := packs.SelectPacks(prompt, sys)
+	selected, err := router.SelectPacks(prompt, sys)
 	if err != nil {
 		return fmt.Errorf("route: %w", err)
 	}
+	pack := selected[0]
 
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("## System Context"))
-	b.WriteString("\n")
-	b.WriteString(sys.String())
-	b.WriteString("\n\n")
-	b.WriteString(labelStyle.Render(fmt.Sprintf("## Matched Pack (%d)", len(selected))))
-	b.WriteString("\n")
-	for _, p := range selected {
-		b.WriteString(fmt.Sprintf("- %s (%s)\n  source: %s\n", p.Name, p.ID, p.Source()))
-		if len(p.RequiredBins) > 0 {
-			b.WriteString(fmt.Sprintf("  required_bins: %v\n", p.RequiredBins))
-			missing := p.MissingBins(sys)
-			if len(missing) > 0 {
-				b.WriteString(fmt.Sprintf("  missing_bins: %v\n", missing))
-			}
-		}
-		if p.ContextCmd != "" {
-			b.WriteString(fmt.Sprintf("  context_cmd: %s\n", p.ContextCmd))
-		}
-		if p.VerifyCmd != "" {
-			b.WriteString(fmt.Sprintf("  verify_cmd: %s\n", p.VerifyCmd))
-		}
+	// Compact status line at the start of execution.
+	fmt.Println(ui.StatusLine(pack.ID, "Planning", "", false))
+	fmt.Println()
+
+	// Build the orchestrator backed by a real LLM client.
+	cfg, err := agent.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
-	b.WriteString("\n")
-	b.WriteString(bodyOf(selected...))
-	b.WriteString(mutedStyle.Render("\n---\nLNTA Phase 1 scaffold: no system mutation was performed."))
+	client, err := agent.NewOpenAIClient(cfg)
+	if err != nil {
+		return fmt.Errorf("llm client: %w", err)
+	}
 
-	fmt.Print(b.String())
+	opts := []agent.Option{
+		agent.WithRunID(nextRunID()),
+		agent.WithCWD("."),
+		agent.WithApprove(defaultApprove),
+		agent.WithConfig(cfg),
+		agent.WithDryRun(dryRunMode),
+	}
+	if explainMode {
+		// Explain Mode: physically remove write_scoped_file and mutate_system so
+		// the model cannot mutate state at the harness level.
+		opts = append(opts, agent.WithAllowedTools([]string{"inspect_system", "complete_task"}))
+	}
+
+	o := agent.New(client, router, opts...)
+
+	ctx, cancel := agent.WithSignalCancellation()
+	defer cancel()
+
+	result, err := o.Run(ctx, prompt)
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+
+	fmt.Println(renderResult(result, o.RunID(), pack))
 	return nil
 }
 
-// bodyOf joins the markdown bodies of the given packs.
-func bodyOf(ps ...packs.Pack) string {
+// nextRunID returns a deterministic run identifier for this invocation.
+func nextRunID() string {
+	return "run-" + time.Now().UTC().Format("20060102T150405")
+}
+
+// renderResult renders the orchestrator outcome and a Verification Receipt.
+func renderResult(result string, runID string, pack packs.Pack) string {
 	var b strings.Builder
-	for i, p := range ps {
-		if i > 0 {
-			b.WriteString("\n---\n\n")
+
+	status := ui.ReceiptFailed
+	changedPaths := []string{}
+	var results []ui.VerificationResult
+
+	if strings.Contains(result, "TASK_COMPLETE") {
+		status = ui.ReceiptCompleted
+		for _, line := range strings.Split(result, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "verified_targets:") {
+				targets := strings.TrimSpace(strings.TrimPrefix(line, "verified_targets:"))
+				if targets != "" {
+					changedPaths = strings.Split(targets, ",")
+					for i := range changedPaths {
+						changedPaths[i] = strings.TrimSpace(changedPaths[i])
+					}
+				}
+			}
 		}
-		b.WriteString(p.Body)
+		results = append(results, ui.VerificationResult{
+			Command:  pack.VerifyCmd,
+			ExitCode: 0,
+			Output:   "verification gate passed",
+		})
+	} else if strings.Contains(result, "HARNESS_VERIFICATION_FAILED") {
+		status = ui.ReceiptFailed
+		results = append(results, ui.VerificationResult{
+			Command:  pack.VerifyCmd,
+			ExitCode: 1,
+			Output:   "verification gate failed",
+		})
 	}
+
+	b.WriteString(titleStyle.Render("## Result"))
+	b.WriteString("\n")
+	b.WriteString(result)
+	b.WriteString("\n\n")
+	b.WriteString(ui.VerificationReceipt(status, runID, changedPaths, results))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render("Hint: Run 'lnta undo <run_id>' to revert a previous run."))
 	return b.String()
+}
+
+// defaultApprove is the mutate_system approval callback for the CLI. It renders
+// a high-visibility huh.Confirm prompt showing the exact command, cwd, and risk
+// level, and only returns true when the user explicitly confirms. On cancel or
+// non-interactive input it denies the mutation.
+func defaultApprove(command, cwd, riskLevel, reason string) bool {
+	confirmed := false
+	confirm := huh.NewConfirm().
+		Title(fmt.Sprintf("mutate_system (%s risk)", riskLevel)).
+		Description(fmt.Sprintf(
+			"command: %s\ncwd: %s\nreason: %s",
+			command, cwd, reason,
+		)).
+		Value(&confirmed)
+	if err := confirm.Run(); err != nil {
+		return false
+	}
+	return confirmed
 }
 
 var chatCmd = &cobra.Command{
 	Use:   "chat",
 	Short: "Start an interactive chat session",
+	Long:  "Start an interactive multi-turn chat session preserving conversation history and active Run ID snapshots.",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println("interactive chat not yet implemented in this phase")
-		fmt.Println("Use: lnta <your prompt>")
-		return nil
+		return runChat()
 	},
 }
 
 var undoCmd = &cobra.Command{
-	Use:   "undo <run_id>",
-	Short: "Undo a previous run by run id",
-	Args:  cobra.ExactArgs(1),
+	Use:   "undo [run_id]",
+	Short: "Undo a previous run by run id (defaults to the most recent run)",
+	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		runID := args[0]
+		runID := ""
+		if len(args) == 1 {
+			runID = args[0]
+		} else {
+			runID = latestRunID()
+			if runID == "" {
+				return fmt.Errorf("no run snapshots found; specify a run_id: lnta undo <run_id>")
+			}
+			fmt.Printf("No run_id specified; reverting most recent run %q\n", runID)
+		}
 		if err := sandbox.RollbackRun(runID); err != nil {
 			return fmt.Errorf("undo %q: %w", runID, err)
 		}
 		fmt.Printf("undone run %q\n", runID)
 		return nil
 	},
+}
+
+// latestRunID returns the most recent run snapshot directory name, or "".
+func latestRunID() string {
+	root := snapshotRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	var latest string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if e.Name() > latest {
+			latest = e.Name()
+		}
+	}
+	return latest
 }
 
 var packsCmd = &cobra.Command{
@@ -169,4 +277,98 @@ var packsListCmd = &cobra.Command{
 
 func init() {
 	packsCmd.AddCommand(packsListCmd)
+}
+
+// snapshotRoot mirrors sandbox.snapshotRoot (unexported) so the CLI can list runs.
+func snapshotRoot() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(".local", "share", "lnta", "snapshots")
+	}
+	return filepath.Join(home, ".local", "share", "lnta", "snapshots")
+}
+
+// runChat starts an interactive multi-turn REPL.
+func runChat() error {
+	fmt.Println("LNTA interactive chat. Type your prompt, or 'exit'/'quit' to leave.")
+	fmt.Println("Commands: /undo <run_id> | /packs | /exit")
+	fmt.Println()
+	for {
+		fmt.Print("lnta> ")
+		var input string
+		if _, err := fmt.Scanln(&input); err != nil {
+			fmt.Println()
+			return nil
+		}
+		input = strings.TrimSpace(input)
+		if input == "" {
+			continue
+		}
+		if input == "/exit" || input == "exit" || input == "quit" {
+			fmt.Println("goodbye.")
+			return nil
+		}
+		if input == "/packs" {
+			router, _ := packs.NewRouter(lnta.EmbeddedPacks, "packs/*.md", userConfigDir)
+			for _, p := range router.AllPacks() {
+				fmt.Printf("  %-32s %s\n", p.ID, p.Name)
+			}
+			continue
+		}
+		if strings.HasPrefix(input, "/undo ") {
+			runID := strings.TrimSpace(strings.TrimPrefix(input, "/undo"))
+			if err := sandbox.RollbackRun(runID); err != nil {
+				fmt.Printf("undo failed: %v\n", err)
+			} else {
+				fmt.Printf("undone run %q\n", runID)
+			}
+			continue
+		}
+		if err := runPromptArgs(input); err != nil {
+			fmt.Printf("error: %v\n", err)
+		}
+		fmt.Println()
+	}
+}
+
+// runPromptArgs runs a single prompt within the chat session.
+func runPromptArgs(prompt string) error {
+	sys, err := fingerprint.Fingerprint()
+	if err != nil {
+		return fmt.Errorf("fingerprint: %w", err)
+	}
+	router, err := packs.NewRouter(lnta.EmbeddedPacks, "packs/*.md", userConfigDir)
+	if err != nil {
+		return fmt.Errorf("load packs: %w", err)
+	}
+	packs.SetDefaultRouter(router)
+	selected, err := router.SelectPacks(prompt, sys)
+	if err != nil {
+		return fmt.Errorf("route: %w", err)
+	}
+	pack := selected[0]
+	fmt.Println(ui.StatusLine(pack.ID, "Running", "", false))
+	cfg, err := agent.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	client, err := agent.NewOpenAIClient(cfg)
+	if err != nil {
+		return fmt.Errorf("llm client: %w", err)
+	}
+	o := agent.New(client, router,
+		agent.WithRunID(nextRunID()),
+		agent.WithCWD("."),
+		agent.WithApprove(defaultApprove),
+		agent.WithConfig(cfg),
+		agent.WithDryRun(dryRunMode),
+	)
+	ctx, cancel := agent.WithSignalCancellation()
+	defer cancel()
+	result, err := o.Run(ctx, prompt)
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+	fmt.Println(renderResult(result, o.RunID(), pack))
+	return nil
 }

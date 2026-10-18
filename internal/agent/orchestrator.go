@@ -26,13 +26,14 @@ type LLMClient interface {
 	// ChatCompletionStream streams a chat completion. It returns a stream
 	// reader and an error. The caller drains the stream via Recv() until
 	// io.EOF, then closes it.
-	ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (chatStream, error)
+	ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (ChatStream, error)
 }
 
-// chatStream is the small subset of *openai.ChatCompletionStream needed by the
-// orchestrator. It is an interface (rather than the concrete type) so tests can
-// provide a fake stream; the real *openai.ChatCompletionStream satisfies it.
-type chatStream interface {
+// ChatStream is the small subset of *openai.ChatCompletionStream needed by the
+// orchestrator. It is an interface (rather than the concrete type) so tests and
+// external callers can provide a fake stream; the real *openai.ChatCompletionStream
+// satisfies it.
+type ChatStream interface {
 	Recv() (openai.ChatCompletionStreamResponse, error)
 	Close() error
 }
@@ -42,7 +43,7 @@ type openaiClient struct {
 	client *openai.Client
 }
 
-func (c *openaiClient) ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (chatStream, error) {
+func (c *openaiClient) ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (ChatStream, error) {
 	return c.client.CreateChatCompletionStream(ctx, req)
 }
 
@@ -57,6 +58,7 @@ type Orchestrator struct {
 	cwd      string
 	approve  ApproveFunc
 	maxTurns int
+	dryRun   bool
 
 	sysCtx fingerprint.SystemContext
 }
@@ -87,6 +89,45 @@ func WithMaxTurns(n int) Option {
 // WithConfig sets the LLM config (model, temperature, ...).
 func WithConfig(cfg *Config) Option {
 	return func(o *Orchestrator) { o.config = cfg }
+}
+
+// RunID returns the active run identifier.
+func (o *Orchestrator) RunID() string {
+	return o.runID
+}
+
+// NewOpenAIClient builds an LLMClient backed by sashabaranov/go-openai using the
+// given config. It supports any OpenAI-compatible endpoint (OpenAI, OpenRouter,
+// Ollama, Anthropic proxy, Gemini).
+func NewOpenAIClient(cfg *Config) (LLMClient, error) {
+	cliCfg := openai.DefaultConfig(cfg.APIKey)
+	cliCfg.BaseURL = cfg.BaseURL
+	client := openai.NewClientWithConfig(cliCfg)
+	return &openaiClient{client: client}, nil
+}
+
+// WithDryRun enables dry-run mode: file writes become diff-only previews and
+// host mutations are blocked.
+func WithDryRun(dry bool) Option {
+	return func(o *Orchestrator) { o.dryRun = dry }
+}
+
+// WithAllowedTools restricts the registered tools to the given names (used by
+// --explain mode, which removes write_scoped_file and mutate_system).
+func WithAllowedTools(names []string) Option {
+	return func(o *Orchestrator) {
+		allowed := make(map[string]bool, len(names))
+		for _, n := range names {
+			allowed[n] = true
+		}
+		filtered := make(map[string]Tool)
+		for _, t := range toolByName(CoreTools()) {
+			if allowed[t.Name] {
+				filtered[t.Name] = t
+			}
+		}
+		o.tools = filtered
+	}
 }
 
 // New constructs an Orchestrator with the four core tools registered.
@@ -277,6 +318,7 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				Pack:    &pack,
 				Approve: o.approve,
 				CWD:     o.cwd,
+				DryRun:  o.dryRun,
 			}
 			result, err := tool.Func(ctx, []byte(p.args), deps)
 			if err != nil {

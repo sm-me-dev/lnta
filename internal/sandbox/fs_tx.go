@@ -397,6 +397,64 @@ func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlo
 	return diff, nil
 }
 
+// PreviewScopedWrite validates the target against allowedGlobs and computes the
+// unified diff between the existing content and the proposed content, without
+// writing anything to disk. It is used by the --dry-run CLI mode to show what
+// would be written without persisting any change. A non-existent target is
+// reported with Created: true.
+func PreviewScopedWrite(targetPath string, content []byte, allowedGlobs []string) (FileDiff, error) {
+	var diff FileDiff
+	diff.TargetPath = targetPath
+
+	resolved, err := resolveTarget(targetPath)
+	if err != nil {
+		return diff, err
+	}
+
+	if !pathAllowed(resolved, allowedGlobs) {
+		return diff, &ScopeViolationError{
+			TargetPath:   targetPath,
+			Resolved:     resolved,
+			AllowedGlobs: allowedGlobs,
+		}
+	}
+
+	fi, statErr := os.Stat(resolved)
+	exists := statErr == nil
+	var oldContent []byte
+	var oldMode os.FileMode = 0o644
+
+	if exists {
+		if !fi.Mode().IsRegular() {
+			return diff, fmt.Errorf("target %q is not a regular file", resolved)
+		}
+		oldContent, err = os.ReadFile(resolved)
+		if err != nil {
+			return diff, err
+		}
+		oldMode = fi.Mode().Perm()
+		diff.OldMode = oldMode
+		sum := sha256.Sum256(oldContent)
+		diff.OldSHA256 = hex.EncodeToString(sum[:])
+		diff.SizeOld = int64(len(oldContent))
+	} else {
+		diff.Created = true
+	}
+
+	sum := sha256.Sum256(content)
+	diff.NewSHA256 = hex.EncodeToString(sum[:])
+	diff.SizeNew = int64(len(content))
+	diff.Diff = unifiedDiff(resolved, resolved, oldContent, content)
+
+	// Mode reporting only; no write occurs.
+	newMode := oldMode
+	if !exists || newMode == 0 {
+		newMode = 0o644
+	}
+	diff.Mode = newMode
+	return diff, nil
+}
+
 // RollbackRun restores every modified file from its backup blob and deletes
 // every file recorded as created, using the manifest at
 // ~/.local/share/lnta/snapshots/<run_id>/manifest.json. Entries are processed
