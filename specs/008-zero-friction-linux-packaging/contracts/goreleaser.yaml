@@ -1,0 +1,90 @@
+# GoReleaser Configuration Contract
+# This defines the expected structure and behavior of .goreleaser.yaml
+
+## Build Contract
+
+### Matrix
+- **GOOS**: `linux` (only)
+- **GOARCH**: `amd64`, `arm64`
+- **CGO_ENABLED**: `0` (static binaries)
+- **ldflags**: `-s -w -X github.com/sm-me/lnta.Version={{.Version}} -X github.com/sm-me/lnta.Commit={{.Commit}} -X github.com/sm-me/lnta.Date={{.Date}}`
+- **flags**: `-trimpath`
+
+### Output
+- Binary name: `lnta`
+- Main package: `./cmd/lnta`
+- Stripped symbols: Yes (DWARF + symbol table removed)
+- Reproducible builds: Yes (`-trimpath`)
+
+---
+
+## Packaging Contract (nfpm)
+
+### Common to All Formats
+| Field | Value |
+|-------|-------|
+| `package_name` | `lnta` |
+| `bindir` | `/usr/bin` |
+| `maintainer` | `LNTA Maintainers <maintainers@lnta.dev>` |
+| `description` | `Linux Natural-Language Terminal Assistant` |
+| `license` | `MIT` |
+| `recommends` | `["bubblewrap", "desktop-file-validate"]` |
+
+### Format-Specific
+
+#### DEB (`nfpms[0]`)
+- **format**: `deb`
+- **scripts**:
+  - `postinstall`: Loads AppArmor profile
+  - `preremove`: Unloads AppArmor profile
+  - `postremove`: Removes profile file
+- **contents**:
+  - `scripts/apparmor-profile` → `/etc/apparmor.d/lnta` (type: config, packager: deb)
+
+#### RPM (`nfpms[1]`)
+- **format**: `rpm`
+- **scripts**: None (AppArmor handled by distro)
+- **contents**: None
+
+#### Arch Linux (`nfpms[2]`)
+- **format**: `archlinux`
+- **scripts**: None
+- **contents**: None
+
+---
+
+## Archive Contract
+
+- **format**: `tar.gz`
+- **name_template**: `{{.ProjectName}}_{{.Version}}_{{.Os}}_{{.Arch}}`
+- **files**: `LICENSE*`, `README.md`
+- **builds**: All (both arches)
+
+---
+
+## Checksum Contract
+
+- **algorithm**: `sha256`
+- **name_template**: `checksums.txt`
+- **Format**: One line per artifact: `<sha256>  <filename>`
+
+---
+
+## Release Contract
+
+- **GitHub owner**: `sm-me`
+- **GitHub repo**: `lnta`
+- **draft**: `false`
+- **prerelease**: `auto` (based on version pre-release suffix)
+- **name_template**: `v{{.Version}}`
+
+---
+
+## Validation Rules
+
+1. **Build matrix**: Exactly 2 builds (linux/amd64, linux/arm64)
+2. **Package matrix**: Exactly 3 nfpm configs (deb, rpm, archlinux)
+3. **Archive**: 2 archives (one per arch)
+4. **Checksums**: 8+ entries (2 deb + 2 rpm + 2 archlinux + 2 tar.gz)
+5. **Version embedding**: Binary must report version via `lnta --version`
+6. **AppArmor**: Only in .deb; scripts must use `|| true` for graceful degradation

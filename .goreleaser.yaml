@@ -1,0 +1,99 @@
+# .goreleaser.yaml
+# GoReleaser v2 configuration for LNTA zero-friction Linux packaging
+# See: https://goreleaser.com/customization/
+project_name: lnta
+version: 2
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+builds:
+  - id: lnta
+    main: ./cmd/lnta
+    binary: lnta
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/sm-me/lnta.Version={{.Version}}
+      - -X github.com/sm-me/lnta.Commit={{.Commit}}
+      - -X github.com/sm-me/lnta.Date={{.Date}}
+    flags:
+      - -trimpath
+nfpms:
+  - id: deb
+    package_name: lnta
+    formats:
+      - deb
+    bindir: /usr/bin
+    maintainer: "LNTA Maintainers <maintainers@lnta.dev>"
+    description: "Linux Natural-Language Terminal Assistant"
+    license: "MIT"
+    recommends:
+      - bubblewrap
+      - desktop-file-validate
+    scripts:
+      postinstall: |
+        #!/bin/sh
+        if command -v apparmor_parser >/dev/null 2>&1; then
+          apparmor_parser -r /etc/apparmor.d/lnta || true
+        fi
+      preremove: |
+        #!/bin/sh
+        if command -v apparmor_parser >/dev/null 2>&1; then
+          apparmor_parser -R /etc/apparmor.d/lnta || true
+        fi
+      postremove: |
+        #!/bin/sh
+        rm -f /etc/apparmor.d/lnta
+    contents:
+      - src: scripts/apparmor-profile
+        dst: /etc/apparmor.d/lnta
+        type: config
+        packager: deb
+  - id: rpm
+    package_name: lnta
+    formats:
+      - rpm
+    bindir: /usr/bin
+    maintainer: "LNTA Maintainers <maintainers@lnta.dev>"
+    description: "Linux Natural-Language Terminal Assistant"
+    license: "MIT"
+    recommends:
+      - bubblewrap
+      - desktop-file-validate
+  - id: archlinux
+    package_name: lnta
+    formats:
+      - archlinux
+    bindir: /usr/bin
+    maintainer: "LNTA Maintainers <maintainers@lnta.dev>"
+    description: "Linux Natural-Language Terminal Assistant"
+    license: "MIT"
+    recommends:
+      - bubblewrap
+      - desktop-file-validate
+archives:
+  - id: binary
+    builds:
+      - lnta
+    format: tar.gz
+    name_template: "{{.ProjectName}}_{{.Version}}_{{.Os}}_{{.Arch}}"
+    files:
+      - LICENSE*
+      - README.md
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+release:
+  github:
+    owner: sm-me
+    name: lnta
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"

@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.27"
+
+jobs:
+  # Go vet - static analysis
+  vet:
+    name: go vet
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run go vet
+        run: go vet ./...
+
+  # golangci-lint - comprehensive linting
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  # Pack validation - ensure all instruction packs are valid
+  packs-validate:
+    name: lnta packs validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build lnta
+        run: go build -o lnta ./cmd/lnta
+
+      - name: Validate packs (strict mode)
+        run: ./lnta packs validate --strict
+
+  # Race detector tests - catch data races
+  test-race:
+    name: go test -race
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install bubblewrap (required for sandbox tests)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Run tests with race detector
+        run: go test -race -v ./...
+
+  # Build verification - ensure release build works
+  build:
+    name: Build verification
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build release binary
+        run: |
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o lnta ./cmd/lnta
+          ./lnta --version
+
+      - name: Verify binary size
+        run: |
+          SIZE=$(stat -c%s lnta)
+          echo "Binary size: $SIZE bytes"
+          if [ $SIZE -gt 15000000 ]; then
+            echo "Binary exceeds 15MB limit"
+            exit 1
+          fi
+          echo "Binary size OK (< 15MB)"
+
+  # Summary job - ensure all checks pass
+  summary:
+    name: Summary
+    runs-on: ubuntu-24.04
+    needs: [vet, lint, packs-validate, test-race, build]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [ "${{ needs.vet.result }}" != "success" ] || \
+             [ "${{ needs.lint.result }}" != "success" ] || \
+             [ "${{ needs.packs-validate.result }}" != "success" ] || \
+             [ "${{ needs.test-race.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ]; then
+            echo "Some CI jobs failed"
+            exit 1
+          fi
+          echo "All CI checks passed!"
