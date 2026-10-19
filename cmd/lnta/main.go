@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	lnta "github.com/sm-me/lnta"
 	"github.com/sm-me/lnta/internal/agent"
 	"github.com/sm-me/lnta/internal/fingerprint"
+	"github.com/sm-me/lnta/internal/mcp"
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
 	"github.com/sm-me/lnta/internal/shell"
@@ -87,8 +89,91 @@ var packsListCmd = &cobra.Command{
 	},
 }
 
+var packsValidateCmd = &cobra.Command{
+	Use:   "validate [path]",
+	Short: "Validate instruction pack syntax and structure",
+	Long: `Validate instruction pack files for correct frontmatter, glob patterns,
+required binaries, and executable context_cmd/verify_cmd commands.
+
+If PATH is not provided, validates embedded packs.
+If PATH is a directory, validates all *.md files in it.
+If PATH is a file, validates that specific pack.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		config := packs.DefaultValidatorConfig()
+		config.CheckBinaries, _ = cmd.Flags().GetBool("check-binaries")
+		config.RunContextCmd, _ = cmd.Flags().GetBool("run-context-cmd")
+		config.StrictMode, _ = cmd.Flags().GetBool("strict")
+
+		var results []packs.ValidationResult
+		var err error
+
+		if len(args) == 0 {
+			// Validate embedded packs
+			results, err = packs.ValidateEmbeddedPacks(lnta.EmbeddedPacks, "packs/*.md", config)
+			if err != nil {
+				return fmt.Errorf("validate embedded packs: %w", err)
+			}
+		} else {
+			path := args[0]
+			info, err := os.Stat(path)
+			if err != nil {
+				return fmt.Errorf("stat %s: %w", path, err)
+			}
+			if info.IsDir() {
+				results, err = packs.ValidateDirectory(path, config)
+				if err != nil {
+					return fmt.Errorf("validate directory: %w", err)
+				}
+			} else {
+				result, err := packs.ValidatePack(path, config)
+				if err != nil {
+					return fmt.Errorf("validate pack: %w", err)
+				}
+				results = []packs.ValidationResult{result}
+			}
+		}
+
+		jsonOutput, _ := cmd.Flags().GetBool("json")
+		if jsonOutput {
+			output, err := packs.FormatValidationResultsJSON(results)
+			if err != nil {
+				return fmt.Errorf("format JSON: %w", err)
+			}
+			fmt.Println(output)
+		} else {
+			fmt.Print(packs.FormatValidationResults(results, config))
+		}
+
+		// Exit with error code if any pack is invalid
+		hasInvalid := false
+		for _, r := range results {
+			if !r.Valid {
+				hasInvalid = true
+				break
+			}
+		}
+		if hasInvalid {
+			if config.StrictMode {
+				os.Exit(1)
+			}
+			return fmt.Errorf("one or more packs failed validation")
+		}
+
+		return nil
+	},
+}
+
 func init() {
 	packsCmd.AddCommand(packsListCmd)
+	packsCmd.AddCommand(packsValidateCmd)
+}
+
+func init() {
+	packsValidateCmd.Flags().Bool("check-binaries", true, "Check if required_bins exist in PATH")
+	packsValidateCmd.Flags().Bool("run-context-cmd", false, "Execute context_cmd in sandbox to validate (requires bwrap/Landlock)")
+	packsValidateCmd.Flags().Bool("strict", false, "Treat warnings as errors and exit with non-zero code on validation failure")
+	packsValidateCmd.Flags().Bool("json", false, "Output results as JSON")
 }
 
 var doctorCmd = &cobra.Command{
@@ -167,6 +252,35 @@ var fixCmd = &cobra.Command{
 	},
 }
 
+var mcpCmd = &cobra.Command{
+	Use:   "mcp",
+	Short: "Run the MCP server (JSON-RPC 2.0 over stdio)",
+	Long: `Start the Model Context Protocol (MCP) server over stdio.
+This allows LNTA to be used as an MCP backend for tools like Claude Code, Cursor, or OpenCode.
+
+The server exposes these tools:
+- lnta_inspect_sandboxed: Execute read-only commands in a sandbox
+- lnta_get_pack_runbook: Get an instruction pack by ID
+- lnta_verify_task: Run a pack's verify_cmd with a target`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		server, err := mcp.NewServer(userConfigDir, lnta.EmbeddedPacks)
+		if err != nil {
+			return fmt.Errorf("create MCP server: %w", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Handle signals
+		sigCtx, sigCancel := signal.NotifyContext(ctx, os.Interrupt)
+		defer sigCancel()
+
+		return server.Run(sigCtx)
+	},
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
 func main() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -215,6 +329,7 @@ func init() {
 	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(fixCmd)
+	rootCmd.AddCommand(mcpCmd)
 
 	// Hidden command for Landlock sandbox self-re-exec
 	rootCmd.AddCommand(sandboxExecCmd)

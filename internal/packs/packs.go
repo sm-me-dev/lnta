@@ -177,6 +177,12 @@ func parsePack(source string, data []byte) (*Pack, error) {
 	return p, nil
 }
 
+// ParsePackForTest is a test helper that parses a pack without requiring embed.FS.
+// It's exported so other packages can use it in tests.
+func ParsePackForTest(source string, data []byte) (*Pack, error) {
+	return parsePack(source, data)
+}
+
 // expandPath replaces a leading ~ with the HOME directory.
 func expandPath(p string) string {
 	if strings.HasPrefix(p, "~") {
