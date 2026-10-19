@@ -44,8 +44,8 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.64.8
-          args: --timeout=5m --go=1.27
+          version: latest
+          args: --timeout=5m
 
   # Pack validation - ensure all instruction packs are valid
   packs-validate:
@@ -124,6 +124,9 @@ jobs:
           }
           EOF
           sudo apparmor_parser -r /etc/apparmor.d/bwrap || true
+          # Verify profile is loaded
+          sudo apparmor_status | grep bwrap || echo "Profile not loaded, checking..."
+          sudo cat /etc/apparmor.d/bwrap
 
       - name: Run tests with race detector
         run: go test -race -v ./...
