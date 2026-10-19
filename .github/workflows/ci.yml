@@ -44,8 +44,8 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
-          args: --timeout=5m
+          version: v1.64.8
+          args: --timeout=5m --go=1.27
 
   # Pack validation - ensure all instruction packs are valid
   packs-validate:
@@ -87,13 +87,13 @@ jobs:
       - name: Install AppArmor profile for bwrap (fixes uid map permission denied on Ubuntu 24.04+)
         run: |
           sudo mkdir -p /etc/apparmor.d
-          sudo tee /etc/apparmor.d/lnta-bwrap > /dev/null <<'EOF'
-          # LNTA bwrap AppArmor Profile
+          sudo tee /etc/apparmor.d/bwrap > /dev/null <<'EOF'
+          # bwrap AppArmor Profile
           # Allows unprivileged user namespaces for bubblewrap sandboxing
           abi <abi/4.0>,
           include <tunables/global>
 
-          profile lnta-bwrap flags=(unconfined) {
+          profile bwrap flags=(unconfined) {
             userns,
 
             # Read-only system mounts
@@ -120,10 +120,10 @@ jobs:
             @{HOME}/.config/lnta/** r,
 
             # Site-specific additions
-            include if exists <local/lnta-bwrap>
+            include if exists <local/bwrap>
           }
           EOF
-          sudo apparmor_parser -r /etc/apparmor.d/lnta-bwrap || true
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap || true
 
       - name: Run tests with race detector
         run: go test -race -v ./...
@@ -144,8 +144,7 @@ jobs:
 
       - name: Build release binary
         run: |
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o lnta ./cmd/lnta
-          ./lnta --version
+          CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/sm-me/lnta.Version=${{ env.GO_VERSION }}" -o lnta ./cmd/lnta
 
       - name: Verify binary size
         run: |

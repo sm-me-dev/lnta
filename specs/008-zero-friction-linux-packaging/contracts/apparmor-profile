@@ -1,13 +1,13 @@
-# LNTA AppArmor Profile
+# bwrap AppArmor Profile
 # Purpose: Allow unprivileged user namespaces for bubblewrap sandboxing
-# Install: /etc/apparmor.d/lnta
-# Load:  apparmor_parser -r /etc/apparmor.d/lnta
-# Remove: apparmor_parser -R /etc/apparmor.d/lnta
+# Install: /etc/apparmor.d/bwrap
+# Load:  apparmor_parser -r /etc/apparmor.d/bwrap
+# Remove: apparmor_parser -R /etc/apparmor.d/bwrap
 
 abi <abi/4.0>,
 include <tunables/global>
 
-profile lnta-bwrap flags=(unconfined) {
+profile bwrap flags=(unconfined) {
   userns,
 
   # Read-only system mounts
@@ -34,5 +34,5 @@ profile lnta-bwrap flags=(unconfined) {
   @{HOME}/.config/lnta/** r,
 
   # Site-specific additions
-  include if exists <local/lnta-bwrap>
+  include if exists <local/bwrap>
 }

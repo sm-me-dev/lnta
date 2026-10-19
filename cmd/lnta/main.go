@@ -323,6 +323,9 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&commandOnly, "command-only", false,
 		"Output only the verified command (for shell widgets)")
 
+	rootCmd.Version = lnta.Version
+	rootCmd.SetVersionTemplate("LNTA version {{.Version}}\n")
+
 	rootCmd.AddCommand(chatCmd)
 	rootCmd.AddCommand(undoCmd)
 	rootCmd.AddCommand(packsCmd)

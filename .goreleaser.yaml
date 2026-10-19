@@ -41,19 +41,19 @@ nfpms:
       postinstall: |
         #!/bin/sh
         if command -v apparmor_parser >/dev/null 2>&1; then
-          apparmor_parser -r /etc/apparmor.d/lnta || true
+          apparmor_parser -r /etc/apparmor.d/bwrap || true
         fi
       preremove: |
         #!/bin/sh
         if command -v apparmor_parser >/dev/null 2>&1; then
-          apparmor_parser -R /etc/apparmor.d/lnta || true
+          apparmor_parser -R /etc/apparmor.d/bwrap || true
         fi
       postremove: |
         #!/bin/sh
-        rm -f /etc/apparmor.d/lnta
+        rm -f /etc/apparmor.d/bwrap
     contents:
       - src: scripts/apparmor-profile
-        dst: /etc/apparmor.d/lnta
+        dst: /etc/apparmor.d/bwrap
         type: config
         packager: deb
   - id: rpm

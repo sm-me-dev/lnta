@@ -35,11 +35,11 @@
 #### DEB (`nfpms[0]`)
 - **format**: `deb`
 - **scripts**:
-  - `postinstall`: Loads AppArmor profile
-  - `preremove`: Unloads AppArmor profile
+  - `postinstall`: Loads AppArmor profile for bwrap
+  - `preremove`: Unloads AppArmor profile for bwrap
   - `postremove`: Removes profile file
 - **contents**:
-  - `scripts/apparmor-profile` → `/etc/apparmor.d/lnta` (type: config, packager: deb)
+  - `scripts/apparmor-profile` → `/etc/apparmor.d/bwrap` (type: config, packager: deb)
 
 #### RPM (`nfpms[1]`)
 - **format**: `rpm`
