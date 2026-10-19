@@ -82,7 +82,48 @@ jobs:
           cache: true
 
       - name: Install bubblewrap (required for sandbox tests)
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap apparmor-utils
+
+      - name: Install AppArmor profile for bwrap (fixes uid map permission denied on Ubuntu 24.04+)
+        run: |
+          sudo mkdir -p /etc/apparmor.d
+          sudo tee /etc/apparmor.d/lnta-bwrap > /dev/null <<'EOF'
+          # LNTA bwrap AppArmor Profile
+          # Allows unprivileged user namespaces for bubblewrap sandboxing
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile lnta-bwrap flags=(unconfined) {
+            userns,
+
+            # Read-only system mounts
+            / r,
+            /usr/** r,
+            /bin/** r,
+            /lib/** r,
+            /lib64/** r,
+            /etc/** r,
+            /proc/** r,
+            /sys/** r,
+            /dev/** r,
+            /run/** r,
+
+            # Read-write tmpfs
+            /tmp/** rw,
+            /var/tmp/** rw,
+
+            # Mask secret directories (read access only; they appear empty inside sandbox anyway)
+            @{HOME}/.ssh/** r,
+            @{HOME}/.gnupg/** r,
+            @{HOME}/.aws/** r,
+            @{HOME}/.kube/** r,
+            @{HOME}/.config/lnta/** r,
+
+            # Site-specific additions
+            include if exists <local/lnta-bwrap>
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/lnta-bwrap || true
 
       - name: Run tests with race detector
         run: go test -race -v ./...
