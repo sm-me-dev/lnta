@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -70,6 +74,10 @@ func init() {
 	rootCmd.AddCommand(chatCmd)
 	rootCmd.AddCommand(undoCmd)
 	rootCmd.AddCommand(packsCmd)
+	rootCmd.AddCommand(doctorCmd)
+
+	// Hidden command for Landlock sandbox self-re-exec
+	rootCmd.AddCommand(sandboxExecCmd)
 }
 
 // runPrompt runs one-shot execution mode through the agent orchestrator.
@@ -371,4 +379,271 @@ func runPromptArgs(prompt string) error {
 	}
 	fmt.Println(renderResult(result, o.RunID(), pack))
 	return nil
+}
+
+// sandboxExecCmd is the hidden __sandbox_exec command used by Landlock fallback.
+// It applies Landlock restrictions and executes the target command from env vars.
+var sandboxExecCmd = &cobra.Command{
+	Use:    "__sandbox_exec",
+	Short:  "Internal: Landlock sandbox executor (do not call directly)",
+	Hidden: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := sandbox.LandlockExecCommand(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return nil
+	},
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
+// doctorCmd implements the `lnta doctor` diagnostic command.
+var doctorCmd = &cobra.Command{
+	Use:   "doctor",
+	Short: "Run system health and configuration diagnostics",
+	Long: `Performs diagnostic checks on the LNTA environment including:
+- LLM API configuration and connectivity
+- Kernel sandbox status (bwrap, AppArmor, Landlock)
+- Installed validator binaries`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runDoctor(cmd)
+	},
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
+func init() {
+	doctorCmd.Flags().BoolVar(&doctorVerbose, "verbose", false, "Verbose output")
+	doctorCmd.Flags().BoolVar(&doctorFix, "generate-apparmor", false, "Generate AppArmor profile for bwrap")
+}
+
+var doctorVerbose bool
+var doctorFix bool
+
+func runDoctor(cmd *cobra.Command) error {
+	fmt.Println(titleStyle.Render("## LNTA Doctor"))
+	fmt.Println()
+
+	checks := []struct {
+		name string
+		fn   func() error
+	}{
+		{"LLM Configuration", checkLLMConfig},
+		{"LLM Connectivity", checkLLMConnectivity},
+		{"Kernel Sandbox", checkKernelSandbox},
+		{"Validator Binaries", checkValidators},
+	}
+
+	allPassed := true
+	for _, c := range checks {
+		fmt.Printf("  %s %s... ", labelStyle.Render("▶"), c.name)
+		err := c.fn()
+		if err != nil {
+			fmt.Println(mutedStyle.Render("FAIL"))
+			if doctorVerbose {
+				fmt.Printf("    %s\n", mutedStyle.Render(err.Error()))
+			}
+			allPassed = false
+		} else {
+			fmt.Println(labelStyle.Render("OK"))
+		}
+	}
+
+	if doctorFix {
+		fmt.Println()
+		fmt.Println(titleStyle.Render("## AppArmor Profile for bwrap"))
+		fmt.Println()
+		fmt.Println(generateAppArmorProfile())
+	}
+
+	fmt.Println()
+	if allPassed {
+		fmt.Println(labelStyle.Render("All checks passed"))
+	} else {
+		fmt.Println(mutedStyle.Render("Some checks failed — run with --verbose for details"))
+	}
+
+	return nil
+}
+
+func checkLLMConfig() error {
+	cfg, err := agent.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if cfg.APIKey == "" {
+		return errors.New("LNTA_API_KEY not set")
+	}
+	if cfg.BaseURL == "" {
+		return errors.New("LNTA_BASE_URL not set")
+	}
+	if doctorVerbose {
+		fmt.Printf("    API Key: %s... (len=%d)\n", cfg.APIKey[:min(8, len(cfg.APIKey))], len(cfg.APIKey))
+		fmt.Printf("    Base URL: %s\n", cfg.BaseURL)
+		fmt.Printf("    Model: %s\n", cfg.Model)
+	}
+	return nil
+}
+
+func checkLLMConnectivity() error {
+	cfg, err := agent.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if cfg.APIKey == "" || cfg.BaseURL == "" {
+		return errors.New("API key or base URL not configured")
+	}
+
+	// Quick HTTP request to check endpoint reachability
+	// Use the models endpoint which is lightweight
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", strings.TrimSuffix(cfg.BaseURL, "/")+"/models", nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("connect to %s: %w", cfg.BaseURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+	if doctorVerbose {
+		fmt.Printf("    Endpoint: %s (status %d)\n", cfg.BaseURL, resp.StatusCode)
+	}
+	return nil
+}
+
+func checkKernelSandbox() error {
+	// Check bwrap binary
+	bwrapPath, err := exec.LookPath("bwrap")
+	if err != nil {
+		return fmt.Errorf("bwrap not found in PATH")
+	}
+	if doctorVerbose {
+		fmt.Printf("    bwrap: %s\n", bwrapPath)
+	}
+
+	// Check AppArmor userns restriction
+	apparmorRestrict, err := readSysctl("kernel.apparmor_restrict_unprivileged_userns")
+	if err == nil {
+		if doctorVerbose {
+			fmt.Printf("    kernel.apparmor_restrict_unprivileged_userns: %s\n", apparmorRestrict)
+		}
+		if strings.TrimSpace(apparmorRestrict) == "1" {
+			return fmt.Errorf("AppArmor userns restriction enabled (value=1) — bwrap will be blocked")
+		}
+	} else if doctorVerbose {
+		fmt.Printf("    kernel.apparmor_restrict_unprivileged_userns: unreadable (%v)\n", err)
+	}
+
+	// Test bwrap probe
+	if err := sandboxProbeBwrap(); err != nil {
+		if errors.Is(err, sandbox.ErrBwrapBlocked) {
+			return fmt.Errorf("bwrap probe blocked by AppArmor: %w", err)
+		}
+		if errors.Is(err, sandbox.ErrBwrapNotFound) {
+			return fmt.Errorf("bwrap not found: %w", err)
+		}
+		return fmt.Errorf("bwrap probe failed: %w", err)
+	}
+	if doctorVerbose {
+		fmt.Printf("    bwrap probe: OK\n")
+	}
+
+	// Check Landlock availability
+	if err := sandbox.LandlockProbe(); err != nil {
+		if doctorVerbose {
+			fmt.Printf("    Landlock: unavailable (%v)\n", err)
+		}
+		return fmt.Errorf("Landlock unavailable: %w", err)
+	}
+	if doctorVerbose {
+		fmt.Printf("    Landlock: available\n")
+	}
+
+	return nil
+}
+
+func sandboxProbeBwrap() error {
+	bwrapPath, err := exec.LookPath("bwrap")
+	if err != nil {
+		return sandbox.ErrBwrapNotFound
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, bwrapPath, "--ro-bind", "/", "/", "--", "true")
+	c.Stdin = nil
+	c.Stdout = nil
+	c.Stderr = nil
+	if err := c.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if exitErr.ExitCode() == 126 || exitErr.ExitCode() == 127 {
+				return sandbox.ErrBwrapBlocked
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+func checkValidators() error {
+	validators := []string{
+		"desktop-file-validate",
+		"systemd-analyze",
+		"shellcheck",
+		"ufw",
+		"ss",
+	}
+	var missing []string
+	for _, v := range validators {
+		if _, err := exec.LookPath(v); err != nil {
+			missing = append(missing, v)
+		} else if doctorVerbose {
+			fmt.Printf("    %s: found\n", v)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing validators: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func readSysctl(key string) (string, error) {
+	data, err := os.ReadFile("/proc/sys/" + strings.ReplaceAll(key, ".", "/"))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func generateAppArmorProfile() string {
+	return `# Allow unprivileged user namespaces for bwrap
+# Install to: /etc/apparmor.d/bwrap
+# Then run: sudo apparmor_parser -r /etc/apparmor.d/bwrap
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/bwrap>
+}
+`
+}
+
+// min returns the smaller of two ints.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

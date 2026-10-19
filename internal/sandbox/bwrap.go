@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +28,10 @@ const maxOutputBytes = 16 * 1024
 // ErrBwrapNotFound is returned when bwrap is not installed on the host.
 var ErrBwrapNotFound = errors.New("bwrap not found on host; cannot run sandboxed command")
 
+// ErrBwrapBlocked is returned when bwrap exists but is blocked by AppArmor
+// (EACCES/EPERM on namespace creation).
+var ErrBwrapBlocked = errors.New("bwrap blocked by AppArmor userns restriction; try 'lnta doctor --generate-apparmor'")
+
 // CommandResult captures the outcome of a sandboxed command execution.
 type CommandResult struct {
 	Stdout    string
@@ -38,64 +41,54 @@ type CommandResult struct {
 	Truncated bool
 }
 
-// secretMaskDirs lists host directories masked over inside the sandbox so a
-// prompt-injected command cannot exfiltrate credentials.
-func secretMaskDirs(home string) []string {
-	return []string{
-		filepath.Join(home, ".ssh"),
-		filepath.Join(home, ".gnupg"),
-		filepath.Join(home, ".aws"),
-		filepath.Join(home, ".kube"),
-		filepath.Join(home, ".config", "lnta"),
-	}
-}
+// SandboxBackend identifies which sandbox backend was used.
+type SandboxBackend string
 
-// expandPath replaces a leading ~ with the HOME directory.
-func expandPath(p string) string {
-	if strings.HasPrefix(p, "~") {
-		home := os.Getenv("HOME")
-		if home == "" {
-			if u, err := os.UserHomeDir(); err == nil {
-				home = u
-			}
+const (
+	BackendBwrap   SandboxBackend = "bwrap"
+	BackendLandlock SandboxBackend = "landlock"
+)
+
+// probeBwrap runs a fast pre-flight check to see if bwrap can create
+// a user namespace. Returns nil if successful, ErrBwrapNotFound if bwrap
+// is not installed, ErrBwrapBlocked if blocked by AppArmor, or other error.
+func probeBwrap() error {
+	bwrap, err := exec.LookPath("bwrap")
+	if err != nil {
+		return ErrBwrapNotFound
+	}
+
+	// Fast probe: try to create a minimal user namespace
+	// --ro-bind / / -- true  (mounts root read-only, runs true)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bwrap, "--ro-bind", "/", "/", "--", "true")
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	err = cmd.Run()
+	if err == nil {
+		return nil // success
+	}
+
+	// Check if it's a permission error (AppArmor blocking userns)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		// Exit code 126 or 127 often means permission denied on namespace creation
+		// Check stderr for clues, but on Ubuntu 24.04+ it's typically silent EACCES
+		if exitErr.ExitCode() == 126 || exitErr.ExitCode() == 127 {
+			return ErrBwrapBlocked
 		}
-		if home != "" {
-			p = home + p[1:]
-		}
 	}
-	return p
+
+	// Context timeout or other error
+	return err
 }
 
-// homeDir returns the user's home directory, falling back gracefully.
-func homeDir() string {
-	if h := os.Getenv("HOME"); h != "" {
-		return h
-	}
-	if u, err := os.UserHomeDir(); err == nil {
-		return u
-	}
-	return ""
-}
-
-// RunReadOnly executes sh -c cmdStr inside a bwrap sandbox with the entire
-// root filesystem bind-mounted read-only. When bwrap is absent it returns
-// ErrBwrapNotFound.
-//
-// The sandbox:
-//   - bind-mounts / read-only (--ro-bind / /)
-//   - provides minimal /dev and /proc
-//   - gives a private, non-persistent /tmp via tmpfs
-//   - masks $HOME/.ssh, .gnupg, .aws, .kube, .config/lnta and any .env files
-//     in cwd over empty/ /dev/null mounts
-//   - chdirs to cwd and dies with the parent
-//
-// Stdin is bound to /dev/null. DEBIAN_FRONTEND=noninteractive and
-// GIT_TERMINAL_PROMPT=0 are set in the environment. A context timeout is
-// enforced (default 15s).
-//
-// Stdout, Stderr, ExitCode and Duration are captured; output is truncated at
-// 16KB with a clear [OUTPUT TRUNCATED] marker.
-func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
+// runBwrap executes the command inside a bwrap sandbox (the original implementation).
+func runBwrap(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
 	var res CommandResult
 	start := time.Now()
 
@@ -148,8 +141,8 @@ func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 	cmd.Env = env
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = io.Writer(&stdout)
-	cmd.Stderr = io.Writer(&stderr)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	err = cmd.Run()
 	res.Duration = time.Since(start)
@@ -171,11 +164,96 @@ func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 	// Best-effort audit log of the sandboxed execution.
 	audit.Log("sandbox.run", "", map[string]string{
 		"cwd":      cwd,
+		"backend":  "bwrap",
 		"exit":     fmt.Sprintf("%d", res.ExitCode),
 		"duration": res.Duration.String(),
 	})
 
 	return res, err
+}
+
+// RunReadOnly executes sh -c cmdStr inside a sandbox with the entire
+// root filesystem mounted read-only. It automatically selects the best
+// available backend:
+//
+//  1. Tier 1 (bwrap): Runs a fast pre-flight probe. If bwrap can create
+//     a user namespace, uses bwrap for full isolation.
+//  2. Tier 2 (Landlock): If bwrap is not installed or blocked by AppArmor
+//     (kernel.apparmor_restrict_unprivileged_userns=1), falls back to
+//     native Linux Landlock LSM via self-re-exec.
+//
+// The sandbox:
+//   - Provides read-only access to system directories (/usr, /bin, /lib, /etc, /proc, /sys)
+//   - Provides private, non-persistent /tmp via tmpfs
+//   - Masks secret directories (~/.ssh, ~/.gnupg, ~/.aws, ~/.kube, ~/.config/lnta)
+//     so they appear empty (bwrap) or return EACCES (Landlock)
+//   - Masks .env files in cwd to /dev/null
+//   - chdirs to cwd and dies with the parent
+//   - Stdin bound to /dev/null, noninteractive env vars set
+//   - Output truncated at 16KB with [OUTPUT TRUNCATED] marker
+//
+// Returns CommandResult with Stdout, Stderr, ExitCode, Duration.
+// Returns error if both backends fail.
+func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
+	// Tier 1: Try bwrap first
+	probeErr := probeBwrap()
+	if probeErr == nil {
+		return runBwrap(ctx, cmdStr, cwd, timeout)
+	} else if !errors.Is(probeErr, ErrBwrapNotFound) && !errors.Is(probeErr, ErrBwrapBlocked) {
+		// Unexpected error from probe (e.g., timeout), try bwrap anyway
+		return runBwrap(ctx, cmdStr, cwd, timeout)
+	}
+
+	// Tier 2: Fall back to Landlock LSM
+	landlockErr := LandlockProbe()
+	if landlockErr == nil {
+		return runLandlock(ctx, cmdStr, cwd, timeout)
+	}
+
+	// Both backends unavailable
+	if errors.Is(probeErr, ErrBwrapNotFound) {
+		return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v", ErrBwrapNotFound, landlockErr)
+	}
+	return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v", ErrBwrapBlocked, landlockErr)
+}
+
+// secretMaskDirs lists host directories masked over inside the sandbox so a
+// prompt-injected command cannot exfiltrate credentials.
+func secretMaskDirs(home string) []string {
+	return []string{
+		filepath.Join(home, ".ssh"),
+		filepath.Join(home, ".gnupg"),
+		filepath.Join(home, ".aws"),
+		filepath.Join(home, ".kube"),
+		filepath.Join(home, ".config", "lnta"),
+	}
+}
+
+// expandPath replaces a leading ~ with the HOME directory.
+func expandPath(p string) string {
+	if strings.HasPrefix(p, "~") {
+		home := os.Getenv("HOME")
+		if home == "" {
+			if u, err := os.UserHomeDir(); err == nil {
+				home = u
+			}
+		}
+		if home != "" {
+			p = home + p[1:]
+		}
+	}
+	return p
+}
+
+// homeDir returns the user's home directory, falling back gracefully.
+func homeDir() string {
+	if h := os.Getenv("HOME"); h != "" {
+		return h
+	}
+	if u, err := os.UserHomeDir(); err == nil {
+		return u
+	}
+	return ""
 }
 
 // truncateOutput caps s at maxOutputBytes, appending a clear marker when cut.
