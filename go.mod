@@ -7,7 +7,7 @@ require (
 	github.com/charmbracelet/huh v0.4.0
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/landlock-lsm/go-landlock v0.10.1
-	github.com/sashabaranov/go-openai v1.43.0
+	github.com/sashabaranov/go-openai/v2 v2.0.0
 	github.com/spf13/cobra v1.10.2
 	gopkg.in/yaml.v3 v3.0.1
 )
