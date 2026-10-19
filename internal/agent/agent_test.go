@@ -251,7 +251,7 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 		WithConfig(&Config{Model: "test-model"}),
 	)
 
-	result, err := o.Run(context.Background(), "create a launcher")
+	result, err := o.Run(context.Background(), "create a launcher", "", false)
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
@@ -326,7 +326,7 @@ Categories=Utility;
 	ctx, cancel := WithSignalCancellation()
 	defer cancel()
 
-	result, err := o.Run(ctx, "create a desktop launcher for my app")
+	result, err := o.Run(ctx, "create a desktop launcher for my app", "", false)
 	if err != nil {
 		t.Fatalf("Run error: %v", err)
 	}

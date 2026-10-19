@@ -158,7 +158,7 @@ func New(client LLMClient, router *packs.Router, opts ...Option) *Orchestrator {
 // It returns a human-readable summary of the outcome. If the context is
 // cancelled (SIGINT / Ctrl+C), it returns immediately with a cancellation
 // error.
-func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
+func (o *Orchestrator) Run(ctx context.Context, prompt string, pipeContext string, commandOnly bool) (string, error) {
 	// Step 1: Collect SystemContext (<5ms).
 	start := time.Now()
 	sysCtx, err := fingerprint.Fingerprint()
@@ -195,7 +195,7 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 	}
 
 	// Step 4: Construct the slim System Prompt.
-	systemPrompt := buildSystemPrompt(sysCtx, pack, contextOutput)
+	systemPrompt := buildSystemPrompt(sysCtx, pack, contextOutput, pipeContext, commandOnly)
 
 	// Step 5: Streaming tool-calling loop with cancellation support.
 	return o.runLoop(ctx, systemPrompt, prompt, pack)
@@ -396,8 +396,8 @@ func (o *Orchestrator) maxTokens() int {
 
 // buildSystemPrompt constructs the slim, focused system prompt: Base Safety
 // Policy + SystemContext + Selected Pack Markdown + Pre-flight context_cmd
-// output.
-func buildSystemPrompt(sysCtx fingerprint.SystemContext, pack packs.Pack, contextOutput string) string {
+// output + Pipe Context (if any).
+func buildSystemPrompt(sysCtx fingerprint.SystemContext, pack packs.Pack, contextOutput string, pipeContext string, commandOnly bool) string {
 	var b strings.Builder
 	b.WriteString(baseSafetyPolicy())
 	b.WriteString("\n")
@@ -425,6 +425,17 @@ func buildSystemPrompt(sysCtx fingerprint.SystemContext, pack packs.Pack, contex
 	if contextOutput != "" {
 		b.WriteString("## Pre-flight Context (context_cmd output)\n")
 		b.WriteString(contextOutput)
+		b.WriteString("\n")
+	}
+	if pipeContext != "" {
+		b.WriteString("## Piped Stdin Context\n")
+		b.WriteString(pipeContext)
+		b.WriteString("\n")
+	}
+	if commandOnly {
+		b.WriteString("## Output Mode: Command Only\n")
+		b.WriteString("Output ONLY the verified shell command. No explanations, no markdown, no extra text.\n")
+		b.WriteString("The command must be a single line, executable as-is in the target shell.\n")
 		b.WriteString("\n")
 	}
 	b.WriteString("## Tool Rules\n")

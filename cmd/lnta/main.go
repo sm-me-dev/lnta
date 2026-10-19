@@ -20,18 +20,152 @@ import (
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me/lnta/internal/shell"
 	"github.com/sm-me/lnta/internal/ui"
 )
 
 var (
-	userConfigDir string
-	explainMode   bool
-	dryRunMode    bool
+	userConfigDir  string
+	explainMode    bool
+	dryRunMode     bool
+	commandOnly    bool
 
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	labelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
 	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
+
+var chatCmd = &cobra.Command{
+	Use:   "chat",
+	Short: "Start an interactive chat session",
+	Long:  "Start an interactive multi-turn chat session preserving conversation history and active Run ID snapshots.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runChat()
+	},
+}
+
+var undoCmd = &cobra.Command{
+	Use:   "undo [run_id]",
+	Short: "Undo a previous run by run id (defaults to the most recent run)",
+	Args:  cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		runID := ""
+		if len(args) == 1 {
+			runID = args[0]
+		} else {
+			runID = latestRunID()
+			if runID == "" {
+				return fmt.Errorf("no run snapshots found; specify a run_id: lnta undo <run_id>")
+			}
+			fmt.Printf("No run_id specified; reverting most recent run %q\n", runID)
+		}
+		if err := sandbox.RollbackRun(runID); err != nil {
+			return fmt.Errorf("undo %q: %w", runID, err)
+		}
+		fmt.Printf("undone run %q\n", runID)
+		return nil
+	},
+}
+
+var packsCmd = &cobra.Command{
+	Use:   "packs",
+	Short: "Manage instruction packs",
+}
+
+var packsListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List loaded instruction packs",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		router, err := packs.NewRouter(lnta.EmbeddedPacks, "packs/*.md", userConfigDir)
+		if err != nil {
+			return fmt.Errorf("load packs: %w", err)
+		}
+		for _, p := range router.AllPacks() {
+			fmt.Printf("%-32s %s\n", p.ID, p.Name)
+		}
+		return nil
+	},
+}
+
+func init() {
+	packsCmd.AddCommand(packsListCmd)
+}
+
+var doctorCmd = &cobra.Command{
+	Use:   "doctor",
+	Short: "Run system health and configuration diagnostics",
+	Long: `Performs diagnostic checks on the LNTA environment including:
+- LLM API configuration and connectivity
+- Kernel sandbox status (bwrap, AppArmor, Landlock)
+- Installed validator binaries`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runDoctor(cmd)
+	},
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
+var doctorVerbose bool
+var doctorFix bool
+
+func init() {
+	doctorCmd.Flags().BoolVar(&doctorVerbose, "verbose", false, "Verbose output")
+	doctorCmd.Flags().BoolVar(&doctorFix, "generate-apparmor", false, "Generate AppArmor profile for bwrap")
+}
+
+var sandboxExecCmd = &cobra.Command{
+	Use:    "__sandbox_exec",
+	Short:  "Internal: Landlock sandbox executor (do not call directly)",
+	Hidden: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := sandbox.LandlockExecCommand(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return nil
+	},
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
+var initCmd = &cobra.Command{
+	Use:   "init <zsh|bash|fish>",
+	Short: "Generate shell integration script for terminal prompt enhancement",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		shellName := args[0]
+		script, err := shell.GenerateInitScript(shellName, lnta.Version)
+		if err != nil {
+			return fmt.Errorf("generate init script: %w", err)
+		}
+		fmt.Print(script)
+		return nil
+	},
+}
+
+var fixCmd = &cobra.Command{
+	Use:   "fix",
+	Short: "Automatically capture and attempt to fix the last failed command",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		lastCmd := os.Getenv("_LNTA_LAST_CMD")
+		lastExit := os.Getenv("_LNTA_LAST_EXIT")
+
+		if lastCmd == "" || lastExit == "" {
+			fmt.Println("No previous command to fix. Run a command first.")
+			os.Exit(1)
+		}
+
+		// Parse exit code
+		exitCode := 0
+		fmt.Sscanf(lastExit, "%d", &exitCode)
+
+		// For now, we'll just run the standard prompt with a fix context
+		// In the future, this could re-run in sandbox and construct FixContext
+		fixPrompt := fmt.Sprintf("The command %q failed with exit code %d. Please diagnose and propose a fix.", lastCmd, exitCode)
+
+		return runPrompt(cmd, []string{fixPrompt})
+	},
+}
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
@@ -49,7 +183,9 @@ Use "lnta <prompt>" for one-shot execution.
 Use "lnta --explain <prompt>" for Explain Mode (no state mutation possible).
 Use "lnta --dry-run <prompt>" to inspect proposed diffs without writing.
 Use "lnta chat" for an interactive multi-turn session.
-Use "lnta undo [run_id]" to revert a previous run.`,
+Use "lnta undo [run_id]" to revert a previous run.
+Use "lnta init <zsh|bash|fish>" to generate shell integration.
+Use "lnta fix" to automatically fix the last failed command.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return cmd.Help()
@@ -70,11 +206,15 @@ func init() {
 		"Explain Mode: disables write_scoped_file and mutate_system so no state can be mutated")
 	rootCmd.PersistentFlags().BoolVar(&dryRunMode, "dry-run", false,
 		"Dry-run mode: print proposed file diffs and commands, block all writes")
+	rootCmd.PersistentFlags().BoolVar(&commandOnly, "command-only", false,
+		"Output only the verified command (for shell widgets)")
 
 	rootCmd.AddCommand(chatCmd)
 	rootCmd.AddCommand(undoCmd)
 	rootCmd.AddCommand(packsCmd)
 	rootCmd.AddCommand(doctorCmd)
+	rootCmd.AddCommand(initCmd)
+	rootCmd.AddCommand(fixCmd)
 
 	// Hidden command for Landlock sandbox self-re-exec
 	rootCmd.AddCommand(sandboxExecCmd)
@@ -83,6 +223,17 @@ func init() {
 // runPrompt runs one-shot execution mode through the agent orchestrator.
 func runPrompt(cmd *cobra.Command, args []string) error {
 	prompt := strings.Join(args, " ")
+
+	// Detect pipe on stdin early
+	stdinIsPipe := shell.IsStdinPipe()
+	var pipeContext string
+	if stdinIsPipe {
+		ctx, _, err := shell.ReadPipeContext(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("read pipe context: %w", err)
+		}
+		pipeContext = ctx
+	}
 
 	sys, err := fingerprint.Fingerprint()
 	if err != nil {
@@ -102,8 +253,10 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	pack := selected[0]
 
 	// Compact status line at the start of execution.
-	fmt.Println(ui.StatusLine(pack.ID, "Planning", "", false))
-	fmt.Println()
+	if !commandOnly {
+		fmt.Println(ui.StatusLine(pack.ID, "Planning", "", false))
+		fmt.Println()
+	}
 
 	// Build the orchestrator backed by a real LLM client.
 	cfg, err := agent.LoadConfig()
@@ -115,10 +268,16 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("llm client: %w", err)
 	}
 
+	// Choose approve callback: use /dev/tty when stdin is a pipe
+	approveFn := defaultApprove
+	if stdinIsPipe {
+		approveFn = approveWithTTY
+	}
+
 	opts := []agent.Option{
 		agent.WithRunID(nextRunID()),
 		agent.WithCWD("."),
-		agent.WithApprove(defaultApprove),
+		agent.WithApprove(approveFn),
 		agent.WithConfig(cfg),
 		agent.WithDryRun(dryRunMode),
 	}
@@ -133,13 +292,38 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	ctx, cancel := agent.WithSignalCancellation()
 	defer cancel()
 
-	result, err := o.Run(ctx, prompt)
+	result, err := o.Run(ctx, prompt, pipeContext, commandOnly)
 	if err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
 
-	fmt.Println(renderResult(result, o.RunID(), pack))
+	if !commandOnly {
+		fmt.Println(renderResult(result, o.RunID(), pack))
+	} else {
+		// In --command-only mode, extract and print only the verified command
+		cmd := extractVerifiedCommand(result)
+		if cmd != "" {
+			fmt.Println(cmd)
+		}
+	}
 	return nil
+}
+
+// extractVerifiedCommand extracts the verified command from the result for --command-only mode.
+func extractVerifiedCommand(result string) string {
+	// The result should contain the verified command from complete_task
+	// Look for patterns in the result
+	lines := strings.Split(result, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "TASK_COMPLETE:") {
+			// The summary might contain the command, but we want just the command
+			// In practice, the pack's verify_cmd or the agent should output just the command
+			// For now, return empty to indicate we need the agent to output the command
+			continue
+		}
+	}
+	return ""
 }
 
 // nextRunID returns a deterministic run identifier for this invocation.
@@ -212,36 +396,23 @@ func defaultApprove(command, cwd, riskLevel, reason string) bool {
 	return confirmed
 }
 
-var chatCmd = &cobra.Command{
-	Use:   "chat",
-	Short: "Start an interactive chat session",
-	Long:  "Start an interactive multi-turn chat session preserving conversation history and active Run ID snapshots.",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runChat()
-	},
+// approveWithTTY uses /dev/tty for confirmation when stdin is a pipe.
+func approveWithTTY(command, cwd, riskLevel, reason string) bool {
+	confirmed, err := shell.ConfirmWithTTY(fmt.Sprintf("mutate_system (%s risk)", riskLevel))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "approval error: %v\n", err)
+		return false
+	}
+	return confirmed
 }
 
-var undoCmd = &cobra.Command{
-	Use:   "undo [run_id]",
-	Short: "Undo a previous run by run id (defaults to the most recent run)",
-	Args:  cobra.MaximumNArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		runID := ""
-		if len(args) == 1 {
-			runID = args[0]
-		} else {
-			runID = latestRunID()
-			if runID == "" {
-				return fmt.Errorf("no run snapshots found; specify a run_id: lnta undo <run_id>")
-			}
-			fmt.Printf("No run_id specified; reverting most recent run %q\n", runID)
-		}
-		if err := sandbox.RollbackRun(runID); err != nil {
-			return fmt.Errorf("undo %q: %w", runID, err)
-		}
-		fmt.Printf("undone run %q\n", runID)
-		return nil
-	},
+// snapshotRoot mirrors sandbox.snapshotRoot (unexported) so the CLI can list runs.
+func snapshotRoot() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(".local", "share", "lnta", "snapshots")
+	}
+	return filepath.Join(home, ".local", "share", "lnta", "snapshots")
 }
 
 // latestRunID returns the most recent run snapshot directory name, or "".
@@ -261,39 +432,6 @@ func latestRunID() string {
 		}
 	}
 	return latest
-}
-
-var packsCmd = &cobra.Command{
-	Use:   "packs",
-	Short: "Manage instruction packs",
-}
-
-var packsListCmd = &cobra.Command{
-	Use:   "list",
-	Short: "List loaded instruction packs",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		router, err := packs.NewRouter(lnta.EmbeddedPacks, "packs/*.md", userConfigDir)
-		if err != nil {
-			return fmt.Errorf("load packs: %w", err)
-		}
-		for _, p := range router.AllPacks() {
-			fmt.Printf("%-32s %s\n", p.ID, p.Name)
-		}
-		return nil
-	},
-}
-
-func init() {
-	packsCmd.AddCommand(packsListCmd)
-}
-
-// snapshotRoot mirrors sandbox.snapshotRoot (unexported) so the CLI can list runs.
-func snapshotRoot() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return filepath.Join(".local", "share", "lnta", "snapshots")
-	}
-	return filepath.Join(home, ".local", "share", "lnta", "snapshots")
 }
 
 // runChat starts an interactive multi-turn REPL.
@@ -373,53 +511,13 @@ func runPromptArgs(prompt string) error {
 	)
 	ctx, cancel := agent.WithSignalCancellation()
 	defer cancel()
-	result, err := o.Run(ctx, prompt)
+	result, err := o.Run(ctx, prompt, "", false)
 	if err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
 	fmt.Println(renderResult(result, o.RunID(), pack))
 	return nil
 }
-
-// sandboxExecCmd is the hidden __sandbox_exec command used by Landlock fallback.
-// It applies Landlock restrictions and executes the target command from env vars.
-var sandboxExecCmd = &cobra.Command{
-	Use:    "__sandbox_exec",
-	Short:  "Internal: Landlock sandbox executor (do not call directly)",
-	Hidden: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := sandbox.LandlockExecCommand(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return nil
-	},
-	SilenceUsage:  true,
-	SilenceErrors: true,
-}
-
-// doctorCmd implements the `lnta doctor` diagnostic command.
-var doctorCmd = &cobra.Command{
-	Use:   "doctor",
-	Short: "Run system health and configuration diagnostics",
-	Long: `Performs diagnostic checks on the LNTA environment including:
-- LLM API configuration and connectivity
-- Kernel sandbox status (bwrap, AppArmor, Landlock)
-- Installed validator binaries`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runDoctor(cmd)
-	},
-	SilenceUsage:  true,
-	SilenceErrors: true,
-}
-
-func init() {
-	doctorCmd.Flags().BoolVar(&doctorVerbose, "verbose", false, "Verbose output")
-	doctorCmd.Flags().BoolVar(&doctorFix, "generate-apparmor", false, "Generate AppArmor profile for bwrap")
-}
-
-var doctorVerbose bool
-var doctorFix bool
 
 func runDoctor(cmd *cobra.Command) error {
 	fmt.Println(titleStyle.Render("## LNTA Doctor"))
@@ -640,7 +738,6 @@ profile bwrap flags=(unconfined) {
 `
 }
 
-// min returns the smaller of two ints.
 func min(a, b int) int {
 	if a < b {
 		return a

@@ -178,7 +178,7 @@ func runScenario(name string, explain, dryRun bool, fn scenarioFn) scenarioResul
 	ctx, cancel := agent.WithSignalCancellation()
 	defer cancel()
 
-	result, err := o.Run(ctx, "create a desktop launcher for my app")
+	result, err := o.Run(ctx, "create a desktop launcher for my app", "", false)
 	if err != nil {
 		r.err = err.Error()
 		return r
