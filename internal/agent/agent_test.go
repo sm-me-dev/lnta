@@ -15,6 +15,7 @@ import (
 	"github.com/sashabaranov/go-openai"
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
+	"github.com/sm-me/lnta/internal/sandbox"
 )
 
 //go:embed testdata/dummy.md
@@ -124,6 +125,11 @@ func testDirUnderHome(t *testing.T) string {
 // HARNESS_VERIFICATION_FAILED when the pack's verify_cmd fails (the harness
 // verification gate blocks completion).
 func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
+	// Skip if sandbox is not available (e.g., CI without user namespaces)
+	if err := sandbox.SandboxAvailable(); err != nil {
+		t.Skipf("skipping: sandbox unavailable (%v)", err)
+	}
+
 	dir := testDirUnderHome(t)
 	existing := filepath.Join(dir, "exists.desktop")
 	if err := os.WriteFile(existing, []byte("[Desktop Entry]\nName=Test\nExec=/usr/bin/true\nType=Application\n"), 0o644); err != nil {
@@ -213,6 +219,11 @@ func TestMutateSystemBlockedWithoutApproval(t *testing.T) {
 // complete_task returns HARNESS_VERIFICATION_FAILED the loop continues and the
 // agent can self-correct on the next turn (mock LLM retries with a valid target).
 func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
+	// Skip if sandbox is not available (e.g., CI without user namespaces)
+	if err := sandbox.SandboxAvailable(); err != nil {
+		t.Skipf("skipping: sandbox unavailable (%v)", err)
+	}
+
 	dir := testDirUnderHome(t)
 	existing := filepath.Join(dir, "launcher.desktop")
 	if err := os.WriteFile(existing, []byte("[Desktop Entry]\nName=Launcher\nExec=/usr/bin/true\nType=Application\n"), 0o644); err != nil {
@@ -268,6 +279,11 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 
 // TestOrchestratorValidDesktop tests the full orchestrator loop with a valid desktop scenario.
 func TestOrchestratorValidDesktop(t *testing.T) {
+	// Skip if sandbox is not available (e.g., CI without user namespaces)
+	if err := sandbox.SandboxAvailable(); err != nil {
+		t.Skipf("skipping: sandbox unavailable (%v)", err)
+	}
+
 	tmpDir := testDirUnderHome(t)
 
 	packFile := fmt.Sprintf(
@@ -332,7 +348,7 @@ Categories=Utility;
 	}
 	t.Logf("Result: %s", result)
 	t.Logf("Turns: %d", mock.turnCount())
-	
+
 	if !strings.Contains(result, "TASK_COMPLETE") {
 		t.Fatalf("expected TASK_COMPLETE in result, got %q", result)
 	}

@@ -87,6 +87,13 @@ func probeBwrap() error {
 	return err
 }
 
+// SandboxAvailable checks if bwrap sandboxing is available and working.
+// Returns nil if available, or an error explaining why not.
+// Use in tests to skip when sandboxing is not available.
+func SandboxAvailable() error {
+	return probeBwrap()
+}
+
 // runBwrap executes the command inside a bwrap sandbox (the original implementation).
 func runBwrap(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
 	var res CommandResult

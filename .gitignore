@@ -49,7 +49,9 @@ bin/
 .serena/
 .specify/
 specs/
+.opencode/
 
 # Embedded packs (if generated)
 embedded_packs.go
 graphify-out/
+specs/

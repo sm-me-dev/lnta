@@ -361,6 +361,10 @@ func TestMCP_ToolsListResult(t *testing.T) {
 
 // TestMCP_ContextCmdExecution tests the inspect_sandboxed tool logic
 func TestMCP_InspectSandboxed_ContextCmd(t *testing.T) {
+	if err := sandbox.SandboxAvailable(); err != nil {
+		t.Skipf("skipping: sandbox unavailable (%v)", err)
+	}
+
 	// This tests the tool logic by calling the sandbox directly
 	ctx := context.Background()
 	res, err := sandbox.RunReadOnly(ctx, "echo hello", "/tmp", 5*time.Second)

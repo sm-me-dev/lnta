@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,8 +13,8 @@ import (
 
 func requireBwrap(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available on host")
+	if err := SandboxAvailable(); err != nil {
+		t.Skipf("sandbox unavailable: %v", err)
 	}
 }
 
