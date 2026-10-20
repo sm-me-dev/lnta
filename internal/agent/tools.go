@@ -26,6 +26,7 @@ import (
 	"github.com/sm-me/lnta/internal/audit"
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me/lnta/internal/transport"
 )
 
 // Tool is a strictly typed, JSON-schema-validated tool the LLM may call.
@@ -48,6 +49,7 @@ type ToolDeps struct {
 	CWD           string            // working directory for sandboxed commands
 	DryRun        bool              // when true, writes are diff-only previews and mutations are blocked
 	RunCollector  *audit.RunSummaryCollector // for recording run metadata
+	Executor      transport.TargetExecutor // for command execution (local or SSH)
 }
 
 // ApproveFunc is consulted before executing a mutate_system command. It should
@@ -167,7 +169,7 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 	if in.CWD == "" {
 		in.CWD = deps.CWD
 	}
-	res, err := sandbox.RunReadOnly(ctx, in.Command, in.CWD, 0)
+	res, err := deps.Executor.RunReadOnly(ctx, in.Command, in.CWD, 0)
 	if err != nil {
 		return fmt.Sprintf("inspect_system error: %v\nstderr: %s", err, res.Stderr), nil
 	}
@@ -245,7 +247,16 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 		return b.String(), nil
 	}
 
-	diff, err := sandbox.ScopedWriteFile(deps.RunID, in.Path, []byte(in.Content), allowed)
+	// Determine file mode
+	fileMode := os.FileMode(0o644)
+	if in.Mode != "" {
+		if m, err := strconv.ParseUint(in.Mode, 8, 32); err == nil {
+			fileMode = os.FileMode(m)
+		}
+	}
+
+	// Use the executor's WriteFile for remote-aware writing
+	writtenPath, writtenInfo, err := deps.Executor.WriteFile(ctx, in.Path, []byte(in.Content), fileMode)
 	if err != nil {
 		var sve *sandbox.ScopeViolationError
 		if errors.As(err, &sve) {
@@ -259,26 +270,19 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 	// Record file diff for time-machine TUI
 	if deps.RunCollector != nil {
 		deps.RunCollector.RecordFileDiff(audit.FileDiffInfo{
-			TargetPath: diff.TargetPath,
-			Created:    diff.Created,
-			OldMode:    fmt.Sprintf("%04o", diff.OldMode),
-			NewMode:    fmt.Sprintf("%04o", diff.Mode),
-			OldSHA256:  diff.OldSHA256,
-			NewSHA256:  diff.NewSHA256,
-			SizeOld:    diff.SizeOld,
-			SizeNew:    diff.SizeNew,
-			Diff:       diff.Diff,
+			TargetPath: writtenPath,
+			Created:    false,
+			OldMode:    fmt.Sprintf("%04o", 0o644),
+			NewMode:    fmt.Sprintf("%04o", writtenInfo.Mode()),
+			OldSHA256:  "",
+			NewSHA256:  "",
+			SizeOld:    0,
+			SizeNew:    writtenInfo.Size(),
+			Diff:       "",
 		})
 	}
 
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("wrote %q (created=%v, mode=%o, size_old=%d, size_new=%d)\n",
-		diff.TargetPath, diff.Created, diff.Mode, diff.SizeOld, diff.SizeNew))
-	if diff.Diff != "" {
-		b.WriteString("--- unified diff ---\n")
-		b.WriteString(diff.Diff)
-	}
-	return b.String(), nil
+	return fmt.Sprintf("wrote %q (mode=%o, size=%d)\n", writtenPath, writtenInfo.Mode(), writtenInfo.Size()), nil
 }
 
 type mutateInput struct {
@@ -413,7 +417,7 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		if cwd == "" {
 			cwd = "/"
 		}
-		res, err := sandbox.RunReadOnly(ctx, verifyCmd, cwd, 0)
+		res, err := deps.Executor.RunReadOnly(ctx, verifyCmd, cwd, 0)
 		if err != nil {
 			// Record failed verification
 			if deps.RunCollector != nil {

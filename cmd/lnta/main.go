@@ -23,6 +23,7 @@ import (
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
 	"github.com/sm-me/lnta/internal/shell"
+	"github.com/sm-me/lnta/internal/transport"
 	"github.com/sm-me/lnta/internal/ui"
 )
 
@@ -31,6 +32,7 @@ var (
 	explainMode    bool
 	dryRunMode     bool
 	commandOnly    bool
+	sshTarget      string
 
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	labelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
@@ -356,6 +358,8 @@ func init() {
 		"Dry-run mode: print proposed file diffs and commands, block all writes")
 	rootCmd.PersistentFlags().BoolVar(&commandOnly, "command-only", false,
 		"Output only the verified command (for shell widgets)")
+	rootCmd.PersistentFlags().StringVar(&sshTarget, "ssh", "",
+		"Execute on remote host via SSH (format: user@host[:port])")
 
 	rootCmd.Version = lnta.Version
 	rootCmd.SetVersionTemplate("LNTA version {{.Version}}\n")
@@ -427,12 +431,39 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 		approveFn = approveWithTTY
 	}
 
+	runID := nextRunID()
+
+	// Set up executor (local or SSH)
+	var executor transport.TargetExecutor
+	if sshTarget != "" {
+		executor, err = transport.NewSSHExecutor(sshTarget, runID, ".")
+		if err != nil {
+			return fmt.Errorf("create SSH executor: %w", err)
+		}
+		defer executor.Close()
+
+		// Preflight: fingerprint remote host
+		ctx := context.Background()
+		if err := executor.Preflight(ctx); err != nil {
+			return fmt.Errorf("SSH preflight: %w", err)
+		}
+
+		// Display remote fingerprint for user confirmation
+		if fp := executor.RemoteFingerprint(); fp != nil && !commandOnly {
+			fmt.Printf("Connected to %s (%s %s)\n", sshTarget, fp.OSRelease["ID"], fp.OSRelease["VERSION_ID"])
+			fmt.Println()
+		}
+	} else {
+		executor = transport.NewLocalExecutor(runID, ".")
+	}
+
 	opts := []agent.Option{
-		agent.WithRunID(nextRunID()),
+		agent.WithRunID(runID),
 		agent.WithCWD("."),
 		agent.WithApprove(approveFn),
 		agent.WithConfig(cfg),
 		agent.WithDryRun(dryRunMode),
+		agent.WithExecutor(executor),
 	}
 	if explainMode {
 		// Explain Mode: physically remove write_scoped_file and mutate_system so

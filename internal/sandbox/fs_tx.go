@@ -1,16 +1,18 @@
 // Package sandbox provides a transactional, scope-checked file writer with an
 // undo log, plus bwrap-based read-only sandboxed execution.
 //
-// See AGENTS.md "Architectural Non-Negotiables".
+ // See AGENTS.md "Architectural Non-Negotiables".
 package sandbox
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -460,10 +462,55 @@ func PreviewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 // ~/.local/share/lnta/snapshots/<run_id>/manifest.json. Entries are processed
 // in reverse order; the snapshot directory is removed afterward. Wired to the
 // `lnta undo <run_id>` CLI command.
+//
+// Also processes remote manifests in remote_*/manifest.json subdirectories
+// for SSH-based remote file operations.
 func RollbackRun(runID string) error {
 	snapDir := snapshotDir(runID)
+
+	// 1. Process local manifest
+	if err := rollbackLocalManifest(runID, snapDir); err != nil {
+		return err
+	}
+
+	// 2. Scan for remote manifests
+	entries, err := os.ReadDir(snapDir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read snapshot dir %q: %w", snapDir, err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, "remote_") {
+			// Found remote manifest directory
+			remoteDir := filepath.Join(snapDir, name)
+			if err := rollbackRemoteManifest(runID, remoteDir, name); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Remove the snapshot directory after attempting all restores.
+	if rerr := os.RemoveAll(snapDir); rerr != nil {
+		return fmt.Errorf("remove snapshot dir %q: %w", snapDir, rerr)
+	}
+
+	audit.Log("fs.rollback", "", map[string]string{
+		"run_id": runID,
+	})
+	return nil
+}
+
+// rollbackLocalManifest processes the local manifest.json
+func rollbackLocalManifest(runID, snapDir string) error {
 	data, err := os.ReadFile(manifestPath(runID))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No local manifest, that's OK
+		}
 		return fmt.Errorf("read manifest for run %q: %w", runID, err)
 	}
 	var m manifest
@@ -471,16 +518,13 @@ func RollbackRun(runID string) error {
 		return fmt.Errorf("parse manifest for run %q: %w", runID, err)
 	}
 
-	var firstErr error
 	// Restore in reverse order so later writes are undone first.
 	for i := len(m.Entries) - 1; i >= 0; i-- {
 		e := m.Entries[i]
 		if e.Created {
 			// Newly created file: delete it.
 			if err := os.Remove(e.Path); err != nil && !os.IsNotExist(err) {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("remove created file %q: %w", e.Path, err)
-				}
+				return fmt.Errorf("remove created file %q: %w", e.Path, err)
 			}
 			continue
 		}
@@ -490,10 +534,7 @@ func RollbackRun(runID string) error {
 		}
 		blob, rerr := os.ReadFile(filepath.Join(snapDir, e.Backup))
 		if rerr != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("read backup blob %q: %w", e.Backup, rerr)
-			}
-			continue
+			return fmt.Errorf("read backup blob %q: %w", e.Backup, rerr)
 		}
 		mode := os.FileMode(0o644)
 		if e.Mode != "" {
@@ -504,28 +545,133 @@ func RollbackRun(runID string) error {
 		dir := filepath.Dir(e.Path)
 		tmp := filepath.Join(dir, fmt.Sprintf(".lnta-rollback-%d-%d", os.Getpid(), time.Now().UnixNano()))
 		if werr := os.WriteFile(tmp, blob, mode); werr != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("write restore temp for %q: %w", e.Path, werr)
-			}
-			continue
+			return fmt.Errorf("write restore temp for %q: %w", e.Path, werr)
 		}
 		if rerr := os.Rename(tmp, e.Path); rerr != nil {
 			_ = os.Remove(tmp)
-			if firstErr == nil {
-				firstErr = fmt.Errorf("restore %q: %w", e.Path, rerr)
+			return fmt.Errorf("restore %q: %w", e.Path, rerr)
+		}
+	}
+	return nil
+}
+
+// rollbackRemoteManifest processes a remote manifest and restores files via SSH
+// Uses direct SSH commands to avoid circular dependency with transport package.
+func rollbackRemoteManifest(runID, remoteDir, dirName string) error {
+	// Parse remote host from directory name: remote_user@host:port
+	_ = strings.TrimPrefix(dirName, "remote_")
+	manifestPath := filepath.Join(remoteDir, "manifest.json")
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read remote manifest %q: %w", manifestPath, err)
+	}
+
+	var m remoteManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("parse remote manifest %q: %w", manifestPath, err)
+	}
+
+	// Parse remote host string (user@host:port)
+	parts := strings.Split(m.RemoteHost, "@")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid remote host format: %s", m.RemoteHost)
+	}
+	user := parts[0]
+	hostPort := parts[1]
+	hostParts := strings.Split(hostPort, ":")
+	host := hostParts[0]
+	port := "22"
+	if len(hostParts) > 1 {
+		port = hostParts[1]
+	}
+
+	ctx := context.Background()
+
+	// Process entries in reverse order
+	for i := len(m.Entries) - 1; i >= 0; i-- {
+		e := m.Entries[i]
+		if e.Created {
+			// Newly created file: delete it via SSH
+			cmd := fmt.Sprintf("rm -f %s", shellQuote(e.Path))
+			if err := runSSHDirect(ctx, user, host, port, cmd); err != nil {
+				// Log but continue
+				fmt.Fprintf(os.Stderr, "Warning: failed to delete remote file %q: %v\n", e.Path, err)
 			}
+			continue
+		}
+		// Modified file: restore backup blob
+		if e.Backup == "" {
+			continue
+		}
+		blobPath := filepath.Join(remoteDir, e.Backup)
+		blob, rerr := os.ReadFile(blobPath)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to read backup blob %q: %v\n", e.Backup, rerr)
+			continue
+		}
+		// Write blob back via SSH
+		writeCmd := fmt.Sprintf("cat > %s <<'LNTA_EOF'\n%s\nLNTA_EOF", shellQuote(e.Path), string(blob))
+		if err := runSSHDirect(ctx, user, host, port, writeCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to restore remote file %q: %v\n", e.Path, err)
 		}
 	}
 
-	// Remove the snapshot directory after attempting all restores.
-	if rerr := os.RemoveAll(snapDir); rerr != nil && firstErr == nil {
-		firstErr = fmt.Errorf("remove snapshot dir %q: %w", snapDir, rerr)
-	}
+	return nil
+}
 
-	audit.Log("fs.rollback", "", map[string]string{
-		"run_id": runID,
-	})
-	return firstErr
+// runSSHDirect executes a command on a remote host via direct SSH call.
+func runSSHDirect(ctx context.Context, user, host, port, cmd string) error {
+	sshCmd := exec.CommandContext(ctx, "ssh",
+		"-o", "BatchMode=yes",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=~/.cache/lnta/ssh-%r@%h:%p",
+		"-o", "ControlPersist=60s",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-p", port,
+		fmt.Sprintf("%s@%s", user, host),
+		cmd,
+	)
+	sshCmd.Stdin = nil
+	sshCmd.Stdout = os.Stdout
+	sshCmd.Stderr = os.Stderr
+	return sshCmd.Run()
+}
+
+// remoteManifest represents the undo log for remote files.
+type remoteManifest struct {
+	RunID      string                  `json:"run_id"`
+	RemoteHost string                  `json:"remote_host"`
+	Entries    []remoteManifestEntry `json:"entries"`
+}
+
+type remoteManifestEntry struct {
+	Path    string `json:"path"`
+	Created bool   `json:"created"`
+	Mode    string `json:"mode,omitempty"`
+	SHA256  string `json:"sha256,omitempty"`
+	Backup  string `json:"backup,omitempty"`
+}
+
+// shellQuote safely quotes a string for use in a shell command.
+func shellQuote(s string) string {
+	// Use single quotes, escaping any embedded single quotes
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// SnapshotRoot returns the snapshot root directory (~/.local/share/lnta/snapshots).
+// Exported for use by transport package.
+func SnapshotRoot() string {
+	return snapshotRoot()
+}
+
+// ComputeSHA256 computes the SHA-256 hash of data.
+// Exported for use by transport package.
+func ComputeSHA256(data []byte) [32]byte {
+	return sha256.Sum256(data)
 }
 
 var _ = bytes.MinRead

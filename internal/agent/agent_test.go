@@ -16,6 +16,7 @@ import (
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me/lnta/internal/transport"
 )
 
 //go:embed testdata/dummy.md
@@ -150,7 +151,7 @@ func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
 		"summary":            "attempt 1",
 		"target_artifacts":   missing,
 		"verification_notes": "should fail",
-	}), ToolDeps{RunID: "run-1", Pack: &pack, Approve: DefaultApprove, CWD: home})
+	}), ToolDeps{RunID: "run-1", Pack: &pack, Approve: DefaultApprove, CWD: home, Executor: transport.NewLocalExecutor("run-1", home)})
 	if err != nil {
 		t.Fatalf("completeTask returned error: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
 		"summary":            "attempt 2",
 		"target_artifacts":   existing,
 		"verification_notes": "should pass",
-	}), ToolDeps{RunID: "run-1", Pack: &pack, Approve: DefaultApprove, CWD: home})
+	}), ToolDeps{RunID: "run-1", Pack: &pack, Approve: DefaultApprove, CWD: home, Executor: transport.NewLocalExecutor("run-1", home)})
 	if err != nil {
 		t.Fatalf("completeTask returned error: %v", err)
 	}
@@ -260,6 +261,7 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 		WithApprove(func(_, _, _, _ string) bool { return false }),
 		WithMaxTurns(8),
 		WithConfig(&Config{Model: "test-model"}),
+		WithExecutor(transport.NewLocalExecutor("run-t1", home)),
 	)
 
 	result, err := o.Run(context.Background(), "create a launcher", "", false)

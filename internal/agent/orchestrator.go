@@ -17,7 +17,7 @@ import (
 	"github.com/sm-me/lnta/internal/audit"
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
-	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me/lnta/internal/transport"
 )
 
 // LLMClient is the abstraction over the chat completions API. It is kept as an
@@ -63,6 +63,9 @@ type Orchestrator struct {
 	dryRun   bool
 
 	sysCtx fingerprint.SystemContext
+
+	// Executor for command execution (local or SSH)
+	executor transport.TargetExecutor
 
 	// Budget tracking for runaway loop and token budget circuit breaker.
 	budgetTracker *BudgetTracker
@@ -138,6 +141,11 @@ func WithAllowedTools(names []string) Option {
 	}
 }
 
+// WithExecutor sets the target executor (local or SSH).
+func WithExecutor(exec transport.TargetExecutor) Option {
+	return func(o *Orchestrator) { o.executor = exec }
+}
+
 // New constructs an Orchestrator with the four core tools registered.
 func New(client LLMClient, router *packs.Router, opts ...Option) *Orchestrator {
 	o := &Orchestrator{
@@ -152,6 +160,10 @@ func New(client LLMClient, router *packs.Router, opts ...Option) *Orchestrator {
 	}
 	for _, opt := range opts {
 		opt(o)
+	}
+	// Default to local executor if not set
+	if o.executor == nil {
+		o.executor = transport.NewLocalExecutor(o.runID, o.cwd)
 	}
 	return o
 }
@@ -198,7 +210,7 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string, pipeContext strin
 	// Turn 1 already knowing the ground truth.
 	var contextOutput string
 	if pack.ContextCmd != "" && pack.ContextCmd != "true" {
-		res, rerr := sandbox.RunReadOnly(ctx, pack.ContextCmd, o.cwd, 0)
+		res, rerr := o.executor.RunReadOnly(ctx, pack.ContextCmd, o.cwd, 0)
 		if rerr != nil || res.ExitCode != 0 {
 			contextOutput = fmt.Sprintf("[context_cmd produced no output: %v] %s", rerr, res.Stderr)
 		} else {
@@ -365,6 +377,7 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				CWD:          o.cwd,
 				DryRun:       o.dryRun,
 				RunCollector: o.runCollector,
+				Executor:     o.executor,
 			}
 			// Parse args to json.RawMessage for budget tracking
 			var argsJSON json.RawMessage
