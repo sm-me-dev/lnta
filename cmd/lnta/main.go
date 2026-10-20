@@ -33,6 +33,7 @@ var (
 	dryRunMode     bool
 	commandOnly    bool
 	sshTarget      string
+	localModelFlag string
 
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	labelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
@@ -97,6 +98,153 @@ Key bindings:
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return ui.RunTimeMachine()
 	},
+}
+
+// ollamaBaseURL is the OpenAI-compatible endpoint exposed by a local Ollama server.
+const ollamaBaseURL = "http://127.0.0.1:11434/v1"
+
+var modelsCmd = &cobra.Command{
+	Use:   "models",
+	Short: "List configured remote models and auto-discovered local Ollama models",
+	Long: `List the currently configured remote LLM models and auto-discover local Ollama models
+	running at http://127.0.0.1:11434/api/tags.
+
+Use --local flag with a prompt to force 100% offline execution via the best detected local model.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := agent.LoadConfig()
+		if err != nil {
+			// Config may fail without an API key; that's OK for listing local models.
+			cfg = nil
+		}
+
+		fmt.Println("Configured remote models:")
+		if cfg != nil {
+			fmt.Printf("  Model: %s (BaseURL: %s)\n", cfg.Model, cfg.BaseURL)
+		} else {
+			fmt.Println("  (no remote config — API key not set)")
+		}
+
+		fmt.Println("\nAuto-discovered local Ollama models:")
+		discovered, hasToolCalling, discErr := agent.DiscoverLocalOllama()
+		if discErr != nil {
+			fmt.Printf("  Ollama discovery failed: %v (ensure Ollama is running at http://127.0.0.1:11434/)\n", discErr)
+		} else if len(discovered) > 0 {
+			for _, m := range discovered {
+				tc := ""
+				if hasToolCalling {
+					tc = " [tool-calling]"
+				}
+				fmt.Printf("  - %s (size: %d bytes)%s\n", m.ID, m.Size, tc)
+			}
+		} else {
+			fmt.Println("  No local Ollama models discovered (ensure Ollama is running at http://127.0.0.1:11434/)")
+		}
+
+		// If --local flag was provided with a prompt, run 100% offline via Ollama.
+		if localModelFlag != "" {
+			return runLocalOllama(localModelFlag, commandOnly)
+		}
+
+		return nil
+	},
+}
+
+// runLocalOllama executes a prompt 100% offline using the best detected local
+// Ollama model. It never contacts a remote LLM provider.
+func runLocalOllama(prompt string, commandOnly bool) error {
+	discovered, _, err := agent.DiscoverLocalOllama()
+	if err != nil {
+		return fmt.Errorf("ollama discovery failed: %w. Start Ollama at http://127.0.0.1:11434/", err)
+	}
+	if len(discovered) == 0 {
+		return fmt.Errorf("no local Ollama models discovered — start Ollama and pull a model (e.g. qwen2.5-coder)")
+	}
+
+	// Select the best model: prefer known tool-calling models, then first available.
+	preferred := []string{"qwen2.5-coder", "llama3.3", "mistral", "codellama", "deepseek-coder"}
+	selected := discovered[0].ID
+	for _, pref := range preferred {
+		for _, m := range discovered {
+			if m.ID == pref || strings.HasPrefix(m.ID, pref+":") {
+				selected = m.ID
+				break
+			}
+		}
+		if selected != discovered[0].ID {
+			break
+		}
+	}
+
+	fmt.Printf("Offline mode: using local Ollama model %s\n", selected)
+	fmt.Printf("Prompt: %s\n\n", prompt)
+
+	sys, err := fingerprint.Fingerprint()
+	if err != nil {
+		return fmt.Errorf("fingerprint: %w", err)
+	}
+
+	router, err := packs.NewRouter(lnta.EmbeddedPacks, "packs/*.md", userConfigDir)
+	if err != nil {
+		return fmt.Errorf("load packs: %w", err)
+	}
+	packs.SetDefaultRouter(router)
+
+	selectedPacks, err := router.SelectPacks(prompt, sys)
+	if err != nil {
+		return fmt.Errorf("route: %w", err)
+	}
+	pack := selectedPacks[0]
+
+	// Display environment-specific warnings.
+	for _, w := range packs.PackEnvironmentWarnings(pack, sys) {
+		fmt.Printf("[env-warning] %s\n", w)
+	}
+
+	if !commandOnly {
+		fmt.Println(ui.StatusLine(pack.ID, "Planning (offline)", "", false))
+		fmt.Println()
+	}
+
+	// Build an OpenAI-compatible client pointed at local Ollama (no API key needed).
+	client, err := agent.NewOllamaClient(selected)
+	if err != nil {
+		return fmt.Errorf("ollama client: %w", err)
+	}
+
+	runID := nextRunID()
+	exec := transport.NewLocalExecutor(runID, ".")
+
+	opts := []agent.Option{
+		agent.WithRunID(runID),
+		agent.WithCWD("."),
+		agent.WithApprove(defaultApprove),
+		agent.WithConfig(&agent.Config{Model: selected, BaseURL: ollamaBaseURL}),
+		agent.WithDryRun(dryRunMode),
+		agent.WithExecutor(exec),
+	}
+	if explainMode {
+		opts = append(opts, agent.WithAllowedTools([]string{"inspect_system", "complete_task"}))
+	}
+
+	o := agent.New(client, router, opts...)
+
+	ctx, cancel := agent.WithSignalCancellation()
+	defer cancel()
+
+	result, err := o.Run(ctx, prompt, "", commandOnly)
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+
+	if !commandOnly {
+		fmt.Println(renderResult(result, o.RunID(), pack))
+	} else {
+		cmd := extractVerifiedCommand(result)
+		if cmd != "" {
+			fmt.Println(cmd)
+		}
+	}
+	return nil
 }
 
 var packsCmd = &cobra.Command{
@@ -335,7 +483,9 @@ Use "lnta undo [run_id]" to revert a previous run.
 Use "lnta undo -i" to interactively select a run to undo.
 Use "lnta sessions" to browse past runs in the Time Machine TUI.
 Use "lnta init <zsh|bash|fish>" to generate shell integration.
-Use "lnta fix" to automatically fix the last failed command.`,
+Use "lnta fix" to automatically fix the last failed command.
+Use "lnta models" to list configured remote models and auto-discovered local Ollama models.
+Use "lnta --local <prompt>" to force 100% offline execution via the best detected local Ollama model.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return cmd.Help()
@@ -360,6 +510,9 @@ func init() {
 		"Output only the verified command (for shell widgets)")
 	rootCmd.PersistentFlags().StringVar(&sshTarget, "ssh", "",
 		"Execute on remote host via SSH (format: user@host[:port])")
+	rootCmd.PersistentFlags().StringVar(&localModelFlag, "local", "",
+		"Force 100% offline execution via the best detected local Ollama model. "+
+			"Optionally provide a prompt to run immediately with the local model.")
 
 	rootCmd.Version = lnta.Version
 	rootCmd.SetVersionTemplate("LNTA version {{.Version}}\n")
@@ -372,6 +525,7 @@ func init() {
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(fixCmd)
 	rootCmd.AddCommand(mcpCmd)
+	rootCmd.AddCommand(modelsCmd)
 
 	// Hidden command for Landlock sandbox self-re-exec
 	rootCmd.AddCommand(sandboxExecCmd)
@@ -380,6 +534,11 @@ func init() {
 // runPrompt runs one-shot execution mode through the agent orchestrator.
 func runPrompt(cmd *cobra.Command, args []string) error {
 	prompt := strings.Join(args, " ")
+
+	// --local forces 100% offline execution via the best detected local Ollama model.
+	if localModelFlag != "" {
+		return runLocalOllama(prompt, commandOnly)
+	}
 
 	// Detect pipe on stdin early
 	stdinIsPipe := shell.IsStdinPipe()
@@ -408,6 +567,11 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("route: %w", err)
 	}
 	pack := selected[0]
+
+	// Display environment-specific warnings (WSL2, container, headless SSH).
+	for _, w := range packs.PackEnvironmentWarnings(pack, sys) {
+		fmt.Printf("[env-warning] %s\n", w)
+	}
 
 	// Compact status line at the start of execution.
 	if !commandOnly {
@@ -677,6 +841,12 @@ func runPromptArgs(prompt string) error {
 		return fmt.Errorf("route: %w", err)
 	}
 	pack := selected[0]
+
+	// Display environment-specific warnings (WSL2, container, headless SSH).
+	for _, w := range packs.PackEnvironmentWarnings(pack, sys) {
+		fmt.Printf("[env-warning] %s\n", w)
+	}
+
 	fmt.Println(ui.StatusLine(pack.ID, "Running", "", false))
 	cfg, err := agent.LoadConfig()
 	if err != nil {

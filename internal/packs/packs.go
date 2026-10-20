@@ -398,6 +398,57 @@ func (r *Router) PackByID(id string) *Pack {
 	return nil
 }
 
+// PackEnvironmentWarnings returns environment-specific warnings for the given
+// pack when run in the described system context. It checks required binaries
+// against environment capabilities (e.g. systemd availability in WSL2 or
+// rootless containers) and suggests container-native alternatives where
+// applicable.
+func PackEnvironmentWarnings(p Pack, ctx fingerprint.SystemContext) []string {
+	var warnings []string
+
+	// If the pack requires systemctl/systemd-analyze but systemd is not
+	// available (WSL2 without systemd=true, or rootless container without
+	// systemd as PID 1), warn and suggest container-native alternatives.
+	needsSystemd := false
+	for _, bin := range p.RequiredBins {
+		if bin == "systemctl" || bin == "systemd-analyze" || bin == "loginctl" {
+			needsSystemd = true
+			break
+		}
+	}
+
+	if needsSystemd && !ctx.SystemdEnabled {
+		warnings = append(warnings,
+			"pack requires systemd binaries (systemctl/systemd-analyze/loginctl) but systemd is not available in this environment")
+		if ctx.IsContainer {
+			warnings = append(warnings,
+				"rootless container without systemd: use `docker ps`/`podman ps` instead of `systemctl status`, `docker logs`/`podman logs` instead of `journalctl`, and `docker exec`/`podman exec` instead of `systemctl start/stop`")
+		}
+		if ctx.IsWSL2 {
+			warnings = append(warnings,
+				"WSL2 without systemd=true in /etc/wsl.conf: systemctl will fail; add `systemd=true` to /etc/wsl.conf and restart the WSL2 instance, or use `service` / `wsl.exe` directly")
+		}
+		if !ctx.IsContainer && !ctx.IsWSL2 {
+			warnings = append(warnings,
+				"systemd is not running as PID 1; systemctl operations will fail with \"System has not been booted with systemd\"")
+		}
+	}
+
+	// WSL2-specific desktop-entry warning.
+	if p.ID == "linux-desktop-entries" && ctx.IsWSL2 {
+		warnings = append(warnings,
+			"WSL2 desktop-entry packs: prefer `wslview` over `xdg-open` for launching .desktop files; WSLg may be required for GUI display")
+	}
+
+	// Container-specific docker-compose warning.
+	if p.ID == "docker-compose-diagnostics" && ctx.IsContainer && ctx.ContainerRuntime != "docker" {
+		warnings = append(warnings,
+			"docker-compose pack selected in a non-Docker container runtime: docker socket may not be mounted; use the matching container runtime CLI instead")
+	}
+
+	return warnings
+}
+
 // AllPacks returns all loaded packs (sorted by id).
 func (r *Router) AllPacks() []Pack {
 	out := make([]Pack, len(r.packs))

@@ -117,6 +117,18 @@ func NewOpenAIClient(cfg *Config) (LLMClient, error) {
 	return &openaiClient{client: client}, nil
 }
 
+// NewOllamaClient builds an LLMClient pointed at a local Ollama server's
+// OpenAI-compatible endpoint (http://127.0.0.1:11434/v1). No API key is
+// required — Ollama does not authenticate local calls. This enables 100%
+// offline execution for airgapped sysadmin tasks.
+func NewOllamaClient(model string) (LLMClient, error) {
+	cliCfg := openai.DefaultConfig("")
+	cliCfg.BaseURL = ollamaBaseURL
+	client := openai.NewClientWithConfig(cliCfg)
+	// Override the default model so callers can use WithConfig(Model=model).
+	return &openaiClient{client: client}, nil
+}
+
 // WithDryRun enables dry-run mode: file writes become diff-only previews and
 // host mutations are blocked.
 func WithDryRun(dry bool) Option {
