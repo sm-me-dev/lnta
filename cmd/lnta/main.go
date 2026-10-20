@@ -49,8 +49,15 @@ var chatCmd = &cobra.Command{
 var undoCmd = &cobra.Command{
 	Use:   "undo [run_id]",
 	Short: "Undo a previous run by run id (defaults to the most recent run)",
-	Args:  cobra.MaximumNArgs(1),
+	Long: `Undo a previous run by run id. If no run_id is provided, reverts the most recent run.
+
+Use --interactive (-i) to launch the Time Machine TUI for selecting which run to undo.`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		interactive, _ := cmd.Flags().GetBool("interactive")
+		if interactive {
+			return ui.RunTimeMachineForUndo()
+		}
 		runID := ""
 		if len(args) == 1 {
 			runID = args[0]
@@ -66,6 +73,27 @@ var undoCmd = &cobra.Command{
 		}
 		fmt.Printf("undone run %q\n", runID)
 		return nil
+	},
+}
+
+var sessionsCmd = &cobra.Command{
+	Use:   "sessions",
+	Short: "Launch interactive Time Machine TUI to browse past runs",
+	Long: `Launch the Time Machine TUI for browsing, inspecting, and rolling back past lnta runs.
+
+The TUI shows a fuzzy-searchable list of past runs with their timestamps, prompts,
+instruction packs, and status icons (✓ verified, ✗ failed, ↩ rolled back).
+
+Key bindings:
+  ↑/↓/j/k    Navigate the run list
+  /          Filter runs by prompt or pack
+  Tab        Switch between left (list) and right (detail) panes
+  Enter/u    Roll back the selected run
+  r          Resume an interactive chat session (planned)
+  d          Export run as Markdown report and shell script
+  q/Ctrl+C   Quit`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return ui.RunTimeMachine()
 	},
 }
 
@@ -174,6 +202,10 @@ func init() {
 	packsValidateCmd.Flags().Bool("run-context-cmd", false, "Execute context_cmd in sandbox to validate (requires bwrap/Landlock)")
 	packsValidateCmd.Flags().Bool("strict", false, "Treat warnings as errors and exit with non-zero code on validation failure")
 	packsValidateCmd.Flags().Bool("json", false, "Output results as JSON")
+}
+
+func init() {
+	undoCmd.Flags().BoolP("interactive", "i", false, "Launch interactive Time Machine TUI to select run to undo")
 }
 
 var doctorCmd = &cobra.Command{
@@ -298,6 +330,8 @@ Use "lnta --explain <prompt>" for Explain Mode (no state mutation possible).
 Use "lnta --dry-run <prompt>" to inspect proposed diffs without writing.
 Use "lnta chat" for an interactive multi-turn session.
 Use "lnta undo [run_id]" to revert a previous run.
+Use "lnta undo -i" to interactively select a run to undo.
+Use "lnta sessions" to browse past runs in the Time Machine TUI.
 Use "lnta init <zsh|bash|fish>" to generate shell integration.
 Use "lnta fix" to automatically fix the last failed command.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -328,6 +362,7 @@ func init() {
 
 	rootCmd.AddCommand(chatCmd)
 	rootCmd.AddCommand(undoCmd)
+	rootCmd.AddCommand(sessionsCmd)
 	rootCmd.AddCommand(packsCmd)
 	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(initCmd)

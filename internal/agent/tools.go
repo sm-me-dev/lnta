@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/sashabaranov/go-openai"
+	"github.com/sm-me/lnta/internal/audit"
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
 )
@@ -41,11 +42,12 @@ type ToolFunc func(ctx context.Context, args json.RawMessage, deps ToolDeps) (re
 
 // ToolDeps are the dependencies injected into every tool call.
 type ToolDeps struct {
-	RunID    string
-	Pack     *packs.Pack   // active instruction pack (may be nil)
-	Approve  ApproveFunc   // mutate_system approval callback
-	CWD      string        // working directory for sandboxed commands
-	DryRun   bool          // when true, writes are diff-only previews and mutations are blocked
+	RunID         string
+	Pack          *packs.Pack       // active instruction pack (may be nil)
+	Approve       ApproveFunc       // mutate_system approval callback
+	CWD           string            // working directory for sandboxed commands
+	DryRun        bool              // when true, writes are diff-only previews and mutations are blocked
+	RunCollector  *audit.RunSummaryCollector // for recording run metadata
 }
 
 // ApproveFunc is consulted before executing a mutate_system command. It should
@@ -180,6 +182,20 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 		b.WriteString("--- stderr ---\n")
 		b.WriteString(res.Stderr)
 	}
+
+	// Record command for time-machine TUI
+	if deps.RunCollector != nil {
+		deps.RunCollector.RecordCommand(audit.CommandRecord{
+			Command:   in.Command,
+			ExitCode:  res.ExitCode,
+			Stdout:    res.Stdout,
+			Stderr:    res.Stderr,
+			Timestamp: time.Now().UTC(),
+			Source:    "inspect_system",
+			Truncated: res.Truncated,
+		})
+	}
+
 	return b.String(), nil
 }
 
@@ -238,6 +254,21 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 				sve.Error(), allowed), nil
 		}
 		return "", fmt.Errorf("write_scoped_file: %w", err)
+	}
+
+	// Record file diff for time-machine TUI
+	if deps.RunCollector != nil {
+		deps.RunCollector.RecordFileDiff(audit.FileDiffInfo{
+			TargetPath: diff.TargetPath,
+			Created:    diff.Created,
+			OldMode:    fmt.Sprintf("%04o", diff.OldMode),
+			NewMode:    fmt.Sprintf("%04o", diff.Mode),
+			OldSHA256:  diff.OldSHA256,
+			NewSHA256:  diff.NewSHA256,
+			SizeOld:    diff.SizeOld,
+			SizeNew:    diff.SizeNew,
+			Diff:       diff.Diff,
+		})
 	}
 
 	var b strings.Builder
@@ -323,6 +354,25 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	var exitCode int
+	if ex, ok := err.(*exec.ExitError); ok {
+		exitCode = ex.ExitCode()
+	} else if err != nil {
+		exitCode = -1
+	}
+
+	// Record command for time-machine TUI
+	if deps.RunCollector != nil {
+		deps.RunCollector.RecordCommand(audit.CommandRecord{
+			Command:   in.Command,
+			ExitCode:  exitCode,
+			Stdout:    stdout.String(),
+			Stderr:    stderr.String(),
+			Timestamp: time.Now().UTC(),
+			Source:    "mutate_system",
+		})
+	}
+
 	if ex, ok := err.(*exec.ExitError); ok {
 		return fmt.Sprintf("exit_code=%d\n--- stdout ---\n%s\n--- stderr ---\n%s",
 			ex.ExitCode(), stdout.String(), stderr.String()), nil
@@ -365,12 +415,43 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		}
 		res, err := sandbox.RunReadOnly(ctx, verifyCmd, cwd, 0)
 		if err != nil {
+			// Record failed verification
+			if deps.RunCollector != nil {
+				deps.RunCollector.RecordVerification(audit.VerificationRecord{
+					Command:   verifyCmd,
+					ExitCode:  -1,
+					Output:    res.Stderr,
+					Timestamp: time.Now().UTC(),
+					Passed:    false,
+				})
+			}
 			return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: verify_cmd failed to run: %v. stderr: %s. Fix the issue and verify again.",
 				err, res.Stderr), nil
 		}
 		if res.ExitCode != 0 {
+			// Record failed verification
+			if deps.RunCollector != nil {
+				deps.RunCollector.RecordVerification(audit.VerificationRecord{
+					Command:   verifyCmd,
+					ExitCode:  res.ExitCode,
+					Output:    res.Stderr,
+					Timestamp: time.Now().UTC(),
+					Passed:    false,
+				})
+			}
 			return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: verify_cmd exited %d. stderr: %s. Fix the issue and verify again.",
 				res.ExitCode, res.Stderr), nil
+		}
+
+		// Record successful verification
+		if deps.RunCollector != nil {
+			deps.RunCollector.RecordVerification(audit.VerificationRecord{
+				Command:   verifyCmd,
+				ExitCode:  res.ExitCode,
+				Output:    res.Stdout,
+				Timestamp: time.Now().UTC(),
+				Passed:    true,
+			})
 		}
 	}
 

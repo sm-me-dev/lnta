@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sashabaranov/go-openai"
+	"github.com/sm-me/lnta/internal/audit"
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
@@ -65,6 +66,9 @@ type Orchestrator struct {
 
 	// Budget tracking for runaway loop and token budget circuit breaker.
 	budgetTracker *BudgetTracker
+
+	// Run summary collection for time-machine TUI.
+	runCollector *audit.RunSummaryCollector
 }
 
 // Option configures an Orchestrator.
@@ -187,6 +191,9 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string, pipeContext strin
 		fmt.Fprintf(os.Stderr, "[warn] routing took %v (>2ms)\n", elapsed)
 	}
 
+	// Initialize run summary collector for time-machine TUI.
+	o.runCollector = audit.NewRunSummaryCollector(o.runID, prompt, pack.ID, o.cwd)
+
 	// Step 3: Run the pack's context_cmd inside RunReadOnly so the LLM starts
 	// Turn 1 already knowing the ground truth.
 	var contextOutput string
@@ -197,6 +204,16 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string, pipeContext strin
 		} else {
 			contextOutput = strings.TrimSpace(res.Stdout)
 		}
+		// Record context_cmd as a command execution
+		o.runCollector.RecordCommand(audit.CommandRecord{
+			Command:   pack.ContextCmd,
+			ExitCode:  res.ExitCode,
+			Stdout:    res.Stdout,
+			Stderr:    res.Stderr,
+			Timestamp: time.Now().UTC(),
+			Source:    "verify_cmd",
+			Truncated: res.Truncated,
+		})
 	}
 
 	// Step 4: Construct the slim System Prompt.
@@ -299,6 +316,11 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 		completionTokens := estimateCompletionTokens(assistantContent.String())
 		o.budgetTracker.RecordCompletionTokens(completionTokens)
 
+		// Record tokens for time-machine TUI
+		if o.runCollector != nil {
+			o.runCollector.RecordTokens(promptTokens, completionTokens)
+		}
+
 		assistantMsg := openai.ChatCompletionMessage{
 			Role: openai.ChatMessageRoleAssistant,
 		}
@@ -337,11 +359,12 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				continue
 			}
 			deps := ToolDeps{
-				RunID:   o.runID,
-				Pack:    &pack,
-				Approve: o.approve,
-				CWD:     o.cwd,
-				DryRun:  o.dryRun,
+				RunID:        o.runID,
+				Pack:         &pack,
+				Approve:      o.approve,
+				CWD:          o.cwd,
+				DryRun:       o.dryRun,
+				RunCollector: o.runCollector,
 			}
 			// Parse args to json.RawMessage for budget tracking
 			var argsJSON json.RawMessage
@@ -357,7 +380,12 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			shouldBlock, hint := o.budgetTracker.RecordToolCall(p.name, argsJSON, err == nil && !strings.HasPrefix(result, "TOOL_ERROR:"), err)
 			if shouldBlock {
 				// Circuit breaker triggered - inject hint and stop
-				return fmt.Sprintf("CIRCUIT_BREAKER_TRIGGERED: %s", hint), nil
+			if o.runCollector != nil {
+				o.runCollector.SetStatus(audit.RunStatusFailed)
+				o.runCollector.SetError("circuit breaker triggered: " + hint)
+				_ = o.runCollector.Save()
+			}
+			return fmt.Sprintf("CIRCUIT_BREAKER_TRIGGERED: %s", hint), nil
 			}
 
 			if err != nil {
@@ -375,10 +403,28 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			// The last complete_task result is the final outcome. Return the
 			// last TASK_COMPLETE (or HARNESS_VERIFICATION_FAILED) message.
 			last := toolResults[len(toolResults)-1]
+
+			// Save run summary on completion
+			if o.runCollector != nil {
+				if strings.Contains(last.Content, "TASK_COMPLETE:") {
+					o.runCollector.SetStatus(audit.RunStatusVerified)
+				} else if strings.Contains(last.Content, "HARNESS_VERIFICATION_FAILED:") {
+					o.runCollector.SetStatus(audit.RunStatusFailed)
+				}
+				_ = o.runCollector.Save()
+			}
+
 			return last.Content, nil
 		}
 		// Otherwise the loop continues, giving the LLM the tool results and
 		// another turn to self-correct or call complete_task again.
+	}
+
+	// Save run summary on max_turns reached
+	if o.runCollector != nil {
+		o.runCollector.SetStatus(audit.RunStatusFailed)
+		o.runCollector.SetError("max_turns reached without successful task completion")
+		_ = o.runCollector.Save()
 	}
 
 	return "", fmt.Errorf("max_turns (%d) reached without successful task completion", o.maxTurns)
