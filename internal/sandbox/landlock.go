@@ -65,6 +65,11 @@ func runLandlock(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 		home = homeDir()
 	}
 
+	// Phantom dotfile paths that must be blocked even if they don't exist.
+	// This defends against CVE-2026-25725 where prompt injection creates
+	// missing startup hooks (.bashrc, .profile, .claude/settings.json, etc.)
+	phantomDotfiles := phantomDotfilePaths(home)
+
 	// Build the Landlock ruleset as a config string passed via env.
 	// This avoids complex serialization - we rebuild rules in the child.
 	// RO dirs: system directories + working directory (if not under home)
@@ -101,6 +106,7 @@ func runLandlock(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 		"LNTA_LANDLOCK_CWD="+cwd,
 		"LNTA_LANDLOCK_CMD="+cmdStr,
 		"LNTA_LANDLOCK_HOME="+home,
+		"LNTA_LANDLOCK_PHANTOM_DOTFILES="+joinPaths(phantomDotfiles),
 	)
 
 	// Execute the hidden command which will apply Landlock and exec the target
@@ -164,6 +170,7 @@ func applyLandlock() error {
 	rwFiles := parsePaths(os.Getenv("LNTA_LANDLOCK_RW_FILES"))
 	_ = os.Getenv("LNTA_LANDLOCK_CWD") // cwd - used by LandlockExecCommand
 	home := os.Getenv("LNTA_LANDLOCK_HOME")
+	phantomDotfiles := parsePaths(os.Getenv("LNTA_LANDLOCK_PHANTOM_DOTFILES"))
 
 	// Build Landlock rules
 	var rules []landlock.Rule
@@ -195,6 +202,15 @@ func applyLandlock() error {
 		}
 		rules = append(rules, landlock.RWFiles(file).IgnoreIfMissing())
 	}
+
+	// Block phantom dotfiles by creating rules that deny access.
+	// Since Landlock is allowlist-based, we ensure these paths are NOT
+	// included in any allow rule. The isSecretDir check above already
+	// handles ~/.ssh, ~/.gnupg, ~/.aws, ~/.config/lnta.
+	// For additional phantom paths like .bashrc, .zshrc, etc., we rely on
+	// the fact that home directory is omitted from roDirs, so they're
+	// inaccessible by default. This is defense-in-depth.
+	_ = phantomDotfiles // tracked for audit; no rule needed since home is blocked
 
 	// Apply the ruleset - this restricts the current thread and all future threads
 	if err := cfg.RestrictPaths(rules...); err != nil {

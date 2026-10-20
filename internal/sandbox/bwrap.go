@@ -115,18 +115,67 @@ func runBwrap(ctx context.Context, cmdStr string, cwd string, timeout time.Durat
 		home = homeDir()
 	}
 
+	// Phantom dotfile paths that must be blocked even if they don't exist.
+	// This defends against CVE-2026-25725 where prompt injection creates
+	// missing startup hooks (.bashrc, .profile, .claude/settings.json, etc.)
+	phantomDotfiles := phantomDotfilePaths(home)
+
 	args := []string{
 		"--ro-bind", "/", "/",
 		"--dev", "/dev",
 		"--proc", "/proc",
 		"--tmpfs", "/tmp",
 		"--die-with-parent",
+		// Zero-egress network namespace: no outbound TCP/UDP possible.
+		// Combined with --unshare-ipc, --unshare-pid, --new-session this
+		// makes network data exfiltration physically impossible at kernel level.
+		"--unshare-net",
+		"--unshare-ipc",
+		"--unshare-pid",
+		"--new-session",
 	}
 
 	// Mask secret-bearing directories so they appear empty inside the sandbox.
 	for _, d := range secretMaskDirs(home) {
 		if _, statErr := os.Stat(d); statErr == nil {
 			args = append(args, "--tmpfs", d)
+		}
+	}
+
+	// Mask phantom dotfiles by binding /dev/null over them.
+	// Only apply to files that exist, or whose parent directory is not the home directory
+	// (since home is mounted read-only via --ro-bind / /).
+	// Skip paths already covered by secretMaskDirs (which use --tmpfs for isolation).
+	secretDirs := secretMaskDirs(home)
+	for _, p := range phantomDotfiles {
+		// Check if this path is already covered by secretMaskDirs
+		coveredBySecretDirs := false
+		for _, sd := range secretDirs {
+			if strings.HasPrefix(p, sd+string(filepath.Separator)) || p == sd {
+				coveredBySecretDirs = true
+				break
+			}
+		}
+		if coveredBySecretDirs {
+			continue // secretMaskDirs handles this with --tmpfs isolation
+		}
+
+		if _, statErr := os.Stat(p); statErr == nil {
+			// File exists - bind /dev/null over it
+			args = append(args, "--ro-bind", "/dev/null", p)
+		} else {
+			// File doesn't exist - check if parent is home directory
+			parent := filepath.Dir(p)
+			home := os.Getenv("HOME")
+			if home == "" {
+				home = homeDir()
+			}
+			// Skip if parent is home directory (can't bind over non-existent file in read-only home)
+			if parent != home {
+				if _, pstatErr := os.Stat(parent); pstatErr == nil {
+					args = append(args, "--ro-bind", "/dev/null", p)
+				}
+			}
 		}
 	}
 
@@ -177,6 +226,29 @@ func runBwrap(ctx context.Context, cmdStr string, cwd string, timeout time.Durat
 	})
 
 	return res, err
+}
+
+// phantomDotfilePaths returns a list of dotfile paths that must be blocked
+// even if they don't exist, to prevent phantom dotfile injection (CVE-2026-25725).
+// These are common shell/startup configuration files that prompt injection
+// could create to achieve persistence.
+func phantomDotfilePaths(home string) []string {
+	if home == "" {
+		return nil
+	}
+	return []string{
+		filepath.Join(home, ".bashrc"),
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".profile"),
+		filepath.Join(home, ".bash_profile"),
+		filepath.Join(home, ".bash_login"),
+		filepath.Join(home, ".bash_logout"),
+		filepath.Join(home, ".ssh", "authorized_keys"),
+		filepath.Join(home, ".ssh", "config"),
+		filepath.Join(home, ".config", "lnta"),
+		filepath.Join(home, ".config", "claude", "settings.json"),
+		filepath.Join(home, ".config", "claude", "settings.local.json"),
+	}
 }
 
 // RunReadOnly executes sh -c cmdStr inside a sandbox with the entire

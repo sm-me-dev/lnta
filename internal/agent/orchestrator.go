@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -61,6 +62,9 @@ type Orchestrator struct {
 	dryRun   bool
 
 	sysCtx fingerprint.SystemContext
+
+	// Budget tracking for runaway loop and token budget circuit breaker.
+	budgetTracker *BudgetTracker
 }
 
 // Option configures an Orchestrator.
@@ -133,13 +137,14 @@ func WithAllowedTools(names []string) Option {
 // New constructs an Orchestrator with the four core tools registered.
 func New(client LLMClient, router *packs.Router, opts ...Option) *Orchestrator {
 	o := &Orchestrator{
-		client:   client,
-		router:   router,
-		tools:    toolByName(CoreTools()),
-		maxTurns: 8,
-		runID:    "run-" + time.Now().UTC().Format("20060102T150405"),
-		cwd:      ".",
-		approve:  DefaultApprove,
+		client:        client,
+		router:        router,
+		tools:         toolByName(CoreTools()),
+		maxTurns:      8,
+		runID:         "run-" + time.Now().UTC().Format("20060102T150405"),
+		cwd:           ".",
+		approve:       DefaultApprove,
+		budgetTracker: NewBudgetTracker(),
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -210,7 +215,15 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
 
+	// Attach budget tracker to context for tool access
+	ctx = WithBudgetTracker(ctx, o.budgetTracker)
+
 	for turn := 0; turn < o.maxTurns; turn++ {
+		// Check circuit breaker before each turn
+		if o.budgetTracker.IsCircuitBreakerTriggered() {
+			return "", fmt.Errorf("circuit breaker triggered: %s", o.budgetTracker.CircuitBreakerReason())
+		}
+
 		if err := ctx.Err(); err != nil {
 			return "", fmt.Errorf("cancelled: %w", err)
 		}
@@ -224,6 +237,8 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			MaxTokens:   o.maxTokens(),
 			Stream:      true,
 		}
+		// Convert tool params to string for token estimation
+		_ = toolDefs
 
 		stream, err := o.client.ChatCompletionStream(ctx, req)
 		if err != nil {
@@ -234,6 +249,10 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 		// pending accumulates in-call tool calls keyed by stream index.
 		pending := make(map[int]*streamingToolCall)
 		var order []int
+
+		// Track tokens from this request (approximate)
+		promptTokens := estimatePromptTokens(messages, toolDefs)
+		o.budgetTracker.RecordPromptTokens(promptTokens)
 
 		for {
 			if err := ctx.Err(); err != nil {
@@ -275,6 +294,10 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			}
 		}
 		stream.Close()
+
+		// Estimate completion tokens
+		completionTokens := estimateCompletionTokens(assistantContent.String())
+		o.budgetTracker.RecordCompletionTokens(completionTokens)
 
 		assistantMsg := openai.ChatCompletionMessage{
 			Role: openai.ChatMessageRoleAssistant,
@@ -320,7 +343,23 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				CWD:     o.cwd,
 				DryRun:  o.dryRun,
 			}
-			result, err := tool.Func(ctx, []byte(p.args), deps)
+			// Parse args to json.RawMessage for budget tracking
+			var argsJSON json.RawMessage
+			if p.args != "" {
+				argsJSON = json.RawMessage(p.args)
+			} else {
+				argsJSON = json.RawMessage("{}")
+			}
+
+			result, err := tool.Func(ctx, argsJSON, deps)
+
+			// Record tool call for circuit breaker detection
+			shouldBlock, hint := o.budgetTracker.RecordToolCall(p.name, argsJSON, err == nil && !strings.HasPrefix(result, "TOOL_ERROR:"), err)
+			if shouldBlock {
+				// Circuit breaker triggered - inject hint and stop
+				return fmt.Sprintf("CIRCUIT_BREAKER_TRIGGERED: %s", hint), nil
+			}
+
 			if err != nil {
 				toolResults = append(toolResults, toolResultMessage(p.id, "", err))
 				continue
@@ -470,4 +509,34 @@ task completion only after verification passes.`
 // child processes.
 func WithSignalCancellation() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt)
+}
+
+// estimatePromptTokens roughly estimates the number of tokens in the prompt.
+// This is a heuristic since we don't have access to the tokenizer.
+// Roughly: 1 token ≈ 4 characters for English text.
+func estimatePromptTokens(messages []openai.ChatCompletionMessage, tools []openai.Tool) int {
+	var totalChars int
+	for _, msg := range messages {
+		totalChars += len(msg.Content)
+	}
+	// Add estimate for tool definitions
+	for _, tool := range tools {
+		totalChars += len(tool.Function.Description)
+		if tool.Function.Parameters != nil {
+			// Parameters is any type, need to marshal to JSON for length
+			if b, err := json.Marshal(tool.Function.Parameters); err == nil {
+				totalChars += len(b)
+			}
+		}
+	}
+	// Add overhead for message formatting
+	totalChars += len(messages) * 50
+	// 1 token ≈ 4 chars
+	return totalChars / 4
+}
+
+// estimateCompletionTokens roughly estimates the number of tokens in the completion.
+func estimateCompletionTokens(content string) int {
+	// 1 token ≈ 4 chars
+	return len(content) / 4
 }

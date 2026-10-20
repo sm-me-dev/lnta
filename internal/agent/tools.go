@@ -251,10 +251,11 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 }
 
 type mutateInput struct {
-	Command   string `json:"command"`
-	CWD       string `json:"cwd"`
-	RiskLevel string `json:"risk_level"`
-	Reason    string `json:"reason"`
+	Command       string `json:"command"`
+	CWD           string `json:"cwd"`
+	RiskLevel     string `json:"risk_level"`      // Deprecated: kept for backwards compatibility
+	Reason        string `json:"reason"`
+	ChallengeCode string `json:"challenge_code"`  // User-provided challenge code for CRITICAL_DESTRUCTIVE
 }
 
 func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (string, error) {
@@ -271,8 +272,48 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		return "[dry-run] mutate_system blocked: host mutations are not permitted in dry-run mode.", nil
 	}
 
-	if deps.Approve == nil || !deps.Approve(in.Command, in.CWD, in.RiskLevel, in.Reason) {
-		return "MUTATE_BLOCKED: user did not approve mutate_system. The command was NOT executed.", nil
+	// Classify the risk level of the command using the semantic blast-radius classifier.
+	classification := sandbox.ClassifyRisk(in.Command)
+
+	// Override risk_level from input if provided (backwards compat), but
+	// the classifier's decision is authoritative for CRITICAL_DESTRUCTIVE.
+	riskLevel := classification.Level.String()
+	if in.RiskLevel != "" && classification.Level != sandbox.RiskCriticalDestructive {
+		riskLevel = in.RiskLevel
+	}
+
+	// For CRITICAL_DESTRUCTIVE, enforce challenge code validation.
+	if classification.Level == sandbox.RiskCriticalDestructive {
+		if in.ChallengeCode == "" {
+			return fmt.Sprintf(
+				"CHALLENGE_REQUIRED: This command is classified as CRITICAL_DESTRUCTIVE.\n"+
+					"Reason: %s\n"+
+					"Affected components: %s\n"+
+					"To proceed, you must provide the challenge code: %s\n"+
+					"Re-run mutate_system with the challenge_code parameter set to this value.",
+				classification.Reason,
+				strings.Join(classification.Affected, ", "),
+				classification.Challenge), nil
+		}
+		if !sandbox.ValidateChallengeCode(classification.Challenge, in.ChallengeCode) {
+			return fmt.Sprintf(
+				"CHALLENGE_FAILED: Invalid challenge code provided. Expected: %s, Got: %s\n"+
+					"Command NOT executed. This is a safety measure against approval fatigue.",
+				classification.Challenge, in.ChallengeCode), nil
+		}
+		// Challenge passed - proceed with approval but with explicit warning
+	}
+
+	// Check approval - for CRITICAL_DESTRUCTIVE, the approval callback should
+	// present the challenge code requirement and not accept --yes flags.
+	approved := false
+	if deps.Approve != nil {
+		approved = deps.Approve(in.Command, in.CWD, riskLevel, in.Reason)
+	}
+	if !approved {
+		return fmt.Sprintf(
+			"MUTATE_BLOCKED: user did not approve mutate_system (risk: %s). The command was NOT executed.\nReason: %s",
+			riskLevel, classification.Reason), nil
 	}
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", in.Command)
