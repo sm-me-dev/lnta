@@ -156,7 +156,7 @@ func DiscoverLocalOllama() ([]LocalOllamaModel, bool, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, false, fmt.Errorf("Ollama returned status %d", resp.StatusCode)
+		return nil, false, fmt.Errorf("ollama returned status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)

@@ -31,7 +31,7 @@ func TestDiscoverLocalOllamaSuccess(t *testing.T) {
 				{"name": "llama3.3:70b", "size": 39812345678, "modified_at": "2024-01-02T00:00:00Z"},
 			},
 		}
-		json.NewEncoder(w).Encode(response)
+		_ = json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
@@ -111,7 +111,7 @@ func TestDiscoverLocalOllamaInvalidJSON(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, "not valid json{{{")
+		_, _ = io.WriteString(w, "not valid json{{{")
 	}))
 	defer server.Close()
 
@@ -131,8 +131,8 @@ func TestLoadConfigAutoDiscoversOllama(t *testing.T) {
 
 	// Set API key so LoadConfig doesn't fail.
 	origKey := os.Getenv("LNTA_API_KEY")
-	os.Setenv("LNTA_API_KEY", "test-key")
-	defer os.Setenv("LNTA_API_KEY", origKey)
+	_ = os.Setenv("LNTA_API_KEY", "test-key")
+	defer func() { _ = os.Setenv("LNTA_API_KEY", origKey) }()
 
 	// Mock Ollama returning one model.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +142,7 @@ func TestLoadConfigAutoDiscoversOllama(t *testing.T) {
 				{"name": "qwen2.5-coder:7b", "size": 1234, "modified_at": "2024-01-01"},
 			},
 		}
-		json.NewEncoder(w).Encode(response)
+		_ = json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
@@ -189,7 +189,7 @@ func TestOllamaDiscoveryTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"models":[]}`)
+		_, _ = io.WriteString(w, `{"models":[]}`)
 	}))
 	defer server.Close()
 

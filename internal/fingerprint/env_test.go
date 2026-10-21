@@ -93,35 +93,35 @@ func TestDetectHeadlessSSH(t *testing.T) {
 	origDisplay := os.Getenv("DISPLAY")
 	origWayland := os.Getenv("WAYLAND_DISPLAY")
 	defer func() {
-		os.Setenv("SSH_CONNECTION", origSSH)
-		os.Setenv("DISPLAY", origDisplay)
-		os.Setenv("WAYLAND_DISPLAY", origWayland)
+		_ = os.Setenv("SSH_CONNECTION", origSSH)
+		_ = os.Setenv("DISPLAY", origDisplay)
+		_ = os.Setenv("WAYLAND_DISPLAY", origWayland)
 	}()
 
 	// No SSH_CONNECTION -> not headless SSH.
-	os.Unsetenv("SSH_CONNECTION")
-	os.Setenv("DISPLAY", ":0")
+	_ = os.Unsetenv("SSH_CONNECTION")
+	_ = os.Setenv("DISPLAY", ":0")
 	if detectHeadlessSSH() {
 		t.Error("expected detectHeadlessSSH() to return false without SSH_CONNECTION")
 	}
 
 	// SSH_CONNECTION with DISPLAY -> not headless (has graphical session).
-	os.Setenv("SSH_CONNECTION", "10.0.0.1 1234 10.0.0.2 5678")
-	os.Setenv("DISPLAY", ":0")
+	_ = os.Setenv("SSH_CONNECTION", "10.0.0.1 1234 10.0.0.2 5678")
+	_ = os.Setenv("DISPLAY", ":0")
 	if detectHeadlessSSH() {
 		t.Error("expected detectHeadlessSSH() to return false when DISPLAY is set")
 	}
 
 	// SSH_CONNECTION with WAYLAND_DISPLAY -> not headless.
-	os.Unsetenv("DISPLAY")
-	os.Setenv("WAYLAND_DISPLAY", "wayland-0")
+	_ = os.Unsetenv("DISPLAY")
+	_ = os.Setenv("WAYLAND_DISPLAY", "wayland-0")
 	if detectHeadlessSSH() {
 		t.Error("expected detectHeadlessSSH() to return false when WAYLAND_DISPLAY is set")
 	}
 
 	// SSH_CONNECTION with no display -> headless SSH.
-	os.Unsetenv("DISPLAY")
-	os.Unsetenv("WAYLAND_DISPLAY")
+	_ = os.Unsetenv("DISPLAY")
+	_ = os.Unsetenv("WAYLAND_DISPLAY")
 	if !detectHeadlessSSH() {
 		t.Error("expected detectHeadlessSSH() to return true for headless SSH")
 	}
