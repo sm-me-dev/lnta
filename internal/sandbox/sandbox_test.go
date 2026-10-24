@@ -164,13 +164,16 @@ func TestScopedWriteFileModifyAndRollback(t *testing.T) {
 		t.Fatalf("expected new content, got %q", got)
 	}
 
-	// Snapshot must exist with a manifest.
+	// Snapshot must exist with a manifest recording path + root.
 	man, err := os.ReadFile(manifestPath(runID))
 	if err != nil {
 		t.Fatalf("manifest missing: %v", err)
 	}
-	if !strings.Contains(string(man), target) {
-		t.Fatalf("manifest does not record target: %s", man)
+	if !strings.Contains(string(man), filepath.Base(target)) {
+		t.Fatalf("manifest does not record target path: %s", man)
+	}
+	if !strings.Contains(string(man), filepath.Dir(target)) {
+		t.Fatalf("manifest does not record target root: %s", man)
 	}
 
 	if err := RollbackRun(runID); err != nil {

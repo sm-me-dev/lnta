@@ -9,10 +9,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sm-me/lnta/internal/audit"
@@ -28,8 +30,8 @@ const maxOutputBytes = 16 * 1024
 // ErrBwrapNotFound is returned when bwrap is not installed on the host.
 var ErrBwrapNotFound = errors.New("bwrap not found on host; cannot run sandboxed command")
 
-// ErrBwrapBlocked is returned when bwrap exists but is blocked by AppArmor
-// (EACCES/EPERM on namespace creation).
+// ErrBwrapBlocked is returned when bwrap exists but cannot create its
+// namespaces (AppArmor userns restriction, EPERM, missing userns support...).
 var ErrBwrapBlocked = errors.New("bwrap blocked by AppArmor userns restriction; try 'lnta doctor --generate-apparmor'")
 
 // CommandResult captures the outcome of a sandboxed command execution.
@@ -45,46 +47,41 @@ type CommandResult struct {
 type SandboxBackend string
 
 const (
-	BackendBwrap   SandboxBackend = "bwrap"
+	BackendBwrap    SandboxBackend = "bwrap"
 	BackendLandlock SandboxBackend = "landlock"
 )
 
-// probeBwrap runs a fast pre-flight check to see if bwrap can create
-// a user namespace. Returns nil if successful, ErrBwrapNotFound if bwrap
-// is not installed, ErrBwrapBlocked if blocked by AppArmor, or other error.
+// probeBwrap runs a fast pre-flight check to see if bwrap can create the same
+// namespaces the real run needs. It FAILS CLOSED: any failure (not just exit
+// codes 126/127, which bwrap never uses for EPERM) is reported as
+// ErrBwrapBlocked together with bwrap's stderr, so the caller falls back to
+// Landlock instead of "trying anyway".
 func probeBwrap() error {
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
 		return ErrBwrapNotFound
 	}
 
-	// Fast probe: try to create a minimal user namespace
-	// --ro-bind / / -- true  (mounts root read-only, runs true)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, bwrap, "--ro-bind", "/", "/", "--", "true")
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, bwrap,
+		"--unshare-user", "--unshare-pid", "--unshare-net",
+		"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+		"--", "true")
 	cmd.Stdin = nil
 	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stderr = &stderr
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"}
+	ConfigureProcessGroup(cmd)
+	RegisterChild(cmd)
+	defer UnregisterChild(cmd)
 
-	err = cmd.Run()
-	if err == nil {
-		return nil // success
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %v: %s", ErrBwrapBlocked, err, strings.TrimSpace(stderr.String()))
 	}
-
-	// Check if it's a permission error (AppArmor blocking userns)
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		// Exit code 126 or 127 often means permission denied on namespace creation
-		// Check stderr for clues, but on Ubuntu 24.04+ it's typically silent EACCES
-		if exitErr.ExitCode() == 126 || exitErr.ExitCode() == 127 {
-			return ErrBwrapBlocked
-		}
-	}
-
-	// Context timeout or other error
-	return err
+	return nil
 }
 
 // SandboxAvailable checks if bwrap sandboxing is available and working.
@@ -94,8 +91,211 @@ func SandboxAvailable() error {
 	return probeBwrap()
 }
 
-// runBwrap executes the command inside a bwrap sandbox (the original implementation).
+// secretMaskDirs lists host directories masked over (empty tmpfs) inside the
+// sandbox so a prompt-injected command cannot exfiltrate credentials.
+func secretMaskDirs(home string) []string {
+	rel := []string{
+		".ssh", ".gnupg", ".aws", ".kube", ".azure", ".docker", ".oci", ".terraform.d",
+		".password-store", ".mozilla", ".thunderbird", ".vault",
+		filepath.Join(".config", "lnta"),
+		filepath.Join(".config", "gh"),
+		filepath.Join(".config", "gcloud"),
+		filepath.Join(".config", "rclone"),
+		filepath.Join(".config", "op"),
+		filepath.Join(".config", "helm"),
+		filepath.Join(".config", "git-credential-manager"),
+		filepath.Join(".config", "google-chrome"),
+		filepath.Join(".config", "chromium"),
+		filepath.Join(".config", "BraveSoftware"),
+		filepath.Join(".config", "Bitwarden"),
+		filepath.Join(".local", "share", "keyrings"),
+		filepath.Join(".local", "share", "lnta"),
+		filepath.Join(".cache", "lnta"),
+		filepath.Join(".gem"),
+	}
+	out := make([]string, 0, len(rel))
+	for _, r := range rel {
+		out = append(out, filepath.Join(home, r))
+	}
+	return out
+}
+
+// secretMaskFiles lists individual credential/history files bound over with
+// /dev/null inside the sandbox.
+func secretMaskFiles(home string) []string {
+	rel := []string{
+		".git-credentials", ".netrc", ".npmrc", ".pypirc", ".vault-token",
+		".bash_history", ".zsh_history", ".python_history", ".psql_history",
+		".mysql_history", ".lesshst", ".viminfo", ".node_repl_history", ".sqlite_history",
+		filepath.Join(".config", "git", "credentials"),
+		filepath.Join(".cargo", "credentials.toml"),
+		filepath.Join(".cargo", "credentials"),
+		filepath.Join(".m2", "settings.xml"),
+		filepath.Join(".config", "claude", "settings.json"),
+		filepath.Join(".config", "claude", "settings.local.json"),
+	}
+	out := make([]string, 0, len(rel))
+	for _, r := range rel {
+		out = append(out, filepath.Join(home, r))
+	}
+	return out
+}
+
+// projectSecretFile reports whether a file found under the working directory
+// looks like a credential file that must be masked.
+func projectSecretFile(name string) bool {
+	switch name {
+	case ".netrc", ".npmrc", ".pypirc", ".git-credentials", "terraform.tfvars", "credentials.json", "service-account.json":
+		return true
+	}
+	return strings.HasPrefix(name, ".env")
+}
+
+// maskProjectSecrets walks cwd (bounded) and returns the credential files to
+// mask. Depth and entry count are capped so a huge tree cannot stall startup.
+func maskProjectSecrets(cwd string) []string {
+	const maxDepth, maxEntries = 4, 5000
+	var out []string
+	seen := 0
+	base := strings.Count(filepath.Clean(cwd), string(filepath.Separator))
+	_ = filepath.WalkDir(cwd, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if seen++; seen > maxEntries {
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			if p != cwd && (d.Name() == ".git" || d.Name() == "node_modules" || d.Name() == "vendor") {
+				return filepath.SkipDir
+			}
+			if strings.Count(p, string(filepath.Separator))-base >= maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type().IsRegular() && projectSecretFile(d.Name()) {
+			out = append(out, p)
+		}
+		return nil
+	})
+	return out
+}
+
+func under(path, dir string) bool {
+	path, dir = filepath.Clean(path), filepath.Clean(dir)
+	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
+}
+
+// resolveCWD returns an absolute, existing directory for the sandbox cwd.
+func resolveCWD(cwd string) (string, error) {
+	if cwd == "" {
+		cwd = "."
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("cwd: %w", err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("cwd %s is not a directory", abs)
+	}
+	return abs, nil
+}
+
+// bwrapArgs builds the bubblewrap argument vector (without the executable and
+// without the trailing command). Pure function of (home, cwd, extraEnv) plus
+// the on-disk existence of the paths to mask.
+func bwrapArgs(home, cwd string, extraEnv []string) []string {
+	args := []string{
+		"--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-net",
+		"--unshare-uts", "--unshare-cgroup-try",
+		"--new-session", "--die-with-parent",
+		"--cap-drop", "ALL",
+		"--clearenv",
+		"--ro-bind", "/", "/",
+		"--dev", "/dev",
+		"--proc", "/proc",
+		"--tmpfs", "/tmp",
+		"--tmpfs", "/var/tmp",
+		// /run holds the user session bus, docker.sock, ssh/gpg-agent and
+		// podman sockets. Pathname Unix sockets are NOT blocked by
+		// --unshare-net, so hide all of it and re-expose only inert data.
+		"--tmpfs", "/run",
+		"--ro-bind-try", "/run/udev", "/run/udev",
+		"--ro-bind-try", "/run/utmp", "/run/utmp",
+		"--ro-bind-try", "/run/log", "/run/log",
+	}
+
+	// Mask secret-bearing directories (empty tmpfs) and files (/dev/null).
+	// H7: use os.Lstat and resolve symlinks so symlink targets are also
+	// masked, defeating symlink bypasses and dangling link exposures.
+	for _, d := range secretMaskDirs(home) {
+		if st, err := os.Lstat(d); err == nil {
+			if st.Mode()&os.ModeSymlink != 0 {
+				if target, rerr := filepath.EvalSymlinks(d); rerr == nil {
+					if tst, terr := os.Stat(target); terr == nil && tst.IsDir() {
+						args = append(args, "--tmpfs", target)
+					}
+				}
+			}
+			if st.IsDir() {
+				args = append(args, "--tmpfs", d)
+			}
+		}
+	}
+	for _, f := range secretMaskFiles(home) {
+		if st, err := os.Lstat(f); err == nil {
+			if st.Mode()&os.ModeSymlink != 0 {
+				if target, rerr := filepath.EvalSymlinks(f); rerr == nil {
+					if tst, terr := os.Stat(target); terr == nil && tst.Mode().IsRegular() {
+						args = append(args, "--ro-bind", "/dev/null", target)
+					}
+				}
+			}
+			if st.Mode().IsRegular() {
+				args = append(args, "--ro-bind", "/dev/null", f)
+			}
+		}
+	}
+	// Credential files inside the project tree (.env, .netrc, ...), recursive and bounded.
+	for _, f := range maskProjectSecrets(cwd) {
+		args = append(args, "--ro-bind", "/dev/null", f)
+	}
+
+	for _, kv := range envList(sandboxEnvMap(home, ""), extraEnv) {
+		i := strings.IndexByte(kv, '=')
+		args = append(args, "--setenv", kv[:i], kv[i+1:])
+	}
+	return append(args, "--chdir", cwd, "--")
+}
+
+// exitCodeOf converts a Wait error into a shell-style exit code.
+func exitCodeOf(err error) int {
+	if err == nil {
+		return 0
+	}
+	var ex *exec.ExitError
+	if errors.As(err, &ex) {
+		if ws, ok := ex.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + int(ws.Signal())
+		}
+		return ex.ExitCode()
+	}
+	return 126
+}
+
+// runBwrap executes the command inside a bwrap sandbox.
 func runBwrap(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
+	return runBwrapEnv(ctx, cmdStr, cwd, timeout, nil)
+}
+
+// runBwrapEnv is runBwrap with extra KEY=VALUE environment entries (used to
+// pass verify_cmd arguments as data, never as shell text).
+func runBwrapEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
 	var res CommandResult
 	start := time.Now()
 
@@ -109,117 +309,43 @@ func runBwrap(ctx context.Context, cmdStr string, cwd string, timeout time.Durat
 	if err != nil {
 		return res, ErrBwrapNotFound
 	}
-
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = homeDir()
+	absCwd, err := resolveCWD(cwd)
+	if err != nil {
+		return res, err
 	}
+	home := homeDir()
 
-	// Phantom dotfile paths that must be blocked even if they don't exist.
-	// This defends against CVE-2026-25725 where prompt injection creates
-	// missing startup hooks (.bashrc, .profile, .claude/settings.json, etc.)
-	phantomDotfiles := phantomDotfilePaths(home)
-
-	args := []string{
-		"--ro-bind", "/", "/",
-		"--dev", "/dev",
-		"--proc", "/proc",
-		"--tmpfs", "/tmp",
-		"--die-with-parent",
-		// Zero-egress network namespace: no outbound TCP/UDP possible.
-		// Combined with --unshare-ipc, --unshare-pid, --new-session this
-		// makes network data exfiltration physically impossible at kernel level.
-		"--unshare-net",
-		"--unshare-ipc",
-		"--unshare-pid",
-		"--new-session",
-	}
-
-	// Mask secret-bearing directories so they appear empty inside the sandbox.
-	for _, d := range secretMaskDirs(home) {
-		if _, statErr := os.Stat(d); statErr == nil {
-			args = append(args, "--tmpfs", d)
-		}
-	}
-
-	// Mask phantom dotfiles by binding /dev/null over them.
-	// Only apply to files that exist, or whose parent directory is not the home directory
-	// (since home is mounted read-only via --ro-bind / /).
-	// Skip paths already covered by secretMaskDirs (which use --tmpfs for isolation).
-	secretDirs := secretMaskDirs(home)
-	for _, p := range phantomDotfiles {
-		// Check if this path is already covered by secretMaskDirs
-		coveredBySecretDirs := false
-		for _, sd := range secretDirs {
-			if strings.HasPrefix(p, sd+string(filepath.Separator)) || p == sd {
-				coveredBySecretDirs = true
-				break
-			}
-		}
-		if coveredBySecretDirs {
-			continue // secretMaskDirs handles this with --tmpfs isolation
-		}
-
-		if _, statErr := os.Stat(p); statErr == nil {
-			// File exists - bind /dev/null over it
-			args = append(args, "--ro-bind", "/dev/null", p)
-		} else {
-			// File doesn't exist - check if parent is home directory
-			parent := filepath.Dir(p)
-			home := os.Getenv("HOME")
-			if home == "" {
-				home = homeDir()
-			}
-			// Skip if parent is home directory (can't bind over non-existent file in read-only home)
-			if parent != home {
-				if _, pstatErr := os.Stat(parent); pstatErr == nil {
-					args = append(args, "--ro-bind", "/dev/null", p)
-				}
-			}
-		}
-	}
-
-	// Mask any .env files in cwd so credentials cannot be read/exfiltrated.
-	if entries, rdErr := os.ReadDir(cwd); rdErr == nil {
-		for _, e := range entries {
-			if !e.IsDir() && strings.HasPrefix(e.Name(), ".env") {
-				args = append(args, "--ro-bind", "/dev/null", filepath.Join(cwd, e.Name()))
-			}
-		}
-	}
-
-	args = append(args, "--chdir", cwd, "--", "sh", "-c", cmdStr)
+	args := append(bwrapArgs(home, absCwd, extraEnv), "sh", "-c", cmdStr)
 
 	cmd := exec.CommandContext(ctx, bwrap, args...)
-	cmd.Stdin = nil // reads from /dev/null
-	env := os.Environ()
-	env = append(env, "DEBIAN_FRONTEND=noninteractive", "GIT_TERMINAL_PROMPT=0")
-	cmd.Env = env
+	cmd.Stdin = nil // /dev/null
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"} // bwrap itself: nothing from the host
+	ConfigureProcessGroup(cmd)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := NewCappedBuffer(maxOutputBytes, hardOutputBytes, cancel)
+	stderr := NewCappedBuffer(maxOutputBytes, hardOutputBytes, cancel)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
+	RegisterChild(cmd)
+	defer UnregisterChild(cmd)
 	err = cmd.Run()
 	res.Duration = time.Since(start)
+	res.Stdout = stdout.Render()
+	res.Stderr = stderr.Render()
+	res.Truncated = stdout.Truncated() || stderr.Truncated()
 
-	if ex, ok := err.(*exec.ExitError); ok {
-		res.ExitCode = ex.ExitCode()
-	} else if err != nil {
-		// Context deadline, bwrap failure to start, etc.
-		res.ExitCode = 126
-		res.Stderr = err.Error() + "\n" + stderr.String()
+	if err != nil {
+		res.ExitCode = exitCodeOf(err)
+		var ex *exec.ExitError
+		if !errors.As(err, &ex) {
+			res.Stderr = err.Error() + "\n" + res.Stderr
+		}
 	}
-
-	out := truncateOutput(stdout.String())
-	errOut := truncateOutput(stderr.String())
-	res.Stdout = out
-	res.Stderr = errOut
-	res.Truncated = len(out) < len(stdout.String()) || len(errOut) < len(stderr.String())
 
 	// Best-effort audit log of the sandboxed execution.
 	audit.Log("sandbox.run", "", map[string]string{
-		"cwd":      cwd,
+		"cwd":      absCwd,
 		"backend":  "bwrap",
 		"exit":     fmt.Sprintf("%d", res.ExitCode),
 		"duration": res.Duration.String(),
@@ -228,96 +354,51 @@ func runBwrap(ctx context.Context, cmdStr string, cwd string, timeout time.Durat
 	return res, err
 }
 
-// phantomDotfilePaths returns a list of dotfile paths that must be blocked
-// even if they don't exist, to prevent phantom dotfile injection (CVE-2026-25725).
-// These are common shell/startup configuration files that prompt injection
-// could create to achieve persistence.
-func phantomDotfilePaths(home string) []string {
-	if home == "" {
-		return nil
-	}
-	return []string{
-		filepath.Join(home, ".bashrc"),
-		filepath.Join(home, ".zshrc"),
-		filepath.Join(home, ".profile"),
-		filepath.Join(home, ".bash_profile"),
-		filepath.Join(home, ".bash_login"),
-		filepath.Join(home, ".bash_logout"),
-		filepath.Join(home, ".ssh", "authorized_keys"),
-		filepath.Join(home, ".ssh", "config"),
-		filepath.Join(home, ".config", "lnta"),
-		filepath.Join(home, ".config", "claude", "settings.json"),
-		filepath.Join(home, ".config", "claude", "settings.local.json"),
-	}
+// RunReadOnly executes sh -c cmdStr inside a sandbox with the entire
+// root filesystem mounted read-only. See RunReadOnlyEnv.
+func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
+	return RunReadOnlyEnv(ctx, cmdStr, cwd, timeout, nil)
 }
 
-// RunReadOnly executes sh -c cmdStr inside a sandbox with the entire
-// root filesystem mounted read-only. It automatically selects the best
-// available backend:
+// RunReadOnlyEnv is RunReadOnly plus extra KEY=VALUE environment entries that
+// are made visible to the command. Callers use it to hand untrusted values
+// (verify_cmd arguments) to the shell as DATA, never as shell source.
 //
-//  1. Tier 1 (bwrap): Runs a fast pre-flight probe. If bwrap can create
-//     a user namespace, uses bwrap for full isolation.
-//  2. Tier 2 (Landlock): If bwrap is not installed or blocked by AppArmor
-//     (kernel.apparmor_restrict_unprivileged_userns=1), falls back to
-//     native Linux Landlock LSM via self-re-exec.
+// It automatically selects the best available backend:
+//
+//  1. Tier 1 (bwrap): if bwrap can create its namespaces.
+//  2. Tier 2 (Landlock): if bwrap is missing or blocked (AppArmor userns
+//     restriction), via self-re-exec; requires Landlock ABI >= 4 or it
+//     refuses to run (fail closed).
 //
 // The sandbox:
-//   - Provides read-only access to system directories (/usr, /bin, /lib, /etc, /proc, /sys)
-//   - Provides private, non-persistent /tmp via tmpfs
-//   - Masks secret directories (~/.ssh, ~/.gnupg, ~/.aws, ~/.kube, ~/.config/lnta)
-//     so they appear empty (bwrap) or return EACCES (Landlock)
-//   - Masks .env files in cwd to /dev/null
-//   - chdirs to cwd and dies with the parent
-//   - Stdin bound to /dev/null, noninteractive env vars set
-//   - Output truncated at 16KB with [OUTPUT TRUNCATED] marker
-//
-// Returns CommandResult with Stdout, Stderr, ExitCode, Duration.
-// Returns error if both backends fail.
-func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
-	// Tier 1: Try bwrap first
+//   - read-only root; private tmpfs /tmp, /var/tmp, /run (no host sockets)
+//   - masks credential directories and files (bwrap) / omits them (Landlock)
+//   - masks .env* and similar credential files under the working directory
+//   - no network, no inherited environment (explicit allowlist only)
+//   - runs in its own process group; timeout and output caps kill the group
+//   - output truncated at 16KB with a marker; 8MB hard cap kills the command
+func RunReadOnlyEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
 	probeErr := probeBwrap()
 	if probeErr == nil {
-		return runBwrap(ctx, cmdStr, cwd, timeout)
-	} else if !errors.Is(probeErr, ErrBwrapNotFound) && !errors.Is(probeErr, ErrBwrapBlocked) {
-		// Unexpected error from probe (e.g., timeout), try bwrap anyway
-		return runBwrap(ctx, cmdStr, cwd, timeout)
+		return runBwrapEnv(ctx, cmdStr, cwd, timeout, extraEnv)
 	}
 
-	// Tier 2: Fall back to Landlock LSM
 	landlockErr := LandlockProbe()
 	if landlockErr == nil {
-		return runLandlock(ctx, cmdStr, cwd, timeout)
+		return runLandlockEnv(ctx, cmdStr, cwd, timeout, extraEnv)
 	}
 
-	// Both backends unavailable
 	if errors.Is(probeErr, ErrBwrapNotFound) {
 		return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v", ErrBwrapNotFound, landlockErr)
 	}
-	return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v", ErrBwrapBlocked, landlockErr)
-}
-
-// secretMaskDirs lists host directories masked over inside the sandbox so a
-// prompt-injected command cannot exfiltrate credentials.
-func secretMaskDirs(home string) []string {
-	return []string{
-		filepath.Join(home, ".ssh"),
-		filepath.Join(home, ".gnupg"),
-		filepath.Join(home, ".aws"),
-		filepath.Join(home, ".kube"),
-		filepath.Join(home, ".config", "lnta"),
-	}
+	return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v", probeErr, landlockErr)
 }
 
 // expandPath replaces a leading ~ with the HOME directory.
 func expandPath(p string) string {
-	if strings.HasPrefix(p, "~") {
-		home := os.Getenv("HOME")
-		if home == "" {
-			if u, err := os.UserHomeDir(); err == nil {
-				home = u
-			}
-		}
-		if home != "" {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home := homeDir(); home != "" {
 			p = home + p[1:]
 		}
 	}
@@ -347,6 +428,3 @@ func truncateOutput(s string) string {
 	}
 	return s[:keep] + marker
 }
-
-// compile-time check that CommandResult is used meaningfully.
-var _ = fmt.Sprintf("%v", CommandResult{})

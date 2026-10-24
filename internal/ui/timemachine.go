@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/sm-me/lnta/internal/audit"
+	"github.com/sm-me/lnta/internal/sandbox"
 )
 
 // TimeMachineModel is the main model for the time-machine TUI.
@@ -261,6 +262,7 @@ func (m *TimeMachineModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.focusLeft {
 			var cmd tea.Cmd
 			m.list, cmd = m.list.Update(msg)
+			m.selectRun(m.list.Index())
 			return m, cmd
 		} else {
 			m.viewport.ScrollUp(1)
@@ -271,6 +273,7 @@ func (m *TimeMachineModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.focusLeft {
 			var cmd tea.Cmd
 			m.list, cmd = m.list.Update(msg)
+			m.selectRun(m.list.Index())
 			return m, cmd
 		} else {
 			m.viewport.ScrollDown(1)
@@ -325,6 +328,7 @@ func (m *TimeMachineModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.focusLeft {
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
+		m.selectRun(m.list.Index())
 		return m, cmd
 	}
 	var cmd tea.Cmd
@@ -466,8 +470,12 @@ func (m *TimeMachineModel) rollbackSelected() tea.Cmd {
 	}
 	runID := m.selected.RunID
 	return func() tea.Msg {
-		err := audit.UpdateRunStatus(runID, audit.RunStatusRolledBack)
-		if err != nil {
+		// H6: call the real RollbackRun (not just a status flag) so the
+		// filesystem is actually restored. Keyed by immutable run ID.
+		if err := sandbox.RollbackRun(runID); err != nil {
+			return rollbackResultMsg{err: err}
+		}
+		if err := audit.UpdateRunStatus(runID, audit.RunStatusRolledBack); err != nil {
 			return rollbackResultMsg{err: err}
 		}
 		return rollbackResultMsg{err: nil}
@@ -621,12 +629,12 @@ func exportMarkdown(run *audit.RunSummary) string {
 func exportShellScript(run *audit.RunSummary) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n")
-	b.WriteString(fmt.Sprintf("# LNTA Run Reproduction Script: %s\n", run.RunID))
-	b.WriteString(fmt.Sprintf("# Original prompt: %s\n", run.Prompt))
+	b.WriteString(fmt.Sprintf("# LNTA Run Reproduction Script: %s\n", shellQuote(run.RunID)))
+	sanitizedPrompt := strings.ReplaceAll(run.Prompt, "\n", " ")
+	b.WriteString(fmt.Sprintf("# Original prompt: %s\n", sanitizedPrompt))
 	b.WriteString(fmt.Sprintf("# Pack: %s\n", run.SelectedPack))
-	b.WriteString(fmt.Sprintf("# CWD: %s\n\n", run.CWD))
 	b.WriteString("set -euo pipefail\n\n")
-	b.WriteString(fmt.Sprintf("cd %s\n\n", run.CWD))
+	b.WriteString(fmt.Sprintf("cd %s\n\n", shellQuote(run.CWD)))
 
 	for _, cmd := range run.CommandsExecuted {
 		if cmd.Source == "inspect_system" || cmd.Source == "mutate_system" {
@@ -653,6 +661,10 @@ func exportShellScript(run *audit.RunSummary) string {
 	}
 
 	return b.String()
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // RunTimeMachine launches the time-machine TUI.

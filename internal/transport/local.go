@@ -3,6 +3,7 @@ package transport
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -11,16 +12,21 @@ import (
 )
 
 // LocalExecutor wraps the local sandbox and file transaction operations.
+// `allowed` is the pack's allowed_paths; it is owned by the caller/pack, never
+// derived from the target path. An empty list denies all writes (fail closed).
 type LocalExecutor struct {
-	runID string
-	cwd   string
+	runID  string
+	cwd    string
+	allowed []string
 }
 
-// NewLocalExecutor creates a new LocalExecutor for the given run ID and working directory.
-func NewLocalExecutor(runID, cwd string) *LocalExecutor {
+// NewLocalExecutor creates a new LocalExecutor for the given run ID, working
+// directory, and allowed paths. Pass an empty/nil slice to deny all writes.
+func NewLocalExecutor(runID, cwd string, allowed []string) *LocalExecutor {
 	return &LocalExecutor{
-		runID: runID,
-		cwd:   cwd,
+		runID:  runID,
+		cwd:    cwd,
+		allowed: allowed,
 	}
 }
 
@@ -61,6 +67,7 @@ func (e *LocalExecutor) ReadFile(ctx context.Context, path string) ([]byte, os.F
 }
 
 // WriteFile writes a file locally using the sandbox's scoped write with snapshot support.
+// Scope is checked against e.allowed (pack-owned), never against the target itself.
 func (e *LocalExecutor) WriteFile(ctx context.Context, path string, content []byte, mode os.FileMode) (string, os.FileInfo, error) {
 	resolved := path
 	if filepath.IsAbs(path) {
@@ -77,11 +84,16 @@ func (e *LocalExecutor) WriteFile(ctx context.Context, path string, content []by
 	}
 	resolved = filepath.Clean(resolved)
 
-	// Use the sandbox's ScopedWriteFile for snapshot support
-	// We need to determine allowed paths - for local executor we use a broad pattern
-	// The actual scope checking happens in the tool layer
-	allowedGlobs := []string{resolved} // Allow this specific path
-	diff, err := sandbox.ScopedWriteFile(e.runID, resolved, content, allowedGlobs)
+	// Scope must be owned by the executor/pack, never derived from the target.
+	// Fail closed: no allowed paths means no writes.
+	if len(e.allowed) == 0 {
+		return "", nil, fmt.Errorf("write_scoped_file: %q is outside allowed_paths (no allowed_paths configured)", resolved)
+	}
+	if !sandbox.PathAllowed(resolved, e.allowed) {
+		return "", nil, fmt.Errorf("write_scoped_file: %q is outside allowed_paths", resolved)
+	}
+
+	diff, err := sandbox.ScopedWriteFile(e.runID, resolved, content, e.allowed)
 	if err != nil {
 		return "", nil, err
 	}

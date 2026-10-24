@@ -142,7 +142,7 @@ func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
 	pack := packs.Pack{
 		ID:           "test-pack",
 		Name:         "Test Pack",
-		VerifyCmd:    `test -f "${target}"`,
+		VerifyCmd:    `test -f "$LNTA_TARGET"`,
 		AllowedPaths: []string{filepath.Join(dir, "*.desktop")},
 	}
 
@@ -151,7 +151,7 @@ func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
 		"summary":            "attempt 1",
 		"target_artifacts":   missing,
 		"verification_notes": "should fail",
-	}), ToolDeps{RunID: "run-1", Pack: &pack, Approve: DefaultApprove, CWD: home, Executor: transport.NewLocalExecutor("run-1", home)})
+	}), ToolDeps{RunID: "run-1", Pack: &pack, Approve: DefaultApprove, CWD: home, Executor: transport.NewLocalExecutor("run-1", home, pack.AllowedPaths)})
 	if err != nil {
 		t.Fatalf("completeTask returned error: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
 		"summary":            "attempt 2",
 		"target_artifacts":   existing,
 		"verification_notes": "should pass",
-	}), ToolDeps{RunID: "run-1", Pack: &pack, Approve: DefaultApprove, CWD: home, Executor: transport.NewLocalExecutor("run-1", home)})
+	}), ToolDeps{RunID: "run-1", Pack: &pack, Approve: DefaultApprove, CWD: home, Executor: transport.NewLocalExecutor("run-1", home, pack.AllowedPaths)})
 	if err != nil {
 		t.Fatalf("completeTask returned error: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 
 	// Write a pack file into dir and load it via the public NewRouter (userDir).
 	packFile := fmt.Sprintf(
-		"---\nid: test-pack\nname: Test Pack\ntriggers:\n  - launcher\nverify_cmd: test -f \"${target}\"\ncontext_cmd: true\nallowed_paths:\n  - \"%s/*.desktop\"\n---\n# body\n",
+		"---\nid: test-pack\nname: Test Pack\ntriggers:\n  - launcher\nverify_cmd: test -f \"$LNTA_TARGET\"\ncontext_cmd: true\nallowed_paths:\n  - \"%s/*.desktop\"\n---\n# body\n",
 		dir,
 	)
 	if err := os.WriteFile(filepath.Join(dir, "test-pack.md"), []byte(packFile), 0o644); err != nil {
@@ -261,7 +261,7 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 		WithApprove(func(_, _, _, _ string) bool { return false }),
 		WithMaxTurns(8),
 		WithConfig(&Config{Model: "test-model"}),
-		WithExecutor(transport.NewLocalExecutor("run-t1", home)),
+		WithExecutor(transport.NewLocalExecutor("run-t1", home, nil)),
 	)
 
 	result, err := o.Run(context.Background(), "create a launcher", "", false)
@@ -289,7 +289,7 @@ func TestOrchestratorValidDesktop(t *testing.T) {
 	tmpDir := testDirUnderHome(t)
 
 	packFile := fmt.Sprintf(
-		"---\nid: linux-desktop-entries\nname: Eval Desktop\ntriggers:\n  - desktop\nallowed_paths:\n  - \"%s/*.desktop\"\nrequired_bins:\n  - desktop-file-validate\ncontext_cmd: true\nverify_cmd: desktop-file-validate \"${target}\"\n---\n# eval body\n",
+		"---\nid: linux-desktop-entries\nname: Eval Desktop\ntriggers:\n  - desktop\nallowed_paths:\n  - \"%s/*.desktop\"\nrequired_bins:\n  - desktop-file-validate\ncontext_cmd: true\nverify_cmd: desktop-file-validate \"$LNTA_TARGET\"\n---\n# eval body\n",
 		tmpDir,
 	)
 	if err := os.WriteFile(filepath.Join(tmpDir, "pack.md"), []byte(packFile), 0o644); err != nil {
@@ -338,6 +338,7 @@ Categories=Utility;
 		WithMaxTurns(8),
 		WithDryRun(false),
 		WithConfig(&Config{Model: "test-model"}),
+		WithExecutor(transport.NewLocalExecutor("eval-test", tmpDir, selected[0].AllowedPaths)),
 	}
 	o := New(mock, router, opts...)
 

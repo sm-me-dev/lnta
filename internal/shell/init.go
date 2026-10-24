@@ -12,8 +12,9 @@ const zshTemplate = `# LNTA Shell Integration for zsh
 
 # PrecMD hook: capture last command and exit code on every prompt
 __lnta_precmd() {
+    local exit_code=$?
+    export _LNTA_LAST_EXIT=$exit_code
     export _LNTA_LAST_CMD="${history[$((HISTCMD-1))]}"
-    export _LNTA_LAST_EXIT=$?
 }
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __lnta_precmd
@@ -49,8 +50,9 @@ const bashTemplate = `# LNTA Shell Integration for bash
 
 # PROMPT_COMMAND hook: capture last command and exit code
 _lnta_prompt_command() {
+    local exit_code=$?
+    export _LNTA_LAST_EXIT=$exit_code
     export _LNTA_LAST_CMD="${BASH_COMMAND}"
-    export _LNTA_LAST_EXIT=$?
 }
 # Append to PROMPT_COMMAND (preserve existing)
 if [[ -n "${PROMPT_COMMAND:-}" ]]; then
@@ -89,8 +91,9 @@ const fishTemplate = `# LNTA Shell Integration for fish
 
 # fish_prompt hook: capture last command and exit code
 function _lnta_fish_prompt --on-event fish_prompt
+    set -l last_status $status
+    set -gx _LNTA_LAST_EXIT $last_status
     set -gx _LNTA_LAST_CMD $history[1]
-    set -gx _LNTA_LAST_EXIT $status
 end
 
 # lnta fix function: invoke lnta fix with captured environment

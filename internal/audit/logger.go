@@ -5,11 +5,9 @@ package audit
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 )
@@ -169,7 +167,3 @@ func redactMap(m map[string]string) map[string]string {
 	}
 	return out
 }
-
-// sanity check: ensure fmt and strings are used.
-var _ = fmt.Sprintf
-var _ = strings.Contains

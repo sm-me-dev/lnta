@@ -11,12 +11,14 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sashabaranov/go-openai"
 	"github.com/sm-me/lnta/internal/audit"
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/packs"
+	"github.com/sm-me/lnta/internal/sandbox"
 	"github.com/sm-me/lnta/internal/transport"
 )
 
@@ -173,9 +175,12 @@ func New(client LLMClient, router *packs.Router, opts ...Option) *Orchestrator {
 	for _, opt := range opts {
 		opt(o)
 	}
-	// Default to local executor if not set
+	// Default to local executor if not set. Allowed paths are unknown at
+	// construction time (the pack arrives per-tool-call via deps.Pass), so an
+	// empty list fails closed: direct executor writes are denied unless a
+	// caller configures allowed paths. WithExecutor is always used in practice.
 	if o.executor == nil {
-		o.executor = transport.NewLocalExecutor(o.runID, o.cwd)
+		o.executor = transport.NewLocalExecutor(o.runID, o.cwd, nil)
 	}
 	return o
 }
@@ -577,9 +582,18 @@ task completion only after verification passes.`
 
 // WithSignalCancellation returns a context cancelled on SIGINT / SIGTERM,
 // suitable for passing to Orchestrator.Run so Ctrl+C cleanly cancels active
-// child processes.
+// child processes and triggers process group termination.
 func WithSignalCancellation() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	wrappedCancel := func() {
+		cancel()
+		sandbox.KillAllChildren()
+	}
+	go func() {
+		<-ctx.Done()
+		sandbox.KillAllChildren()
+	}()
+	return ctx, wrappedCancel
 }
 
 // estimatePromptTokens roughly estimates the number of tokens in the prompt.

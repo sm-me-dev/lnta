@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sashabaranov/go-openai"
@@ -219,6 +220,13 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 		}
 	}
 
+	// Fail closed: no pack or no allowed_paths means no writes. This prevents
+	// LocalExecutor.WriteFile from being reached with a vacuous scope (C1) and
+	// a nil-pack dereference (M1).
+	if deps.Pack == nil || len(deps.Pack.AllowedPaths) == 0 {
+		return "SCOPE_VIOLATION: active pack has no allowed_paths; writing is not permitted.", nil
+	}
+
 	allowed := deps.Pack.AllowedPaths
 	if len(allowed) == 0 {
 		return "SCOPE_VIOLATION: active pack has no allowed_paths; writing is not permitted.", nil
@@ -247,10 +255,10 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 		return b.String(), nil
 	}
 
-	// Determine file mode
+	// Determine file mode (default 0644)
 	fileMode := os.FileMode(0o644)
 	if in.Mode != "" {
-		if m, err := strconv.ParseUint(in.Mode, 8, 32); err == nil {
+		if m, err := strconv.ParseUint(in.Mode, 8, 32); err == nil && m != 0 {
 			fileMode = os.FileMode(m)
 		}
 	}
@@ -269,15 +277,21 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 
 	// Record file diff for time-machine TUI
 	if deps.RunCollector != nil {
+		newModeStr := fmt.Sprintf("%04o", fileMode)
+		var newSize int64
+		if writtenInfo != nil {
+			newModeStr = fmt.Sprintf("%04o", writtenInfo.Mode())
+			newSize = writtenInfo.Size()
+		}
 		deps.RunCollector.RecordFileDiff(audit.FileDiffInfo{
 			TargetPath: writtenPath,
 			Created:    false,
 			OldMode:    fmt.Sprintf("%04o", 0o644),
-			NewMode:    fmt.Sprintf("%04o", writtenInfo.Mode()),
+			NewMode:    newModeStr,
 			OldSHA256:  "",
 			NewSHA256:  "",
 			SizeOld:    0,
-			SizeNew:    writtenInfo.Size(),
+			SizeNew:    newSize,
 			Diff:       "",
 		})
 	}
@@ -317,26 +331,18 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		riskLevel = in.RiskLevel
 	}
 
-	// For CRITICAL_DESTRUCTIVE, enforce challenge code validation.
-	if classification.Level == sandbox.RiskCriticalDestructive {
-		if in.ChallengeCode == "" {
-			return fmt.Sprintf(
-				"CHALLENGE_REQUIRED: This command is classified as CRITICAL_DESTRUCTIVE.\n"+
-					"Reason: %s\n"+
-					"Affected components: %s\n"+
-					"To proceed, you must provide the challenge code: %s\n"+
-					"Re-run mutate_system with the challenge_code parameter set to this value.",
-				classification.Reason,
-				strings.Join(classification.Affected, ", "),
-				classification.Challenge), nil
-		}
-		if !sandbox.ValidateChallengeCode(classification.Challenge, in.ChallengeCode) {
-			return fmt.Sprintf(
-				"CHALLENGE_FAILED: Invalid challenge code provided. Expected: %s, Got: %s\n"+
-					"Command NOT executed. This is a safety measure against approval fatigue.",
-				classification.Challenge, in.ChallengeCode), nil
-		}
-		// Challenge passed - proceed with approval but with explicit warning
+	// H1: never echo the challenge code to the LLM (the tool result is fed back
+	// to the model, which would just echo it on the next call). The human
+	// approval dialog gates execution through deps.Approve, where
+	// CRITICAL_DESTRUCTIVE requires typing an anti-fatigue challenge.
+
+	// C7: mutate_system never runs on a remote target. If the active executor
+	// is remote (e.g. --ssh), fail closed: the command would otherwise run on
+	// the operator's workstation instead of the intended host.
+	if deps.Executor != nil && deps.Executor.IsRemote() {
+		return "MUTATE_UNSUPPORTED: mutate_system is not implemented for remote targets; " +
+			"refusing to run this command on the local machine. Run it manually on " +
+			deps.Executor.TargetID() + " or use a remote-execution pack.", nil
 	}
 
 	// Check approval - for CRITICAL_DESTRUCTIVE, the approval callback should
@@ -351,13 +357,50 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 			riskLevel, classification.Reason), nil
 	}
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", in.Command)
+	// C9: explicit minimal environment allowlist. Never inherit LD_PRELOAD,
+	// BASH_ENV, ENV, PROMPT_COMMAND, GIT_SSH_COMMAND, SSH_AUTH_SOCK, or any
+	// *_KEY/*_SECRET/*_TOKEN variables. Mirror the sandbox allowlist.
+	homeDir, _ := os.UserHomeDir()
+	mutateEnv := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=" + homeDir,
+		"LANG=C.UTF-8",
+		"LC_ALL=C.UTF-8",
+		"TERM=dumb",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"NO_COLOR=1",
+	}
+
+	// C9/C2/H2/H13: finite timeout, own process group, capped output.
+	mctx, mcancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer mcancel()
+
+	cmd := exec.CommandContext(mctx, "sh", "-c", in.Command)
 	cmd.Dir = in.CWD
 	cmd.Stdin = nil
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
+	cmd.Env = mutateEnv
+	sandbox.ConfigureProcessGroup(cmd)
+
+	out := sandbox.NewCappedBuffer(16*1024, 8<<20, mcancel)
+	errOut := sandbox.NewCappedBuffer(16*1024, 8<<20, mcancel)
+	cmd.Stdout = out
+	cmd.Stderr = errOut
+	cmd.WaitDelay = 5 * time.Second
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Sprintf("mutate_system failed to start: %v", err), nil
+	}
+	sandbox.RegisterChild(cmd)
+	defer sandbox.UnregisterChild(cmd)
+
+	defer func() {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // negative PID = whole process group
+		}
+	}()
+
+	err := cmd.Wait()
 	var exitCode int
 	if ex, ok := err.(*exec.ExitError); ok {
 		exitCode = ex.ExitCode()
@@ -365,13 +408,13 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		exitCode = -1
 	}
 
-	// Record command for time-machine TUI
+	// Record command for time-machine TUI using capped/rendered output.
 	if deps.RunCollector != nil {
 		deps.RunCollector.RecordCommand(audit.CommandRecord{
 			Command:   in.Command,
 			ExitCode:  exitCode,
-			Stdout:    stdout.String(),
-			Stderr:    stderr.String(),
+			Stdout:    out.Render(),
+			Stderr:    errOut.Render(),
 			Timestamp: time.Now().UTC(),
 			Source:    "mutate_system",
 		})
@@ -379,12 +422,12 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 
 	if ex, ok := err.(*exec.ExitError); ok {
 		return fmt.Sprintf("exit_code=%d\n--- stdout ---\n%s\n--- stderr ---\n%s",
-			ex.ExitCode(), stdout.String(), stderr.String()), nil
+			ex.ExitCode(), out.Render(), errOut.Render()), nil
 	}
 	if err != nil {
-		return fmt.Sprintf("mutate_system failed to start: %v\nstderr: %s", err, stderr.String()), nil
+		return fmt.Sprintf("mutate_system failed to start: %v\nstderr: %s", err, errOut.Render()), nil
 	}
-	return fmt.Sprintf("exit_code=0\n--- stdout ---\n%s", stdout.String()), nil
+	return fmt.Sprintf("exit_code=0\n--- stdout ---\n%s", out.Render()), nil
 }
 
 type completeInput struct {
@@ -400,63 +443,71 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	}
 
 	// --- Verification Gate ---
-	if deps.Pack != nil && deps.Pack.VerifyCmd != "" {
-		vars := map[string]string{"target": in.TargetArtifacts}
-		verifyCmd := packs.RenderVerifyCmd(deps.Pack.VerifyCmd, vars)
+	// Fail closed: no pack or no verify_cmd means we cannot certify. The
+	// target is passed out-of-band as LNTA_TARGET (single-quoted env
+	// assignment, data never shell text) so it cannot rewrite the command.
+	if deps.Pack == nil || strings.TrimSpace(deps.Pack.VerifyCmd) == "" {
+		return "", errors.New("complete_task: no verify_cmd for the active pack; refusing to certify")
+	}
 
-		// Native Go check for linux-desktop-entries: file exists,
-		// desktop-file-validate returns 0, Exec= binary resolves via LookPath.
-		if deps.Pack.ID == "linux-desktop-entries" {
-			if err := nativeDesktopEntryVerify(in.TargetArtifacts); err != nil {
-				return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: %s. Fix the issue and verify again.", err), nil
-			}
+	// Native Go check for linux-desktop-entries: file exists,
+	// desktop-file-validate returns 0, Exec= binary resolves via LookPath.
+	if deps.Pack.ID == "linux-desktop-entries" {
+		if err := nativeDesktopEntryVerify(in.TargetArtifacts, deps.Pack.AllowedPaths); err != nil {
+			return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: %s. Fix the issue and verify again.", err), nil
 		}
+	}
 
-		// Execute verify_cmd inside the sandbox.
-		cwd := deps.CWD
-		if cwd == "" {
-			cwd = "/"
-		}
-		res, err := deps.Executor.RunReadOnly(ctx, verifyCmd, cwd, 0)
-		if err != nil {
-			// Record failed verification
-			if deps.RunCollector != nil {
-				deps.RunCollector.RecordVerification(audit.VerificationRecord{
-					Command:   verifyCmd,
-					ExitCode:  -1,
-					Output:    res.Stderr,
-					Timestamp: time.Now().UTC(),
-					Passed:    false,
-				})
-			}
-			return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: verify_cmd failed to run: %v. stderr: %s. Fix the issue and verify again.",
-				err, res.Stderr), nil
-		}
-		if res.ExitCode != 0 {
-			// Record failed verification
-			if deps.RunCollector != nil {
-				deps.RunCollector.RecordVerification(audit.VerificationRecord{
-					Command:   verifyCmd,
-					ExitCode:  res.ExitCode,
-					Output:    res.Stderr,
-					Timestamp: time.Now().UTC(),
-					Passed:    false,
-				})
-			}
-			return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: verify_cmd exited %d. stderr: %s. Fix the issue and verify again.",
-				res.ExitCode, res.Stderr), nil
-		}
+	// export LNTA_TARGET makes the target available as data for the entire
+	// verify_cmd. Packs must reference $LNTA_TARGET literally and must not
+	// interpolate target_artifacts into shell text.
+	verifyCmd := "export LNTA_TARGET=" + shellQuoteTarget(in.TargetArtifacts) + "; " + deps.Pack.VerifyCmd
 
-		// Record successful verification
+	// Execute verify_cmd inside the sandbox with a finite timeout.
+	cwd := deps.CWD
+	if cwd == "" {
+		cwd = "/"
+	}
+	res, err := deps.Executor.RunReadOnly(ctx, verifyCmd, cwd, 2*time.Minute)
+	if err != nil {
+		// Record failed verification
+		if deps.RunCollector != nil {
+			deps.RunCollector.RecordVerification(audit.VerificationRecord{
+				Command:   verifyCmd,
+				ExitCode:  -1,
+				Output:    res.Stderr,
+				Timestamp: time.Now().UTC(),
+				Passed:    false,
+			})
+		}
+		return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: verify_cmd failed to run: %v. stderr: %s. Fix the issue and verify again.",
+			err, res.Stderr), nil
+	}
+	if res.ExitCode != 0 {
+		stderr := res.Stderr
+		// Record failed verification
 		if deps.RunCollector != nil {
 			deps.RunCollector.RecordVerification(audit.VerificationRecord{
 				Command:   verifyCmd,
 				ExitCode:  res.ExitCode,
-				Output:    res.Stdout,
+				Output:    stderr,
 				Timestamp: time.Now().UTC(),
-				Passed:    true,
+				Passed:    false,
 			})
 		}
+		return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: verify_cmd exited %d. stderr: %s. Fix the issue and verify again.",
+			res.ExitCode, stderr), nil
+	}
+
+	// Record successful verification
+	if deps.RunCollector != nil {
+		deps.RunCollector.RecordVerification(audit.VerificationRecord{
+			Command:   verifyCmd,
+			ExitCode:  res.ExitCode,
+			Output:    res.Stdout,
+			Timestamp: time.Now().UTC(),
+			Passed:    true,
+		})
 	}
 
 	var b strings.Builder
@@ -468,11 +519,26 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	return b.String(), nil
 }
 
+// shellQuoteTarget single-quotes s for shell use so it is data, never code.
+func shellQuoteTarget(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
 // nativeDesktopEntryVerify performs the native Go verification for the
 // linux-desktop-entries pack: the target desktop entry file exists,
 // desktop-file-validate returns 0 (if installed), and the binary referenced by
 // Exec= resolves via exec.LookPath.
-func nativeDesktopEntryVerify(target string) error {
+func nativeDesktopEntryVerify(target string, allowedPaths []string) error {
+	resolved := target
+	if !filepath.IsAbs(target) {
+		if abs, err := filepath.Abs(target); err == nil {
+			resolved = abs
+		}
+	}
+	if len(allowedPaths) > 0 && !sandbox.PathAllowed(resolved, allowedPaths) {
+		return fmt.Errorf("target desktop entry %q is outside allowed_paths %v", target, allowedPaths)
+	}
+
 	if _, err := os.Stat(target); err != nil {
 		return fmt.Errorf("desktop entry %q does not exist: %v", target, err)
 	}
@@ -771,6 +837,3 @@ func openaiTools(tools []Tool) []openai.Tool {
 	}
 	return out
 }
-
-// compile-time check that time is used (needed for a potential deadline).
-var _ = time.Second

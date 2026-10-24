@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 
@@ -212,12 +211,12 @@ func runLocalOllama(prompt string, commandOnly bool) error {
 	}
 
 	runID := nextRunID()
-	exec := transport.NewLocalExecutor(runID, ".")
+	exec := transport.NewLocalExecutor(runID, ".", pack.AllowedPaths)
 
 	opts := []agent.Option{
 		agent.WithRunID(runID),
 		agent.WithCWD("."),
-		agent.WithApprove(defaultApprove),
+		agent.WithApprove(approveMutation("local")),
 		agent.WithConfig(&agent.Config{Model: selected, BaseURL: ollamaBaseURL}),
 		agent.WithDryRun(dryRunMode),
 		agent.WithExecutor(exec),
@@ -464,6 +463,10 @@ The server exposes these tools:
 }
 
 func main() {
+	// Kill any tracked child process groups on exit (Ctrl-C / cancellation)
+	// so bwrap/ssh/mutate children cannot outlive the CLI (H5).
+	defer sandbox.KillAllChildren()
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -589,12 +592,6 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("llm client: %w", err)
 	}
 
-	// Choose approve callback: use /dev/tty when stdin is a pipe
-	approveFn := defaultApprove
-	if stdinIsPipe {
-		approveFn = approveWithTTY
-	}
-
 	runID := nextRunID()
 
 	// Set up executor (local or SSH)
@@ -618,8 +615,13 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 			fmt.Println()
 		}
 	} else {
-		executor = transport.NewLocalExecutor(runID, ".")
+		executor = transport.NewLocalExecutor(runID, ".", pack.AllowedPaths)
 	}
+
+	// One approval function for every path (piped or interactive stdin).
+	// ConfirmWithTTY opens /dev/tty; if no controlling terminal is available
+	// (CI), it returns an error and the mutation is denied (fail closed).
+	approveFn := approveMutation(executor.TargetID())
 
 	opts := []agent.Option{
 		agent.WithRunID(runID),
@@ -708,10 +710,20 @@ func renderResult(result string, runID string, pack packs.Pack) string {
 		})
 	} else if strings.Contains(result, "HARNESS_VERIFICATION_FAILED") {
 		status = ui.ReceiptFailed
+		exitCode := 1
+		outputMsg := "verification gate failed"
+		for _, line := range strings.Split(result, "\n") {
+			if idx := strings.Index(line, "verify_cmd exited "); idx != -1 {
+				var code int
+				if n, _ := fmt.Sscanf(line[idx:], "verify_cmd exited %d", &code); n == 1 {
+					exitCode = code
+				}
+			}
+		}
 		results = append(results, ui.VerificationResult{
 			Command:  pack.VerifyCmd,
-			ExitCode: 1,
-			Output:   "verification gate failed",
+			ExitCode: exitCode,
+			Output:   outputMsg,
 		})
 	}
 
@@ -725,33 +737,35 @@ func renderResult(result string, runID string, pack packs.Pack) string {
 	return b.String()
 }
 
-// defaultApprove is the mutate_system approval callback for the CLI. It renders
-// a high-visibility huh.Confirm prompt showing the exact command, cwd, and risk
-// level, and only returns true when the user explicitly confirms. On cancel or
-// non-interactive input it denies the mutation.
-func defaultApprove(command, cwd, riskLevel, reason string) bool {
-	confirmed := false
-	confirm := huh.NewConfirm().
-		Title(fmt.Sprintf("mutate_system (%s risk)", riskLevel)).
-		Description(fmt.Sprintf(
-			"command: %s\ncwd: %s\nreason: %s",
-			command, cwd, reason,
-		)).
-		Value(&confirmed)
-	if err := confirm.Run(); err != nil {
-		return false
+// approveMutation is the single mutate_system approval callback for every
+// invocation path (piped or interactive stdin). It renders a high-visibility
+// huh.Confirm on /dev/tty showing the exact target, command, cwd, and risk
+// level, with all display text sanitized against control-char and bidi
+// spoofing. On any error (including no controlling terminal / CI) it denies.
+func approveMutation(target string) agent.ApproveFunc {
+	return func(command, cwd, riskLevel, reason string) bool {
+		desc := fmt.Sprintf("target:  %s\ncommand: %s\ncwd:     %s\nreason:  %s",
+			target,
+			shell.SanitizeForDisplay(command),
+			shell.SanitizeForDisplay(cwd),
+			shell.SanitizeForDisplay(reason),
+		)
+		if riskLevel == sandbox.RiskCriticalDestructive.String() {
+			challenge := sandbox.GenerateChallengeCode()
+			ok, err := shell.ConfirmChallengeWithTTY(fmt.Sprintf("mutate_system (%s risk)", riskLevel), desc, challenge)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "approval error: %v\n", err)
+				return false
+			}
+			return ok
+		}
+		ok, err := shell.ConfirmWithTTY(fmt.Sprintf("mutate_system (%s risk)", riskLevel), desc)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "approval error: %v\n", err)
+			return false
+		}
+		return ok
 	}
-	return confirmed
-}
-
-// approveWithTTY uses /dev/tty for confirmation when stdin is a pipe.
-func approveWithTTY(command, cwd, riskLevel, reason string) bool {
-	confirmed, err := shell.ConfirmWithTTY(fmt.Sprintf("mutate_system (%s risk)", riskLevel))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "approval error: %v\n", err)
-		return false
-	}
-	return confirmed
 }
 
 // snapshotRoot mirrors sandbox.snapshotRoot (unexported) so the CLI can list runs.
@@ -859,7 +873,7 @@ func runPromptArgs(prompt string) error {
 	o := agent.New(client, router,
 		agent.WithRunID(nextRunID()),
 		agent.WithCWD("."),
-		agent.WithApprove(defaultApprove),
+		agent.WithApprove(approveMutation("local")),
 		agent.WithConfig(cfg),
 		agent.WithDryRun(dryRunMode),
 	)

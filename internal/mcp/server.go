@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/sm-me/lnta/internal/packs"
 	"github.com/sm-me/lnta/internal/sandbox"
@@ -347,12 +348,13 @@ func (s *Server) toolVerifyTask(ctx context.Context, args map[string]interface{}
 		return toolCallResult{}, fmt.Errorf("pack %s has no verify_cmd", packID)
 	}
 
-	// Render verify_cmd with target placeholder
-	vars := map[string]string{"target": target}
-	verifyCmd := packs.RenderVerifyCmd(pack.VerifyCmd, vars)
+	// Render verify_cmd with target passed out-of-band as LNTA_TARGET
+	// (single-quoted env assignment, data never shell text). Packs must
+	// reference $LNTA_TARGET literally and must not interpolate target.
+	verifyCmd := "export LNTA_TARGET='" + strings.ReplaceAll(target, "'", "'\\''") + "'; " + pack.VerifyCmd
 
 	cwd := "."
-	res, err := sandbox.RunReadOnly(ctx, verifyCmd, cwd, 0)
+	res, err := sandbox.RunReadOnly(ctx, verifyCmd, cwd, 2*time.Minute)
 	if err != nil {
 		return toolCallResult{}, fmt.Errorf("verify_cmd execution failed: %w", err)
 	}

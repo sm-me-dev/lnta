@@ -151,8 +151,8 @@ func classifyElevated(cmd string) (bool, string) {
 	return false, ""
 }
 
-// generateChallengeCode generates a random 4-character alphanumeric code.
-func generateChallengeCode() string {
+// GenerateChallengeCode generates a random 4-character alphanumeric code.
+func GenerateChallengeCode() string {
 	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // No confusing chars: 0,O,1,I
 	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {
@@ -163,6 +163,10 @@ func generateChallengeCode() string {
 		b[i] = charset[b[i]%byte(len(charset))]
 	}
 	return string(b)
+}
+
+func generateChallengeCode() string {
+	return GenerateChallengeCode()
 }
 
 // ClassifyRisk analyzes a mutate_system command and returns its risk classification.

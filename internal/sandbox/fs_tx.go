@@ -11,11 +11,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sm-me/lnta/internal/audit"
@@ -78,13 +82,21 @@ func (e *ScopeViolationError) Error() string {
 }
 
 // manifestEntry is one row in a run's manifest.json.
+// Path is stored relative to Root; Root is the directory that must be opened
+// with os.OpenRoot before operating on Path. This confines rollback to a
+// single directory and rejects absolute path escapes (C4).
 type manifestEntry struct {
-	Path    string `json:"path"`
-	Created bool   `json:"created"`
-	Mode    string `json:"mode,omitempty"`   // octal permission string of the original
-	SHA256  string `json:"sha256,omitempty"` // hash of the original content
-	Backup  string `json:"backup,omitempty"` // backup blob file name within the snapshot dir
+	Path       string `json:"path"`                  // relative to Root
+	Root       string `json:"root"`                  // directory opened as the rollback root
+	Created    bool   `json:"created"`               // true if the file was newly created
+	Mode       string `json:"mode,omitempty"`        // octal permission string of the original
+	SHA256     string `json:"sha256,omitempty"`      // hash of the original content
+	PostSHA256 string `json:"post_sha256,omitempty"` // hash of the content written by LNTA
+	Backup     string `json:"backup,omitempty"`      // backup blob file name within the snapshot dir
 }
+
+// manifestMu synchronizes manifest read-modify-write operations in-process.
+var manifestMu sync.Mutex
 
 // manifest is the undo log for a single run.
 type manifest struct {
@@ -258,13 +270,33 @@ func pathAllowed(resolved string, allowedGlobs []string) bool {
 	return false
 }
 
+// PathAllowed is the exported wrapper of pathAllowed, used by the transport
+// package to check a resolved target against the pack's allowed_paths.
+func PathAllowed(resolved string, allowedGlobs []string) bool {
+	return pathAllowed(resolved, allowedGlobs)
+}
+
 // appendManifestEntry reads (or creates) the run manifest, appends entry, and
-// rewrites it atomically.
+// rewrites it atomically with locking and fsync.
 func appendManifestEntry(runID string, entry manifestEntry) error {
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
 	snapDir := snapshotDir(runID)
 	if err := os.MkdirAll(snapDir, 0o700); err != nil {
 		return err
 	}
+
+	lockPath := filepath.Join(snapDir, ".lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err == nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX)
+		defer func() {
+			_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+			_ = lockFile.Close()
+		}()
+	}
+
 	m := manifest{RunID: runID}
 	data, err := os.ReadFile(manifestPath(runID))
 	if err == nil {
@@ -276,14 +308,26 @@ func appendManifestEntry(runID string, entry manifestEntry) error {
 	return writeManifest(snapDir, m)
 }
 
-// writeManifest writes the manifest atomically via temp file + rename.
+// writeManifest writes the manifest atomically via temp file + fsync + rename.
 func writeManifest(snapDir string, m manifest) error {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
 	tmp := filepath.Join(snapDir, ".manifest.tmp")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(snapDir, "manifest.json"))
@@ -326,62 +370,91 @@ func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlo
 		return diff, err
 	}
 
-	fi, statErr := os.Stat(resolved)
+	fi, statErr := os.Lstat(resolved)
+	if statErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return diff, fmt.Errorf("target %q is a symlink; refusing to write", resolved)
+	}
 	exists := statErr == nil
 	var oldContent []byte
 	var oldMode os.FileMode = 0o644
+
+	sum := sha256.Sum256(content)
+	diff.NewSHA256 = hex.EncodeToString(sum[:])
+	diff.SizeNew = int64(len(content))
 
 	if exists {
 		if !fi.Mode().IsRegular() {
 			return diff, fmt.Errorf("target %q is not a regular file", resolved)
 		}
-		oldContent, err = os.ReadFile(resolved)
+		// Read backup with O_NOFOLLOW to avoid symlink races
+		f, rerr := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if rerr != nil {
+			return diff, fmt.Errorf("open target for backup %q: %w", resolved, rerr)
+		}
+		oldContent, err = io.ReadAll(f)
+		_ = f.Close()
 		if err != nil {
 			return diff, err
 		}
 		oldMode = fi.Mode().Perm()
 		diff.OldMode = oldMode
-		sum := sha256.Sum256(oldContent)
-		diff.OldSHA256 = hex.EncodeToString(sum[:])
+		oldSum := sha256.Sum256(oldContent)
+		diff.OldSHA256 = hex.EncodeToString(oldSum[:])
 
 		// Backup blob: original content, mode, hash recorded in manifest.
-		blobName := fmt.Sprintf("backup-%x.bin", sum[:8])
+		blobName := fmt.Sprintf("backup-%x.bin", oldSum[:8])
 		if werr := os.WriteFile(filepath.Join(snapDir, blobName), oldContent, 0o600); werr != nil {
 			return diff, werr
 		}
 		diff.SizeOld = int64(len(oldContent))
 		if err := appendManifestEntry(runID, manifestEntry{
-			Path:    resolved,
-			Created: false,
-			Mode:    fmt.Sprintf("%04o", oldMode),
-			SHA256:  diff.OldSHA256,
-			Backup:  blobName,
+			Path:       filepath.Base(resolved),
+			Root:       filepath.Dir(resolved),
+			Created:    false,
+			Mode:       fmt.Sprintf("%04o", oldMode),
+			SHA256:     diff.OldSHA256,
+			PostSHA256: diff.NewSHA256,
+			Backup:     blobName,
 		}); err != nil {
 			return diff, err
 		}
 	} else {
 		diff.Created = true
 		if err := appendManifestEntry(runID, manifestEntry{
-			Path:    resolved,
-			Created: true,
+			Path:       filepath.Base(resolved),
+			Root:       filepath.Dir(resolved),
+			Created:    true,
+			PostSHA256: diff.NewSHA256,
 		}); err != nil {
 			return diff, err
 		}
 	}
 
-	sum := sha256.Sum256(content)
-	diff.NewSHA256 = hex.EncodeToString(sum[:])
-	diff.SizeNew = int64(len(content))
 	diff.Diff = unifiedDiff(resolved, resolved, oldContent, content)
 
-	// Atomic write: temp file in same directory, then rename.
+	// Atomic write: temp file in same directory, fsync, then rename.
 	newMode := oldMode
 	if !exists || newMode == 0 {
 		newMode = 0o644
 	}
 	tmpName := filepath.Join(filepath.Dir(resolved),
 		fmt.Sprintf(".lnta-tmp-%d-%d", os.Getpid(), time.Now().UnixNano()))
-	if err := os.WriteFile(tmpName, content, newMode); err != nil {
+	tf, err := os.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, newMode)
+	if err != nil {
+		return diff, err
+	}
+	if _, err := tf.Write(content); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmpName)
+		return diff, err
+	}
+	if err := tf.Sync(); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmpName)
+		return diff, err
+	}
+	if err := tf.Close(); err != nil {
+		_ = os.Remove(tmpName)
 		return diff, err
 	}
 	if err := os.Rename(tmpName, resolved); err != nil {
@@ -457,19 +530,35 @@ func PreviewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 	return diff, nil
 }
 
+var runIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
 // RollbackRun restores every modified file from its backup blob and deletes
 // every file recorded as created, using the manifest at
 // ~/.local/share/lnta/snapshots/<run_id>/manifest.json. Entries are processed
 // in reverse order; the snapshot directory is removed afterward. Wired to the
 // `lnta undo <run_id>` CLI command.
 //
-// Also processes remote manifests in remote_*/manifest.json subdirectories
-// for SSH-based remote file operations.
+// The manifest and run id are treated as hostile input: the run id is
+// validated against a strict regex, every manifest path must be local
+// (filepath.IsLocal), and no symlink is followed on restore. All snapshot
+// reads are confined to an opened root directory (os.OpenRoot).
 func RollbackRun(runID string) error {
+	if !runIDRE.MatchString(runID) || strings.Contains(runID, "..") {
+		return fmt.Errorf("invalid run id %q", runID)
+	}
 	snapDir := snapshotDir(runID)
 
+	snapRoot, err := os.OpenRoot(snapDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No snapshot for this run, nothing to undo
+		}
+		return fmt.Errorf("open snapshot root %q: %w", snapDir, err)
+	}
+	defer snapRoot.Close()
+
 	// 1. Process local manifest
-	if err := rollbackLocalManifest(runID, snapDir); err != nil {
+	if err := rollbackLocalManifest(snapRoot, runID); err != nil {
 		return err
 	}
 
@@ -504,8 +593,10 @@ func RollbackRun(runID string) error {
 	return nil
 }
 
-// rollbackLocalManifest processes the local manifest.json
-func rollbackLocalManifest(runID, snapDir string) error {
+// rollbackLocalManifest processes the local manifest.json, confined to snapRoot.
+// Each entry's Path is relative to its Root; we open Root with os.OpenRoot and
+// operate on Path relative to it, rejecting symlinks and .. escapes (C4).
+func rollbackLocalManifest(snapRoot *os.Root, runID string) error {
 	data, err := os.ReadFile(manifestPath(runID))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -521,19 +612,59 @@ func rollbackLocalManifest(runID, snapDir string) error {
 	// Restore in reverse order so later writes are undone first.
 	for i := len(m.Entries) - 1; i >= 0; i-- {
 		e := m.Entries[i]
+		// Confine every path: Path must be local (no .. escape). Backup is
+		// empty for newly created files, so skip it when empty.
+		if !filepath.IsLocal(e.Path) || (e.Backup != "" && !filepath.IsLocal(e.Backup)) {
+			return fmt.Errorf("manifest entry escapes root: %q / %q", e.Path, e.Backup)
+		}
+		if e.Root == "" {
+			return fmt.Errorf("manifest entry %q has no root directory", e.Path)
+		}
+		targetRoot, err := os.OpenRoot(e.Root)
+		if err != nil {
+			return fmt.Errorf("open target root %q: %w", e.Root, err)
+		}
+
 		if e.Created {
-			// Newly created file: delete it.
-			if err := os.Remove(e.Path); err != nil && !os.IsNotExist(err) {
+			// Newly created file: delete it (confined to targetRoot).
+			// M5: check if file was modified concurrently after run
+			if e.PostSHA256 != "" {
+				curBytes, rerr := readRootFile(targetRoot, e.Path)
+				if rerr == nil {
+					curSum := sha256.Sum256(curBytes)
+					if hex.EncodeToString(curSum[:]) != e.PostSHA256 {
+						targetRoot.Close()
+						return fmt.Errorf("concurrent modification detected on %q: content changed since run %s", e.Path, runID)
+					}
+				}
+			}
+			if err := targetRoot.Remove(e.Path); err != nil && !os.IsNotExist(err) {
+				targetRoot.Close()
 				return fmt.Errorf("remove created file %q: %w", e.Path, err)
 			}
+			targetRoot.Close()
 			continue
 		}
 		// Modified file: restore backup blob with original mode.
 		if e.Backup == "" {
+			targetRoot.Close()
 			continue
 		}
-		blob, rerr := os.ReadFile(filepath.Join(snapDir, e.Backup))
+		// M5: check if file was modified concurrently after run
+		if e.PostSHA256 != "" {
+			curBytes, rerr := readRootFile(targetRoot, e.Path)
+			if rerr == nil {
+				curSum := sha256.Sum256(curBytes)
+				if hex.EncodeToString(curSum[:]) != e.PostSHA256 {
+					targetRoot.Close()
+					return fmt.Errorf("concurrent modification detected on %q: content changed since run %s", e.Path, runID)
+				}
+			}
+		}
+		// Read the backup through the opened snapshot root (no path escape).
+		blob, rerr := readRootFile(snapRoot, e.Backup)
 		if rerr != nil {
+			targetRoot.Close()
 			return fmt.Errorf("read backup blob %q: %w", e.Backup, rerr)
 		}
 		mode := os.FileMode(0o644)
@@ -542,17 +673,50 @@ func rollbackLocalManifest(runID, snapDir string) error {
 				mode = os.FileMode(v)
 			}
 		}
+		// Lstat the target through targetRoot: refuse to restore through a symlink.
+		fi, lerr := targetRoot.Lstat(e.Path)
+		if lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			targetRoot.Close()
+			return fmt.Errorf("refusing to restore through symlink %q", e.Path)
+		}
+		// Write temp file in the same directory, then rename (atomic within root).
 		dir := filepath.Dir(e.Path)
 		tmp := filepath.Join(dir, fmt.Sprintf(".lnta-rollback-%d-%d", os.Getpid(), time.Now().UnixNano()))
-		if werr := os.WriteFile(tmp, blob, mode); werr != nil {
+		tf, werr := targetRoot.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+		if werr != nil {
+			targetRoot.Close()
 			return fmt.Errorf("write restore temp for %q: %w", e.Path, werr)
 		}
-		if rerr := os.Rename(tmp, e.Path); rerr != nil {
-			_ = os.Remove(tmp)
+		if _, werr := tf.Write(blob); werr != nil {
+			tf.Close()
+			targetRoot.Close()
+			return fmt.Errorf("write restore temp for %q: %w", e.Path, werr)
+		}
+		if werr := tf.Sync(); werr != nil {
+			tf.Close()
+			targetRoot.Close()
+			return fmt.Errorf("sync restore temp for %q: %w", e.Path, werr)
+		}
+		tf.Close()
+		if rerr := targetRoot.Rename(tmp, e.Path); rerr != nil {
+			_ = targetRoot.Remove(tmp)
+			targetRoot.Close()
 			return fmt.Errorf("restore %q: %w", e.Path, rerr)
 		}
+		targetRoot.Close()
 	}
 	return nil
+}
+
+// readRootFile reads a file relative to an opened root directory, confined to
+// that root (no symlink or .. escape).
+func readRootFile(root *os.Root, name string) ([]byte, error) {
+	fd, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer fd.Close()
+	return io.ReadAll(fd)
 }
 
 // rollbackRemoteManifest processes a remote manifest and restores files via SSH
@@ -613,9 +777,10 @@ func rollbackRemoteManifest(runID, remoteDir, dirName string) error {
 			fmt.Fprintf(os.Stderr, "Warning: failed to read backup blob %q: %v\n", e.Backup, rerr)
 			continue
 		}
-		// Write blob back via SSH
-		writeCmd := fmt.Sprintf("cat > %s <<'LNTA_EOF'\n%s\nLNTA_EOF", shellQuote(e.Path), string(blob))
-		if err := runSSHDirect(ctx, user, host, port, writeCmd); err != nil {
+		// Write blob back via SSH. Stream bytes over stdin; no heredoc parser
+		// to confuse, so a backup blob containing "LNTA_EOF" cannot execute code.
+		writeScript := fmt.Sprintf("cat > %s", shellQuote(e.Path))
+		if err := runSSHDirectStdin(ctx, user, host, port, writeScript, bytes.NewReader(blob)); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to restore remote file %q: %v\n", e.Path, err)
 		}
 	}
@@ -625,19 +790,58 @@ func rollbackRemoteManifest(runID, remoteDir, dirName string) error {
 
 // runSSHDirect executes a command on a remote host via direct SSH call.
 func runSSHDirect(ctx context.Context, user, host, port, cmd string) error {
+	return runSSHDirectStdin(ctx, user, host, port, cmd, nil)
+}
+
+// runSSHDirectStdin executes a command on a remote host via direct SSH call,
+// streaming stdin to the remote command's stdin (binary-safe, no heredoc).
+// Validates the target to prevent option injection (C3) through manifest data.
+func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin io.Reader) error {
+	if !sshUserRE.MatchString(user) || !sshHostRE.MatchString(host) || strings.HasPrefix(host, "-") {
+		return fmt.Errorf("invalid ssh target %s@%s:%s", user, host, port)
+	}
+	if strings.Contains(host, "%") {
+		return fmt.Errorf("ssh host %q contains %% (ControlPath token expansion)", host)
+	}
+	portInt, err := strconv.Atoi(port)
+	if err != nil || portInt < 1 || portInt > 65535 {
+		return fmt.Errorf("invalid ssh port %q", port)
+	}
+
+	home, _ := os.UserHomeDir()
+	controlDir := filepath.Join(home, ".cache", "lnta")
+	if err := os.MkdirAll(controlDir, 0o700); err != nil {
+		return fmt.Errorf("create ssh control dir %q: %w", controlDir, err)
+	}
+	if fi, err := os.Lstat(controlDir); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("ssh control dir %q is a symlink", controlDir)
+		}
+		if fi.Mode().Perm() != 0o700 {
+			_ = os.Chmod(controlDir, 0o700)
+		}
+	}
+
 	sshCmd := exec.CommandContext(ctx, "ssh",
 		"-o", "BatchMode=yes",
-		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=~/.cache/lnta/ssh-%r@%h:%p",
-		"-o", "ControlPersist=60s",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-p", port,
-		fmt.Sprintf("%s@%s", user, host),
+		"-o", "ConnectTimeout=10",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "ControlMaster=no",
+		"-o", fmt.Sprintf("ControlPath=%s/ssh-%%r@%%h:%%p", controlDir),
+		"-p", strconv.Itoa(portInt),
+		"--", user + "@" + host,
 		cmd,
 	)
-	sshCmd.Stdin = nil
-	sshCmd.Stdout = os.Stdout
-	sshCmd.Stderr = os.Stderr
+	sshCmd.Stdin = stdin
+	ConfigureProcessGroup(sshCmd)
+	out := NewCappedBuffer(16*1024, 8<<20, nil)
+	errOut := NewCappedBuffer(16*1024, 8<<20, nil)
+	sshCmd.Stdout = out
+	sshCmd.Stderr = errOut
+	sshCmd.WaitDelay = 5 * time.Second
+
+	RegisterChild(sshCmd)
+	defer UnregisterChild(sshCmd)
 	return sshCmd.Run()
 }
 
@@ -662,6 +866,11 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+var (
+	sshUserRE = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+	sshHostRE = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$`)
+)
+
 // SnapshotRoot returns the snapshot root directory (~/.local/share/lnta/snapshots).
 // Exported for use by transport package.
 func SnapshotRoot() string {
@@ -673,5 +882,3 @@ func SnapshotRoot() string {
 func ComputeSHA256(data []byte) [32]byte {
 	return sha256.Sum256(data)
 }
-
-var _ = bytes.MinRead
