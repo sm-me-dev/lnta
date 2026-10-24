@@ -39,19 +39,9 @@ nfpms:
       - bubblewrap
       - desktop-file-validate
     scripts:
-      postinstall: |
-        #!/bin/sh
-        if command -v apparmor_parser >/dev/null 2>&1; then
-          apparmor_parser -r /etc/apparmor.d/bwrap || true
-        fi
-      preremove: |
-        #!/bin/sh
-        if command -v apparmor_parser >/dev/null 2>&1; then
-          apparmor_parser -R /etc/apparmor.d/bwrap || true
-        fi
-      postremove: |
-        #!/bin/sh
-        rm -f /etc/apparmor.d/bwrap
+      postinstall: scripts/deb/postinstall.sh
+      preremove: scripts/deb/preremove.sh
+      postremove: scripts/deb/postremove.sh
     contents:
       - src: scripts/apparmor-profile
         dst: /etc/apparmor.d/bwrap
