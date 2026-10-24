@@ -1,0 +1,5 @@
+Component: main
+Origin: sm-me-dev
+Label: LNTA Official APT Repository
+Architecture: amd64
+Description: Fast, kernel-sandboxed Linux natural-language terminal assistant

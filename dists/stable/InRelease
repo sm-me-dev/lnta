@@ -1,0 +1,38 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: sm-me-dev
+Label: LNTA Official APT Repository
+Codename: stable
+Date: Sat, 24 Oct 2026 16:08:03 UTC
+Architectures: amd64 arm64
+Components: main
+Description: Fast, kernel-sandboxed Linux natural-language terminal assistant
+MD5Sum:
+ 677932f44724b54d172db55a067793d2 477 main/binary-amd64/Packages
+ 07ceaeef249574e6259aa8cc9fd30d2c 366 main/binary-amd64/Packages.gz
+ 69e90a4b243811cd43aa64b3284c6b4d 168 main/binary-amd64/Release
+ 3c798bd38b38cadeb394c704abf2db6a 477 main/binary-arm64/Packages
+ 7fb46f1dd29717026b28985a313d08f3 365 main/binary-arm64/Packages.gz
+ f5b1c9bc270e9fc1eecb3dac4c605171 168 main/binary-arm64/Release
+SHA1:
+ e225da270f4c7c4a8b8a50c3ec234c7b5fc2c295 477 main/binary-amd64/Packages
+ 81ae54cb30d2f6ffd176ff210627a6373960fdce 366 main/binary-amd64/Packages.gz
+ 33d455b454ba11e9a1d2184b2cb5033bb7e8b650 168 main/binary-amd64/Release
+ 94ede4058b6958a3ce7c2ab731ddf69bf3d53f2b 477 main/binary-arm64/Packages
+ e0bffe8d1631d9c64fcf63c1f5aa59fea78c7fec 365 main/binary-arm64/Packages.gz
+ 24b27d4764188dd1ba765c685633244c2ab0ee0a 168 main/binary-arm64/Release
+SHA256:
+ 9bc8c51c8862abc7b11fd2f2a61546ebb284965ca6c6aa64c347f4e624e504c2 477 main/binary-amd64/Packages
+ 3b07bcb1d0192cf0cde3c58a79295384c283bc88d2df29bf6e9dd60652058433 366 main/binary-amd64/Packages.gz
+ 537121e202850547501376288cd719d72b27bef2dd5261aa53e2a5960b374e88 168 main/binary-amd64/Release
+ ea161a67a209a6355e3db59e97cece902c464258bb32b681da17ca5137bfcce8 477 main/binary-arm64/Packages
+ f75170d24f8cf8f9e6073d674096dca27daeca7c03889d158db38ee1106218b8 365 main/binary-arm64/Packages.gz
+ 45067859409edb1fa633b7078f6d331e785e0db6e71ac329317ef664d6c43b5f 168 main/binary-arm64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQRFv+e1ZsJPmE7wD2ruAXihGAUL2wUCatzX4wAKCRDuAXihGAUL
+2zRyAQCjm0elv1WnkKVtTXB128Jfl0T/Vgsx2FNDeCUztkQgQAD9EVVtEXqg2VYa
+8UJYVLTg4UDxqSIZRKZfWPxrLhRy3Q4=
+=eDzA
+-----END PGP SIGNATURE-----
