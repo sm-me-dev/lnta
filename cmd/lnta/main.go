@@ -582,6 +582,7 @@ func init() {
 	rootCmd.AddCommand(fixCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(modelsCmd)
+	rootCmd.AddCommand(selfUpdateCmd)
 
 	// Hidden command for Landlock sandbox self-re-exec
 	rootCmd.AddCommand(sandboxExecCmd)

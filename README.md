@@ -217,25 +217,94 @@ Dive deeper into LNTA's architecture, security controls, and extensibility:
 
 ## Installation Packages & Options
 
-### Native Package Managers
+### Option 1: Official Signed APT Repository (Ubuntu / Debian — Recommended)
 
-| Distribution | Installation Command |
-|---|---|
-| **Ubuntu / Debian** | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
-| **Fedora / RHEL / openSUSE** | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.8.0-1.x86_64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
-| **Arch Linux / Manjaro** | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.8.0-1-x86_64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
-| **Static Binary (Any Linux)**| `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
-
-<details>
-<summary><strong>Building from Source</strong></summary>
+Install LNTA with automatic security updates via standard `apt upgrade`, hosted at zero cost on GitHub Pages:
 
 ```bash
+curl -fsSL https://sm-me-dev.github.io/lnta/install-apt.sh | sudo sh
+```
+
+<details>
+<summary><strong>Manual APT Keyring & Sources Setup (Step-by-Step)</strong></summary>
+
+For security-conscious sysadmins who prefer inspecting commands rather than piping curl to sh:
+
+```bash
+# 1. Install the dedicated LNTA Ed25519 repository signing key
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://sm-me-dev.github.io/lnta/lnta-archive-keyring.asc | sudo gpg --dearmor -o /etc/apt/keyrings/lnta.gpg
+sudo chmod a+r /etc/apt/keyrings/lnta.gpg
+
+# 2. Add the modern DEB822 repository entry
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/lnta.gpg] https://sm-me-dev.github.io/lnta stable main" | \
+  sudo tee /etc/apt/sources.list.d/lnta.list > /dev/null
+
+# 3. Install LNTA
+sudo apt update && sudo apt install -y lnta
+```
+</details>
+
+---
+
+### Option 2: Homebrew / Linuxbrew Tap (macOS & Linux)
+
+For developers using [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux):
+
+```bash
+brew tap sm-me-dev/lnta https://github.com/sm-me-dev/lnta
+brew install lnta
+```
+
+---
+
+### Option 3: Universal Standalone Installer (All Linux Distributions)
+
+Auto-detects your distribution, fetches the latest package or static binary, verifies SHA-256 signatures, and installs:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sm-me-dev/lnta/main/scripts/install.sh | sudo bash
+```
+
+#### Direct Package Downloads
+
+| Distribution | Architecture | Installation Command |
+|---|---|---|
+| **Ubuntu / Debian** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.0_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
+| **Fedora / RHEL / openSUSE** | `x86_64` / `aarch64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.0-1.x86_64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
+| **Arch Linux / Manjaro** | `x86_64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.0-1-x86_64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
+| **Static Tarball (Any Linux)**| `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.0_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
+
+---
+
+### Option 4: Building from Source & Go Install
+
+```bash
+# Using go install
+go install github.com/sm-me-dev/lnta/cmd/lnta@latest
+
+# Or building from git repository
 git clone https://github.com/sm-me-dev/lnta.git
 cd lnta
 go build -o lnta ./cmd/lnta
 sudo mv lnta /usr/local/bin/
 ```
-</details>
+
+---
+
+### In-Place Upgrades (`lnta self-update`)
+
+Standalone binary installations can upgrade themselves directly:
+
+```bash
+# Check if an update is available
+lnta self-update --check
+
+# Upgrade binary in-place with SHA-256 verification
+lnta self-update
+```
+
+*(Note: If LNTA was installed via APT, RPM, or Pacman, `lnta self-update` automatically detects your package manager and advises using `sudo apt update && sudo apt upgrade lnta` to preserve system integrity).*
 
 ---
 

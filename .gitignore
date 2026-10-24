@@ -1,6 +1,4 @@
 # Binaries built by the project
-lnta
-lnta-eval
 /lnta
 /lnta-eval
 
@@ -59,3 +57,4 @@ specs/
 embedded_packs.go
 graphify-out/
 specs/
+.superpowers/

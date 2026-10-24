@@ -8,13 +8,14 @@ on:
 permissions:
   contents: write
   packages: write
+  pages: write
 
 env:
   GO_VERSION: "1.27"
 
 jobs:
   goreleaser:
-    name: GoReleaser
+    name: GoReleaser & APT Repository
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
@@ -36,6 +37,7 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
 
       - name: Upload artifacts as workflow artifacts
         uses: actions/upload-artifact@v4
@@ -43,3 +45,86 @@ jobs:
           name: release-artifacts
           path: dist/
           retention-days: 30
+
+      - name: Publish APT Repository to GitHub Pages
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          echo "=== Setting up APT Repository Publisher ==="
+          sudo apt-get update && sudo apt-get install -y reprepro gnupg
+
+          HAVE_GPG=false
+          KEY_FP=""
+          if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "Importing GPG release signing key..."
+            echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+            KEY_FP=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+            if [ -n "$KEY_FP" ]; then
+              echo "Loaded GPG signing key fingerprint: $KEY_FP"
+              HAVE_GPG=true
+            fi
+          else
+            echo "::warning::GPG_PRIVATE_KEY secret is not set! Building an unsigned test repository."
+            echo "::notice::To enable signed releases, generate an Ed25519 GPG key and add it to repo secrets as GPG_PRIVATE_KEY."
+          fi
+
+          echo "Checking out or initializing gh-pages branch..."
+          git clone --branch gh-pages --single-branch "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages-apt 2>/dev/null || {
+            echo "gh-pages branch does not exist yet. Initializing new orphan branch..."
+            mkdir -p gh-pages-apt
+            cd gh-pages-apt
+            git init
+            git checkout --orphan gh-pages
+            cd ..
+          }
+
+          mkdir -p gh-pages-apt/conf
+          cp scripts/apt/distributions gh-pages-apt/conf/distributions
+
+          if [ "$HAVE_GPG" = "false" ]; then
+            echo "Disabling package signing in conf/distributions (GPG_PRIVATE_KEY not set)..."
+            sed -i '/^SignWith:/d' gh-pages-apt/conf/distributions
+          fi
+
+          echo "Adding Debian packages to reprepro repository..."
+          for deb in dist/*.deb; do
+            if [ -f "$deb" ]; then
+              echo "Including $deb..."
+              reprepro -b gh-pages-apt --ignore=existingincludedeb includedeb stable "$deb" || \
+                reprepro -b gh-pages-apt includedeb stable "$deb"
+            fi
+          done
+
+          echo "Exporting public key and static assets..."
+          if [ "$HAVE_GPG" = "true" ]; then
+            gpg --armor --export "$KEY_FP" > gh-pages-apt/lnta-archive-keyring.asc
+          elif [ -f scripts/apt/lnta-archive-keyring.asc ]; then
+            cp scripts/apt/lnta-archive-keyring.asc gh-pages-apt/lnta-archive-keyring.asc
+          fi
+
+          if [ -f scripts/apt/install-apt.sh ]; then
+            cp scripts/apt/install-apt.sh gh-pages-apt/install-apt.sh
+            chmod +x gh-pages-apt/install-apt.sh
+          fi
+
+          echo "Creating .nojekyll marker for GitHub Pages..."
+          touch gh-pages-apt/.nojekyll
+
+          echo "Generating landing page (index.html)..."
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/apt/generate-index.sh "${TAG_VERSION}" "gh-pages-apt"
+
+          echo "Committing and force-pushing to gh-pages branch..."
+          cd gh-pages-apt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes in APT repository to commit."
+          else
+            git commit -m "deploy: update APT repository for ${GITHUB_REF_NAME}"
+            git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+          fi
+          echo "APT repository deployment complete!"

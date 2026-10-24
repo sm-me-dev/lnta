@@ -28,6 +28,7 @@ builds:
 nfpms:
   - id: deb
     package_name: lnta
+    file_name_template: "{{ .PackageName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     formats:
       - deb
     bindir: /usr/bin
@@ -58,6 +59,7 @@ nfpms:
         packager: deb
   - id: rpm
     package_name: lnta
+    file_name_template: "{{ .PackageName }}-{{ .Version }}-1.{{ .Arch }}"
     formats:
       - rpm
     bindir: /usr/bin
@@ -69,6 +71,7 @@ nfpms:
       - desktop-file-validate
   - id: archlinux
     package_name: lnta
+    file_name_template: "{{ .PackageName }}-{{ .Version }}-1-{{ .Arch }}"
     formats:
       - archlinux
     bindir: /usr/bin
@@ -90,6 +93,22 @@ archives:
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
+brews:
+  - name: lnta
+    repository:
+      owner: sm-me-dev
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    skip: "{{ not .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: github-actions[bot]
+      email: github-actions[bot]@users.noreply.github.com
+    homepage: "https://github.com/sm-me-dev/lnta"
+    description: "Linux Natural-Language Terminal Assistant"
+    license: "MIT"
+    test: |
+      system "#{bin}/lnta --version"
 release:
   github:
     owner: sm-me-dev

@@ -9,8 +9,8 @@ LNTA is designed with an uncompromising defense-in-depth model. We take vulnerab
 | Version | Supported | Status |
 |---|---|---|
 | `main` (trunk) | :white_check_mark: | Actively maintained |
-| `>= 0.8.0` | :white_check_mark: | Supported for critical security patches |
-| `< 0.8.0` | :x: | End of life |
+| `>= 0.1.0` | :white_check_mark: | Supported for critical security patches |
+| `< 0.1.0` | :x: | End of life |
 
 ---
 
