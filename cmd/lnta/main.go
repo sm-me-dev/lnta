@@ -1024,12 +1024,7 @@ func runDoctor(cmd *cobra.Command) error {
 		}
 	}
 
-	if doctorFix {
-		fmt.Println()
-		fmt.Println(titleStyle.Render("## AppArmor Profile for bwrap"))
-		fmt.Println()
-		fmt.Println(generateAppArmorProfile())
-	}
+
 
 	fmt.Println()
 	if allPassed {
