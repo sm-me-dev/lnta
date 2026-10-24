@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/sm-me-dev/lnta/actions/workflows/ci.yml"><img src="https://github.com/sm-me-dev/lnta/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI Build"></a>
-  <a href="https://github.com/sm-me-dev/lnta/releases/latest"><img src="https://img.shields.io/github/v/release/sm-me-dev/lnta?color=blue&label=release" alt="Latest Release"></a>
+  <a href="https://github.com/sm-me-dev/lnta/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/Release-v0.1.0-blue?logo=github" alt="Latest Release v0.1.0"></a>
   <a href="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu"><img src="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu" alt="Ubuntu 24.04/26.04 AppArmor Ready"></a>
   <a href="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
