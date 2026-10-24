@@ -1,8 +1,8 @@
 # LNTA — Linux Natural-Language Terminal Assistant
 
 <p align="center">
-  <a href="https://github.com/sm-me-dev/lnta/actions"><img src="https://img.shields.io/github/actions/workflow/status/sm-me-dev/lnta/ci.yml?branch=main&label=CI%20Build" alt="Build Status"></a>
-  <a href="https://goreportcard.com/report/github.com/sm-me-dev/lnta"><img src="https://goreportcard.com/badge/github.com/sm-me-dev/lnta" alt="Go Report Card"></a>
+  <a href="https://github.com/sm-me-dev/lnta/actions/workflows/ci.yml"><img src="https://github.com/sm-me-dev/lnta/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI Build"></a>
+  <a href="https://github.com/sm-me-dev/lnta/releases/latest"><img src="https://img.shields.io/github/v/release/sm-me-dev/lnta?color=blue&label=release" alt="Latest Release"></a>
   <a href="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu"><img src="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu" alt="Ubuntu 24.04/26.04 AppArmor Ready"></a>
   <a href="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
@@ -37,7 +37,10 @@ Giving an LLM raw `/bin/bash` access is an invitation to accidental data loss, c
 ### 1. One-Line Install
 
 ```bash
-# Detects distribution (deb/rpm/arch/tarball), verifies SHA-256, and installs cleanly
+# Ubuntu / Debian (Official Signed APT Repository — Recommended):
+curl -fsSL https://sm-me-dev.github.io/lnta/install-apt.sh | sudo sh
+
+# Universal Installer (Fedora / Arch / other Linux):
 curl -fsSL https://raw.githubusercontent.com/sm-me-dev/lnta/main/scripts/install.sh | bash
 ```
 
@@ -271,8 +274,8 @@ curl -fsSL https://raw.githubusercontent.com/sm-me-dev/lnta/main/scripts/install
 | Distribution | Architecture | Installation Command |
 |---|---|---|
 | **Ubuntu / Debian** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.0_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
-| **Fedora / RHEL / openSUSE** | `x86_64` / `aarch64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.0-1.x86_64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
-| **Arch Linux / Manjaro** | `x86_64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.0-1-x86_64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
+| **Fedora / RHEL / openSUSE** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.0-1.amd64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
+| **Arch Linux / Manjaro** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.0-1-amd64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
 | **Static Tarball (Any Linux)**| `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.0_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
 
 ---
