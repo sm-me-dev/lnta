@@ -1,344 +1,275 @@
 # LNTA — Linux Natural-Language Terminal Assistant
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go&logoColor=white" alt="Go Version">
-  <img src="https://img.shields.io/badge/Platform-Linux-blue?logo=linux&logoColor=white" alt="Platform">
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
-  <img src="https://img.shields.io/github/v/release/sm-me/lnta?display_name=tag" alt="Latest Release">
+  <a href="https://github.com/sm-me/lnta/actions"><img src="https://img.shields.io/github/actions/workflow/status/sm-me/lnta/ci.yml?branch=main&label=build" alt="Build Status"></a>
+  <a href="https://goreportcard.com/report/github.com/sm-me/lnta"><img src="https://goreportcard.com/badge/github.com/sm-me/lnta" alt="Go Report Card"></a>
+  <a href="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu"><img src="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu" alt="Ubuntu 24.04/26.04 AppArmor Ready"></a>
+  <a href="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
 </p>
 
-LNTA grounds LLM actions in local system truth. It fingerprints the machine, routes your prompt to matching executable **Instruction Packs**, gathers ground-truth context, shows exactly what would be done — then waits for your approval before anything touches the system.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        LNTA ARCHITECTURE                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   User Prompt  ──►  Fingerprint (<5ms)  ──►  Pack Router (triggers)        │
-│       │                                            │                        │
-│       ▼                                            ▼                        │
-│   ┌─────────┐                              ┌───────────────┐               │
-│   │ Context │ ◄───────────────────────────►│ Instruction   │               │
-│   │ Gather  │     verify_cmd / context_cmd │ Pack Engine   │               │
-│   └────┬────┘                              └───────┬───────┘               │
-│        │                                           │                       │
-│        ▼                                           ▼                       │
-│   ┌───────────────────────────────────────────────────────┐              │
-│   │              MUTATION GATE (huh.Confirm)              │              │
-│   │  Shows exact command + cwd + risk level + rationale   │              │
-│   │  Requires explicit human approval (Y/N)               │              │
-│   └───────────────────────┬───────────────────────────────┘              │
-│                           │                                               │
-│                           ▼                                               │
-│   ┌───────────────────────────────────────────────────────┐              │
-│   │              EXECUTION SANDBOX (bwrap/Landlock)       │              │
-│   │  • Read-only root FS (--ro-bind / /)                  │              │
-│   │  • Masked secrets (~/.ssh, ~/.gnupg, ~/.aws, ~/.config)│              │
-│   │  • Private /tmp (tmpfs)                               │              │
-│   │  • Stdin = /dev/null, non-interactive env             │              │
-│   └───────────────────────┬───────────────────────────────┘              │
-│                           │                                               │
-│                           ▼                                               │
-│   ┌───────────────────────────────────────────────────────┐              │
-│   │          VERIFICATION GATE (verify_cmd)               │              │
-│   │  Deterministic shell check — no LLM self-reporting    │              │
-│   │  Exit 0 = success, Exit ≠ 0 = retry with error        │              │
-│   └───────────────────────┬───────────────────────────────┘              │
-│                           │                                               │
-│                           ▼                                               │
-│   ┌───────────────────────────────────────────────────────┐              │
-│   │              SNAPSHOT + UNDO (instant rollback)       │              │
-│   │  Atomic backup → ~/.local/share/lnta/snapshots/       │              │
-│   │  One command: lnta undo [run_id]                      │              │
-│   └───────────────────────────────────────────────────────┘              │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <strong>Grounded Linux system administration with airgapped sandboxes, strict path scopes, and deterministic verification gates.</strong>
+</p>
 
 ---
 
-## Why Safer Than Raw Bash Agents
+## Table of Contents
 
-| ❌ Raw Bash Agent | ✅ LNTA |
-|-------------------|---------|
-| Unbounded shell access — can `rm -rf /` | **Kernel Sandboxing**: `bwrap`/`Landlock` read-only FS, masked secrets, no network |
-| No verification — assumes LLM succeeded | **Mandatory Verification Gates**: `verify_cmd` must pass deterministically |
-| No rollback — mistakes are permanent | **Instant Rollback**: `lnta undo` reverts in ~1s from atomic snapshots |
-| Prompt injection = system compromise | **Scoped Tools Only**: `inspect_system`, `write_scoped_file`, `mutate_system`, `complete_task` |
-| Silent failures, no audit trail | **Full Audit Log**: Every mutation logged with command, cwd, rationale, timestamp |
+- [The Problem & Solution in 3 Bullet Points](#the-problem--solution-in-3-bullet-points)
+- [60-Second Quickstart](#60-second-quickstart)
+  - [1. One-Line Install](#1-one-line-install)
+  - [2. Shell Integration](#2-shell-integration)
+  - [3. Four Immediately Useful Real-World Commands](#3-four-immediately-useful-real-world-commands)
+- [How It Works](#how-it-works)
+  - [System Architecture Diagram](#system-architecture-diagram)
+- [Technical Comparison](#technical-comparison)
+- [Documentation Suite](#documentation-suite)
+- [Key Features](#key-features)
+- [Installation Packages & Options](#installation-packages--options)
+- [Diagnostics & AppArmor Setup](#diagnostics--apparmor-setup)
+- [License](#license)
 
 ---
 
-## Quick Install
+## The Problem & Solution in 3 Bullet Points
 
-### One-Line Installer (All Distros)
+Giving an LLM raw `/bin/bash` access is an invitation to accidental data loss, credential theft, or stealth persistence. **LNTA solves this natively:**
+
+- 🛡️ **Airgapped `bwrap` & Landlock Sandbox**: Raw shell agents can `rm -rf /` or leak your `~/.ssh` and `.env` files via prompt injection. LNTA conducts all context discovery inside an airgapped kernel sandbox with a read-only root (`--ro-bind / /`), disconnected networking (`--unshare-net`), masked credentials, and phantom dotfile lockouts (defending against **CVE-2026-25725**).
+- 🎯 **Deterministic Verification Gates**: Unbounded agents self-report success even when commands fail or leave daemons broken. LNTA enforces automated, deterministic verification checks (`verify_cmd` using `systemd-analyze`, `desktop-file-validate`, `ufw status`). The task **cannot exit with success** until the actual Linux validation tool exits `0`.
+- ⏪ **Instant Atomic Rollback**: When other tools break a configuration file, recovery means tedious manual hunting through shell history. Every file write in LNTA creates an atomic snapshot under `~/.local/share/lnta/snapshots/`. Restore the machine to its exact previous state in <1s with `lnta undo` or browse past changes visually via `lnta sessions`.
+
+---
+
+## 60-Second Quickstart
+
+### 1. One-Line Install
 
 ```bash
-# Downloads correct package (.deb/.rpm/.pkg.tar.zst) or static binary,
-# verifies SHA-256, installs cleanly
+# Detects distribution (deb/rpm/arch/tarball), verifies SHA-256, and installs cleanly
 curl -fsSL https://raw.githubusercontent.com/sm-me/lnta/main/scripts/install.sh | bash
 ```
 
-### Distribution Packages
+### 2. Shell Integration
 
-| Distro | Command |
-|--------|---------|
-| **Ubuntu / Debian** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
-| **Fedora / RHEL / openSUSE** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta-0.8.0-1.x86_64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
-| **Arch / Manjaro** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta-0.8.0-1-x86_64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
-| **Any (static binary)** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.tar.gz | tar -xz && sudo mv lnta /usr/local/bin/` |
-
-> **Note**: On Ubuntu 24.04+, the `.deb` package automatically installs the AppArmor profile for `bwrap`, enabling zero-config kernel sandboxing out of the box.
-
----
-
-## Usage
+Add LNTA to your shell profile to activate `lnta fix` and the `Ctrl+G` line-editor hotkey:
 
 ```bash
-# One-shot: describe what you want
-lnta "create a .desktop launcher for my backup script at ~/bin/backup-ui"
-
-# Interactive chat with history
-lnta chat
-
-# Explain mode (read-only, no mutations possible)
-lnta --explain "why is nginx failing?"
-
-# Dry-run: see diffs without writing
-lnta --dry-run "create a systemd user service for my app"
-
-# Undo a previous run
-lnta undo
-
-# Fix the last failed command (requires shell integration)
-lnta fix
-
-# Pipe logs for analysis
-journalctl -u nginx -n 50 | lnta "explain the error"
-
-# Generate shell integration (Ctrl+G widget, lnta fix, last-cmd capture)
-eval "$(lnta init zsh)"   # or bash, fish
-
-# Generate man page
-lnta docs --man
-
-# Validate instruction packs
-lnta packs validate
-
-# System diagnostics
-lnta doctor
-```
-
-### Example Output
-
-```
-## System Context
-- os: ubuntu 26.04 (Ubuntu 26.04 LTS)
-- shell: /usr/bin/zsh
-- session: wayland / ubuntu:GNOME
-- home: /home/user
-- cwd: /home/user/Codes/project
-- binaries: bwrap ✓, systemctl ✓, desktop-file-validate ✓, ss ✓
-
-## Matched Pack (1)
-- Linux Desktop Entries (linux-desktop-entries)
-  required_bins: [desktop-file-validate]
-  context_cmd: desktop-file-validate --version
-  verify_cmd: desktop-file-validate "${target}"
-
-# Linux Desktop Entries
-Create, validate, and install .desktop launchers in ~/.local/share/applications/.
-
-## Plan
-1. Create ~/.local/share/applications/backup-ui.desktop with Exec=/home/user/bin/backup-ui
-2. Run desktop-file-validate on the created file
-
-## Result
-✅ Verification Receipt (run-20260115T143022)
-  • Status: COMPLETED
-  • Verified: /home/user/.local/share/applications/backup-ui.desktop
-  • desktop-file-validate: passed
-
-Hint: Run 'lnta undo run-20260115T143022' to revert.
-```
-
----
-
-## Shell Integration
-
-Add to your shell RC file (`.zshrc`, `.bashrc`, `config.fish`):
-
-```bash
-# zsh
+# For Zsh (~/.zshrc)
 eval "$(lnta init zsh)"
 
-# bash
+# For Bash (~/.bashrc)
 eval "$(lnta init bash)"
 
-# fish
+# For Fish (~/.config/fish/config.fish)
 lnta init fish | source
 ```
 
-This enables:
-- **`Ctrl+G`**: Type natural language at prompt, press `Ctrl+G` → replaced with verified command
-- **`lnta fix`**: After a command fails, run `lnta fix` to auto-capture and remediate
-- **Last-command capture**: `_LNTA_LAST_CMD` / `_LNTA_LAST_EXIT` exported on every prompt
-
----
-
-## Instruction Packs
-
-LNTA's capabilities come from **Instruction Packs** — Markdown files with YAML frontmatter:
-
-```yaml
----
-id: linux-desktop-entries
-name: Linux Desktop Entries
-triggers:
-  - desktop
-  - .desktop
-  - launcher
-allowed_paths:
-  - "~/.local/share/applications/*.desktop"
-  - "~/.config/autostart/*.desktop"
-required_bins:
-  - desktop-file-validate
-context_cmd: desktop-file-validate --version
-verify_cmd: desktop-file-validate "${target}"
----
-# Markdown body guides the LLM...
-```
-
-### Built-in Packs
-
-| Pack ID | Triggers | Purpose |
-|---------|----------|---------|
-| `linux-desktop-entries` | desktop, .desktop, launcher | Create/validate `.desktop` launchers |
-| `systemd-user-services` | systemd, service, user service | Manage user systemd units |
-| `network-ports-processes` | port, listening, ss, netstat | Inspect network state |
-| `general-diagnostics` | (fallback) | Generic system diagnostics |
-| `docker-compose-diagnostics` | docker, compose | Debug Docker Compose |
-| `git-repo-hygiene` | git, repo, hygiene | Repository health checks |
-| `ssh-gpg-permissions` | ssh, gpg, permissions | Fix SSH/GPG file permissions |
-| `systemd-timers-cron` | timer, cron, schedule | Manage systemd timers |
-| `udev-device-rules` | udev, device, rules | Create udev rules |
-| `ufw-firewall-ports` | ufw, firewall, port | Manage UFW rules |
-| `disk-mounts-fstab` | mount, fstab, disk | Configure `/etc/fstab` |
-
-### Contributing New Packs
-
-1. Create `packs/your-pack-name.md` with the schema above
-2. Test locally: `lnta packs validate --strict`
-3. Add trigger scoring test, `allowed_paths` coverage test, `verify_cmd` determinism test
-4. PR to `main` — CI validates automatically
-
----
-
-## Demo
-
-<p align="center">
-  <img src="demo.gif" alt="LNTA Demo" width="800">
-</p>
-
-*The demo shows: (1) creating a validated desktop launcher with fingerprint + sandbox + diff + receipt, (2) instant `lnta undo`, (3) pipe ingestion from `journalctl` with LLM analysis.*
-
----
-
-## Architecture Deep Dive
-
-### Zero-Raw-Bash Execution Model
-
-The LLM **never** gets raw shell access. It operates through four strictly typed tools:
-
-1. **`inspect_system`** — Read-only commands in `bwrap` sandbox (`--ro-bind / /`, masked secrets, no network)
-2. **`write_scoped_file`** — Atomic writes with backup, validated against pack's `allowed_paths` glob
-3. **`mutate_system`** — Pauses for human confirmation via `huh.Confirm` (shows exact command, cwd, risk, rationale)
-4. **`complete_task`** — Triggers pack's `verify_cmd`; cannot exit success until verification passes
-
-### Deterministic Verification Gates
-
-Every operation has a `verify_cmd` in its Instruction Pack:
-- Runs **without LLM involvement**
-- Returns exit code 0 **only on true completion**
-- Produces machine-parseable output for CI integration
-- Single source of truth for "task complete" — no LLM self-reporting
-
-### Zero-Latency Fingerprinting
-
-System fingerprint runs at startup in **<5ms** with **zero LLM calls**:
-- OS, kernel, distro, shell, session type
-- Available binaries (bwrap, systemctl, validators, etc.)
-- User, home, cwd, PATH
-- Independently benchmarked: `go test -bench=BenchmarkFingerprint`
-
----
-
-## Development
+Set your preferred OpenAI-compatible API key or use [local Ollama](#local-offline-mode):
 
 ```bash
-# Build
-go build ./...
-
-# Test (includes race detector)
-go test -race -v ./...
-
-# Lint
-golangci-lint run
-
-# Validate packs
-lnta packs validate --strict
-
-# Fingerprint benchmark
-go test -bench=BenchmarkFingerprint -benchtime=1s ./internal/fingerprint/
+export LNTA_API_KEY="sk-..."
 ```
 
-### Project Structure
+---
 
+### 3. Four Immediately Useful Real-World Commands
+
+#### 1. One-Shot System Task (`lnta "..."`)
+Create a validated Freedesktop `.desktop` launcher without memorizing syntax:
+
+```bash
+lnta "create a desktop launcher for my backup utility at ~/bin/backup-sync"
 ```
-cmd/lnta/                    # Cobra CLI
-  ├── main.go                # Entry point, root command
-  ├── docs_cmd.go            # Man page generation
-  ├── init_cmd.go            # Shell integration generator
-  ├── fix_cmd.go             # Last-command fix workflow
-  └── ...
 
-internal/
-  ├── agent/                 # LLM agent orchestrator
-  ├── fingerprint/           # <5ms system fingerprinter
-  ├── packs/                 # Instruction pack engine + router
-  ├── sandbox/               # bwrap/Landlock sandbox + transactional writer
-  ├── shell/                 # Pipe handling, /dev/tty, shell scripts
-  ├── mcp/                   # MCP server (JSON-RPC over stdio)
-  ├── audit/                 # Mutation audit logging
-  └── ui/                    # Terminal rendering (lipgloss)
+```text
+## System Context
+- os: ubuntu 26.04 (Ubuntu 26.04 LTS) • shell: /usr/bin/zsh • binaries: bwrap ✓, desktop-file-validate ✓
 
-packs/                       # Embedded instruction packs (embed.FS)
-  ├── linux-desktop-entries.md
-  ├── systemd-user-services.md
-  ├── network-ports-processes.md
-  └── ...
+## Matched Pack (1)
+- Linux Desktop Entries (linux-desktop-entries)
+  allowed_paths: [~/.local/share/applications/*.desktop]
+  verify_cmd: desktop-file-validate "${target}"
 
-specs/                       # Feature specifications (SpecKit)
-  ├── 001-core-scaffold/
-  ├── 002-instruction-packs/
-  ├── 003-sandbox/
-  ├── 004-terminal-ui/
-  ├── 005-kernel-hardening/
-  ├── 006-unix-pipe-shell/
-  ├── 007-instruction-pack-library/
-  └── 008-zero-friction-packaging/
+[write_scoped_file] ~/.local/share/applications/backup-sync.desktop (created, 218B)
+[complete_task] Verification passed: desktop-file-validate exit 0.
 ```
+
+#### 2. Pipe & Fix Failed Logs (`journalctl -xe | lnta fix`)
+Pipe failing service logs directly into LNTA for diagnosis and remediation:
+
+```bash
+journalctl -u nginx -n 30 --no-pager | lnta "diagnose and fix the crash"
+```
+
+```text
+Found syntax error in /etc/nginx/sites-enabled/default at line 42 (missing semicolon).
+? Propose fix to /etc/nginx/sites-enabled/default [y/N]: y
+[complete_task] nginx -t verification passed.
+```
+
+#### 3. Interactive Visual Undo (`lnta undo -i`)
+Launch the Time Machine TUI to browse file diffs and roll back past runs:
+
+```bash
+lnta undo -i
+```
+
+```text
+┌─ Past Runs ───────────────────────┐┌─ Run Details: 20261024-101502 ────────────────┐
+│ ✓ [desktop] create backup-sync    ││ Status:    Verified (✓)                        │
+│ ✗ [network] open port 443 in ufw  ││ Pack:      linux-desktop-entries               │
+│ ↩ [systemd] bad sync timer        ││ File:      ~/.local/share/applications/        │
+│                                   ││            backup-sync.desktop                 │
+└───────────────────────────────────┘└────────────────────────────────────────────────┘
+  ↑/↓: Select  •  Enter/u: Rollback  •  Tab: Switch Pane  •  q: Quit
+```
+
+#### 4. Safe Remote SSH Management (`lnta --ssh user@host "..."`)
+Execute tasks on remote servers with preflight fingerprinting and local approvals:
+
+```bash
+lnta --ssh user@prod-web-01 "allow wireguard on udp 51820 in ufw and verify"
+```
+
+```text
+Connected to user@prod-web-01 (Ubuntu 24.04 LTS)
+Preflight: ufw ✓, ss ✓
+? [prod-web-01] Execute mutation: ufw allow 51820/udp (elevated risk) [y/N]: y
+[complete_task] Remote verification passed.
+```
+
+---
+
+## How It Works
+
+LNTA implements a strict, unidirectional pipeline where LLM execution is bounded at every stage:
+
+### System Architecture Diagram
+
+```mermaid
+flowchart TD
+    PROMPT["User Prompt / Pipeline Input"] --> FP["Host Fingerprint (<5ms)<br>OS, Init, Sockets, Binaries"]
+    FP --> ROUTER["Local Pack Router (<5ms)<br>Scored n-gram Matcher"]
+    ROUTER --> PACK["Selected Instruction Pack<br>allowed_paths, required_bins, verify_cmd"]
+    
+    PACK --> SANDBOX["Airgapped Sandbox (bwrap / Landlock)<br>• --ro-bind / /  • --unshare-net<br>• Masked ~/.ssh, ~/.gnupg, .env*<br>• Phantom Dotfile Masks (CVE-2026-25725)"]
+    
+    SANDBOX --> AGENT["Agent Reasoning Loop<br>(Only 4 strictly typed tools)"]
+    
+    AGENT --> CLASSIFY{"Semantic Blast-Radius Classifier"}
+    CLASSIFY -- "Low / Elevated" --> CONFIRM["Interactive TTY Approval<br>[y/N] (huh.Confirm)"]
+    CLASSIFY -- "Critical Destructive" --> CHALLENGE["Anti-Fatigue Gate<br>Type 4-char Challenge Code"]
+    
+    CONFIRM & CHALLENGE --> MUTATE["Scoped Mutation & Atomic Snapshot<br>Backed up to ~/.local/share/lnta/snapshots/"]
+    
+    MUTATE --> VERIFY{"Mandatory Verification Gate<br>Run verify_cmd (e.g. systemd-analyze)"}
+    VERIFY -- "Exit ≠ 0" --> AGENT
+    VERIFY -- "Exit 0" --> COMPLETE["Task Complete ✓"]
+```
+
+---
+
+## Technical Comparison
+
+An honest assessment of how LNTA compares to raw shell wrappers and heavyweight autonomous coding agents:
+
+| Feature | Raw Shell Wrappers (`sgpt`) | Heavy Coding Daemons (`Claude Code`, `OpenCode`) | LNTA |
+|---|---|---|---|
+| **Inspection Sandbox** | ❌ None (raw host bash) | ⚠️ Partial / Docker optional | ✅ **Dual-tier kernel sandbox** (`bwrap` + Landlock) |
+| **Network Egress During Discovery** | ❌ Unrestricted | ❌ Unrestricted | ✅ **Isolated** (`--unshare-net` loopback only) |
+| **Secret Masking** | ❌ None (`~/.ssh` exposed) | ⚠️ Partial `.env` ignores | ✅ **Full masking** (`~/.ssh`, `~/.gnupg`, `~/.aws`, `.env*`, AF_UNIX sockets) |
+| **Phantom Dotfile Defense (CVE-2026-25725)** | ❌ Vulnerable | ❌ Vulnerable | ✅ **Mitigated** (all startup dotfiles mapped to `/dev/null`) |
+| **Approval Mechanism** | ⚠️ Generic prompt | ⚠️ Blanket bypass flags | ✅ **3-Tier Blast-Radius Classifier** + Anti-Fatigue Challenge Gate |
+| **Verification Authority** | ❌ LLM self-reports | ⚠️ LLM self-reports | ✅ **Deterministic shell gate** (`verify_cmd` exit code 0 mandatory) |
+| **Rollback Capability** | ❌ None | ⚠️ Git only | ✅ **System-wide atomic snapshots** (`lnta undo`, `lnta sessions`) |
+| **Latency to First Token** | ~500ms | 3–10 seconds (daemon load) | ✅ **< 5ms** local fingerprint + pack routing |
+| **Interactive Hotkey** | ❌ Shell wrapper | ❌ Full terminal hijack | ✅ **In-line `Ctrl+G`** via native shell line editor |
+| **Local Offline LLMs** | ⚠️ Manual URL flag | ⚠️ Remote focused | ✅ **Auto-discovery** (`lnta --local` via Ollama) |
+| **Remote SSH Execution** | ❌ Run locally only | ❌ Requires remote daemon | ✅ **Native `--ssh`** with local approval attribution |
+
+---
+
+## Documentation Suite
+
+Dive deeper into LNTA's architecture, security controls, and extensibility:
+
+- 📖 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)**: Detailed workflows for all 8 interaction modes, shell widgets, multi-turn chat, and full configuration templates for OpenRouter, Anthropic, OpenAI, Gemini, and Ollama.
+- 🔒 **[Security Model (`docs/SECURITY_MODEL.md`)](docs/SECURITY_MODEL.md)**: Deep dive into the 2-tier sandbox, Unix socket isolation, CVE-2026-25725 defenses, blast-radius heuristics, and AppArmor troubleshooting.
+- 📦 **[Pack Authoring Guide (`docs/PACK_AUTHORING.md`)](docs/PACK_AUTHORING.md)**: 5-minute tutorial on writing custom `.md` Instruction Packs, frontmatter reference, and static verification with `lnta packs validate`.
+- 🛠️ **[Contributing Guide (`CONTRIBUTING.md`)](CONTRIBUTING.md)**: Development setup, adding new distro rules, and running the `cmd/lnta-eval` automated benchmark suite.
+- 🛡️ **[Security Policy (`SECURITY.md`)](SECURITY.md)**: Vulnerability disclosure policies, response times, and architectural security invariants.
+
+---
+
+## Key Features
+
+- **Blazing Fast Preflight**: Local system fingerprinting and n-gram pack routing complete in **under 5 milliseconds**.
+- **Unix Pipeline Friendly**: Preserves the first 16KB and last 48KB of piped context while redirecting approval prompts to `/dev/tty`.
+- **Command-Line Hotkey (`Ctrl+G`)**: Replaces natural language with verified commands directly in your Zsh, Bash, or Fish buffer.
+- **Explain Mode (`--explain`)**: Physically strips mutation tools from the agent's capability manifest for 100% read-only diagnostic reasoning.
+- **Dry-Run Preview (`--dry-run`)**: Generates unified color diffs and commands without touching the disk or executing mutations.
+- **Time Machine TUI (`lnta sessions`)**: Two-pane BubbleTea browser with fuzzy searching, run diff inspection, and single-keystroke rollbacks.
+- **100% Offline Ollama Execution (`--local`)**: Discovers local models at `127.0.0.1:11434` and runs zero-egress tasks without an API key.
+
+---
+
+## Installation Packages & Options
+
+### Native Package Managers
+
+| Distribution | Installation Command |
+|---|---|
+| **Ubuntu / Debian** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
+| **Fedora / RHEL / openSUSE** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta-0.8.0-1.x86_64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
+| **Arch Linux / Manjaro** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta-0.8.0-1-x86_64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
+| **Static Binary (Any Linux)**| `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
+
+<details>
+<summary><strong>Building from Source</strong></summary>
+
+```bash
+git clone https://github.com/sm-me/lnta.git
+cd lnta
+go build -o lnta ./cmd/lnta
+sudo mv lnta /usr/local/bin/
+```
+</details>
+
+---
+
+## Diagnostics & AppArmor Setup
+
+Verify your installation and kernel sandboxing capabilities with `lnta doctor`:
+
+```bash
+lnta doctor
+```
+
+```text
+## LNTA Doctor Diagnostics
+- LLM API Config:        OK
+- LLM API Connectivity:  OK
+- bwrap binary:          /usr/bin/bwrap
+- AppArmor userns:       OK
+- Landlock LSM:          available
+- System Validators:     desktop-file-validate ✓, systemctl ✓, ss ✓, ufw ✓
+All checks passed
+```
+
+### Ubuntu 24.04 / 26.04 AppArmor Note
+On Ubuntu 24.04 and 26.04 LTS, unprivileged user namespaces are restricted by default. If `lnta doctor` reports that `bwrap` is blocked, generate and load the AppArmor profile:
+
+```bash
+lnta doctor --generate-apparmor | sudo tee /etc/apparmor.d/bwrap
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+```
+
+*(Note: The official `.deb` package installs this profile automatically during package setup).*
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
-
----
-
-## Links
-
-- **GitHub**: https://github.com/sm-me/lnta
-- **Releases**: https://github.com/sm-me/lnta/releases
-- **Issues**: https://github.com/sm-me/lnta/issues
+LNTA is open-source software released under the [MIT License](LICENSE).
