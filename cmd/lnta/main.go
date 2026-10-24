@@ -991,6 +991,11 @@ func runPromptArgs(prompt string) error {
 }
 
 func runDoctor(cmd *cobra.Command) error {
+	if doctorFix {
+		fmt.Println(generateAppArmorProfile())
+		return nil
+	}
+
 	fmt.Println(titleStyle.Render("## LNTA Doctor"))
 	fmt.Println()
 
@@ -1109,23 +1114,16 @@ func checkKernelSandbox() error {
 		fmt.Printf("    bwrap: %s\n", bwrapPath)
 	}
 
-	// Check AppArmor userns restriction
+	// Check AppArmor userns restriction status (informative)
 	apparmorRestrict, err := readSysctl("kernel.apparmor_restrict_unprivileged_userns")
-	if err == nil {
-		if doctorVerbose {
-			fmt.Printf("    kernel.apparmor_restrict_unprivileged_userns: %s\n", apparmorRestrict)
-		}
-		if strings.TrimSpace(apparmorRestrict) == "1" {
-			return fmt.Errorf("AppArmor userns restriction enabled (value=1) — bwrap will be blocked")
-		}
-	} else if doctorVerbose {
-		fmt.Printf("    kernel.apparmor_restrict_unprivileged_userns: unreadable (%v)\n", err)
+	if err == nil && doctorVerbose {
+		fmt.Printf("    kernel.apparmor_restrict_unprivileged_userns: %s\n", apparmorRestrict)
 	}
 
-	// Test bwrap probe
+	// Test bwrap probe - this verifies if bwrap can run (succeeds when AppArmor profile is loaded)
 	if err := sandboxProbeBwrap(); err != nil {
-		if errors.Is(err, sandbox.ErrBwrapBlocked) {
-			return fmt.Errorf("bwrap probe blocked by AppArmor: %w", err)
+		if errors.Is(err, sandbox.ErrBwrapBlocked) || strings.TrimSpace(apparmorRestrict) == "1" {
+			return fmt.Errorf("bwrap blocked by AppArmor userns restriction. Run 'lnta doctor --generate-apparmor | sudo tee /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap'")
 		}
 		if errors.Is(err, sandbox.ErrBwrapNotFound) {
 			return fmt.Errorf("bwrap not found: %w", err)
@@ -1133,7 +1131,7 @@ func checkKernelSandbox() error {
 		return fmt.Errorf("bwrap probe failed: %w", err)
 	}
 	if doctorVerbose {
-		fmt.Printf("    bwrap probe: OK\n")
+		fmt.Printf("    bwrap probe: OK (user namespaces operational)\n")
 	}
 
 	// Check Landlock availability
@@ -1174,23 +1172,37 @@ func sandboxProbeBwrap() error {
 }
 
 func checkValidators() error {
-	validators := []string{
+	required := []string{
 		"desktop-file-validate",
 		"systemd-analyze",
-		"shellcheck",
-		"ufw",
 		"ss",
 	}
-	var missing []string
-	for _, v := range validators {
+	recommended := []string{
+		"ufw",
+		"shellcheck",
+	}
+	var missingRequired []string
+	var missingRecommended []string
+
+	for _, v := range required {
 		if _, err := exec.LookPath(v); err != nil {
-			missing = append(missing, v)
+			missingRequired = append(missingRequired, v)
 		} else if doctorVerbose {
 			fmt.Printf("    %s: found\n", v)
 		}
 	}
-	if len(missing) > 0 {
-		return fmt.Errorf("missing validators: %s", strings.Join(missing, ", "))
+	for _, v := range recommended {
+		if _, err := exec.LookPath(v); err != nil {
+			missingRecommended = append(missingRecommended, v)
+		} else if doctorVerbose {
+			fmt.Printf("    %s: found\n", v)
+		}
+	}
+	if len(missingRequired) > 0 {
+		return fmt.Errorf("missing required validators: %s", strings.Join(missingRequired, ", "))
+	}
+	if len(missingRecommended) > 0 && doctorVerbose {
+		fmt.Printf("    recommended validators not found: %s\n", strings.Join(missingRecommended, ", "))
 	}
 	return nil
 }
