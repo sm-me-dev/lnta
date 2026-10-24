@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sm-me/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/audit"
 	"github.com/zalando/go-keyring"
 )
 

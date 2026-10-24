@@ -1,4 +1,6 @@
 # Binaries built by the project
+lnta
+lnta-eval
 /lnta
 /lnta-eval
 
@@ -23,7 +25,8 @@ vendor/
 Thumbs.db
 
 # Test coverage and profiling
-coverage.out
+coverage*
+*.out
 *.coverprofile
 
 # Build directories

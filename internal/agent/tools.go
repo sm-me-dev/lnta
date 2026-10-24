@@ -24,10 +24,10 @@ import (
 	"time"
 
 	"github.com/sashabaranov/go-openai"
-	"github.com/sm-me/lnta/internal/audit"
-	"github.com/sm-me/lnta/internal/packs"
-	"github.com/sm-me/lnta/internal/sandbox"
-	"github.com/sm-me/lnta/internal/transport"
+	"github.com/sm-me-dev/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/packs"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/transport"
 )
 
 // Tool is a strictly typed, JSON-schema-validated tool the LLM may call.
@@ -175,7 +175,7 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 		return fmt.Sprintf("inspect_system error: %v\nstderr: %s", err, res.Stderr), nil
 	}
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("exit_code=%d duration=%s\n", res.ExitCode, res.Duration))
+	fmt.Fprintf(&b, "exit_code=%d duration=%s\n", res.ExitCode, res.Duration)
 	if res.Truncated {
 		b.WriteString("[OUTPUT TRUNCATED]\n")
 	}
@@ -246,8 +246,8 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 			return "", fmt.Errorf("write_scoped_file (dry-run): %w", perr)
 		}
 		var b strings.Builder
-		b.WriteString(fmt.Sprintf("[dry-run] would write %q (created=%v, mode=%o, size_old=%d, size_new=%d)\n",
-			diff.TargetPath, diff.Created, diff.Mode, diff.SizeOld, diff.SizeNew))
+		fmt.Fprintf(&b, "[dry-run] would write %q (created=%v, mode=%o, size_old=%d, size_new=%d)\n",
+			diff.TargetPath, diff.Created, diff.Mode, diff.SizeOld, diff.SizeNew)
 		if diff.Diff != "" {
 			b.WriteString("--- proposed unified diff ---\n")
 			b.WriteString(diff.Diff)
@@ -511,10 +511,10 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("TASK_COMPLETE: %s\n", in.Summary))
-	b.WriteString(fmt.Sprintf("verified_targets: %s\n", in.TargetArtifacts))
+	fmt.Fprintf(&b, "TASK_COMPLETE: %s\n", in.Summary)
+	fmt.Fprintf(&b, "verified_targets: %s\n", in.TargetArtifacts)
 	if in.VerificationNotes != "" {
-		b.WriteString(fmt.Sprintf("verification_notes: %s\n", in.VerificationNotes))
+		fmt.Fprintf(&b, "verification_notes: %s\n", in.VerificationNotes)
 	}
 	return b.String(), nil
 }
@@ -568,12 +568,12 @@ func nativeDesktopEntryVerify(target string, allowedPaths []string) error {
 		bin := fields[0]
 		if strings.Contains(bin, "/") {
 			if _, err := os.Stat(bin); err != nil {
-				return fmt.Errorf("Exec binary %q does not exist: %v", bin, err)
+				return fmt.Errorf("exec binary %q does not exist: %v", bin, err)
 			}
 			continue
 		}
 		if _, err := exec.LookPath(bin); err != nil {
-			return fmt.Errorf("Exec binary %q not found in PATH: %v", bin, err)
+			return fmt.Errorf("exec binary %q not found in PATH: %v", bin, err)
 		}
 	}
 	return nil
@@ -759,8 +759,8 @@ func previewUnifiedDiff(oldPath, newPath string, oldContent, newContent []byte) 
 
 	const context = 3
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("--- a/%s\n", oldPath))
-	b.WriteString(fmt.Sprintf("+++ b/%s\n", newPath))
+	fmt.Fprintf(&b, "--- a/%s\n", oldPath)
+	fmt.Fprintf(&b, "+++ b/%s\n", newPath)
 
 	n := len(ops)
 	i := 0

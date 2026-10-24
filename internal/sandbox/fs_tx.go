@@ -22,7 +22,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sm-me/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/audit"
 )
 
 // dataRoot returns ~/.local/share/lnta (sandbox-local mirror of audit's helper).
@@ -174,8 +174,8 @@ func unifiedDiff(oldPath, newPath string, oldContent, newContent []byte) string 
 
 	const context = 3
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("--- a/%s\n", oldPath))
-	b.WriteString(fmt.Sprintf("+++ b/%s\n", newPath))
+	fmt.Fprintf(&b, "--- a/%s\n", oldPath)
+	fmt.Fprintf(&b, "+++ b/%s\n", newPath)
 
 	n := len(ops)
 	i := 0

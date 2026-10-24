@@ -281,18 +281,18 @@ func Fingerprint() (SystemContext, error) {
 func (c SystemContext) String() string {
 	var b strings.Builder
 	b.WriteString("## System Context\n")
-	b.WriteString(fmt.Sprintf("- os: %s %s (%s)\n", c.DistroID, c.DistroVer, c.PrettyName))
-	b.WriteString(fmt.Sprintf("- shell: %s\n", c.Shell))
-	b.WriteString(fmt.Sprintf("- session: %s / %s\n", c.XDGSessionType, c.XDGCurrentDesktop))
-	b.WriteString(fmt.Sprintf("- home: %s\n", c.Home))
-	b.WriteString(fmt.Sprintf("- cwd: %s\n", c.CWD))
-	b.WriteString(fmt.Sprintf("- user: %s (uid=%d gid=%d)\n", c.Username, c.UID, c.GID))
+	fmt.Fprintf(&b, "- os: %s %s (%s)\n", c.DistroID, c.DistroVer, c.PrettyName)
+	fmt.Fprintf(&b, "- shell: %s\n", c.Shell)
+	fmt.Fprintf(&b, "- session: %s / %s\n", c.XDGSessionType, c.XDGCurrentDesktop)
+	fmt.Fprintf(&b, "- home: %s\n", c.Home)
+	fmt.Fprintf(&b, "- cwd: %s\n", c.CWD)
+	fmt.Fprintf(&b, "- user: %s (uid=%d gid=%d)\n", c.Username, c.UID, c.GID)
 	b.WriteString("- binaries:\n")
 	for _, bin := range wantedBins {
-		b.WriteString(fmt.Sprintf("    - %s: %v\n", bin, c.Binaries[bin]))
+		fmt.Fprintf(&b, "    - %s: %v\n", bin, c.Binaries[bin])
 	}
-	b.WriteString(fmt.Sprintf("- fingerprinted_at: %s\n", c.FingerprintedAt))
-	b.WriteString(fmt.Sprintf("- duration_ns: %d\n", c.DurationNs))
+	fmt.Fprintf(&b, "- fingerprinted_at: %s\n", c.FingerprintedAt)
+	fmt.Fprintf(&b, "- duration_ns: %d\n", c.DurationNs)
 	b.WriteString(c.environmentConstraints())
 	return b.String()
 }

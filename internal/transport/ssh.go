@@ -17,20 +17,18 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 // SSHExecutor executes commands and file operations on a remote host via system ssh command.
 type SSHExecutor struct {
-	user       string
-	host       string
-	port       int
-	runID      string
-	cwd        string
-	connMux    sync.Mutex
+	user        string
+	host        string
+	port        int
+	runID       string
+	cwd         string
 	fingerprint *RemoteFingerprint
 }
 
@@ -292,19 +290,6 @@ func runSystemSSH(ctx context.Context, user, host, port, cmdStr string, stdin io
 func (e *SSHExecutor) runSSH(ctx context.Context, script string, stdin io.Reader) error {
 	_, err := runSystemSSH(ctx, e.user, e.host, strconv.Itoa(e.port), script, stdin, 30*time.Second)
 	return err
-}
-
-// truncateOutput caps output at maxBytes.
-func truncateOutput(s string, maxBytes int) string {
-	if len(s) <= maxBytes {
-		return s
-	}
-	marker := fmt.Sprintf("\n\n[OUTPUT TRUNCATED: %d total bytes]\n", len(s))
-	keep := maxBytes - len(marker)
-	if keep < 0 {
-		keep = 0
-	}
-	return s[:keep] + marker
 }
 
 // CommandResult mirrors sandbox.CommandResult for transport package.

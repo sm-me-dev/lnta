@@ -4,7 +4,7 @@ import (
 	"embed"
 	"testing"
 
-	"github.com/sm-me/lnta/internal/fingerprint"
+	"github.com/sm-me-dev/lnta/internal/fingerprint"
 )
 
 //go:embed testdata/*.md

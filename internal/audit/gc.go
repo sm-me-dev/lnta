@@ -198,17 +198,17 @@ func FormatGCResult(res *GCResult) string {
 	var sb strings.Builder
 	mbFreed := float64(res.BytesFreed) / (1024 * 1024)
 	if res.SnapshotsRemoved > 0 {
-		sb.WriteString(fmt.Sprintf("Cleaned %d old snapshot(s) (freed %.1f MB).\n", res.SnapshotsRemoved, mbFreed))
+		fmt.Fprintf(&sb, "Cleaned %d old snapshot(s) (freed %.1f MB).\n", res.SnapshotsRemoved, mbFreed)
 	} else {
 		sb.WriteString("No snapshots needed cleaning.\n")
 	}
 
 	if res.LogRotated {
 		oldMB := float64(res.OldLogSize) / (1024 * 1024)
-		sb.WriteString(fmt.Sprintf("Audit log rotated (was %.1f MB).\n", oldMB))
+		fmt.Fprintf(&sb, "Audit log rotated (was %.1f MB).\n", oldMB)
 	}
 
 	totalMB := float64(res.TotalBytesAfter) / (1024 * 1024)
-	sb.WriteString(fmt.Sprintf("Active storage: %d snapshot(s) using %.1f MB.", res.TotalRunsAfter, totalMB))
+	fmt.Fprintf(&sb, "Active storage: %d snapshot(s) using %.1f MB.", res.TotalRunsAfter, totalMB)
 	return sb.String()
 }

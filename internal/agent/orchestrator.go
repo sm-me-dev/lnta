@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/sashabaranov/go-openai"
-	"github.com/sm-me/lnta/internal/audit"
-	"github.com/sm-me/lnta/internal/fingerprint"
-	"github.com/sm-me/lnta/internal/packs"
-	"github.com/sm-me/lnta/internal/sandbox"
-	"github.com/sm-me/lnta/internal/transport"
+	"github.com/sm-me-dev/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/fingerprint"
+	"github.com/sm-me-dev/lnta/internal/packs"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/transport"
 )
 
 // LLMClient is the abstraction over the chat completions API. It is kept as an
@@ -287,9 +287,9 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			Messages:    messages,
 			Tools:       toolDefs,
 			ToolChoice:  "required",
-			Temperature: o.temperature(),
-			MaxTokens:   o.maxTokens(),
-			Stream:      true,
+			Temperature:         o.temperature(),
+			MaxCompletionTokens: o.maxTokens(),
+			Stream:              true,
 		}
 		// Convert tool params to string for token estimation
 		_ = toolDefs
@@ -528,19 +528,19 @@ func buildSystemPrompt(sysCtx fingerprint.SystemContext, pack packs.Pack, contex
 	b.WriteString(sysCtx.String())
 	b.WriteString("\n")
 	b.WriteString("## Selected Instruction Pack\n")
-	b.WriteString(fmt.Sprintf("id: %s\nname: %s\n", pack.ID, pack.Name))
+	fmt.Fprintf(&b, "id: %s\nname: %s\n", pack.ID, pack.Name)
 	if len(pack.RequiredBins) > 0 {
-		b.WriteString(fmt.Sprintf("required_bins: %v\n", pack.RequiredBins))
+		fmt.Fprintf(&b, "required_bins: %v\n", pack.RequiredBins)
 	}
 	if pack.ContextCmd != "" {
-		b.WriteString(fmt.Sprintf("context_cmd: %s\n", pack.ContextCmd))
+		fmt.Fprintf(&b, "context_cmd: %s\n", pack.ContextCmd)
 	}
 	if pack.VerifyCmd != "" {
-		b.WriteString(fmt.Sprintf("verify_cmd: %s\n", pack.VerifyCmd))
+		fmt.Fprintf(&b, "verify_cmd: %s\n", pack.VerifyCmd)
 	}
 	b.WriteString("allowed_paths:\n")
 	for _, ap := range pack.AllowedPaths {
-		b.WriteString(fmt.Sprintf("  - %s\n", ap))
+		fmt.Fprintf(&b, "  - %s\n", ap)
 	}
 	b.WriteString("\n## Pack Guidance\n")
 	b.WriteString(pack.Body)

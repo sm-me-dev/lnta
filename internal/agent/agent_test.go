@@ -13,10 +13,10 @@ import (
 	"testing"
 
 	"github.com/sashabaranov/go-openai"
-	"github.com/sm-me/lnta/internal/fingerprint"
-	"github.com/sm-me/lnta/internal/packs"
-	"github.com/sm-me/lnta/internal/sandbox"
-	"github.com/sm-me/lnta/internal/transport"
+	"github.com/sm-me-dev/lnta/internal/fingerprint"
+	"github.com/sm-me-dev/lnta/internal/packs"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/transport"
 )
 
 //go:embed testdata/dummy.md

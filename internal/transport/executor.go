@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 // TargetExecutor abstracts command execution and file operations

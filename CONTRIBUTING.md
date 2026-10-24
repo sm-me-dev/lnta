@@ -42,7 +42,7 @@ Before submitting code, review our non-negotiable architectural invariants:
 
 ### Building the Project
 ```bash
-git clone https://github.com/sm-me/lnta.git
+git clone https://github.com/sm-me-dev/lnta.git
 cd lnta
 go build -o bin/lnta ./cmd/lnta
 ```

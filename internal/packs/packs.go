@@ -20,7 +20,7 @@ import (
 	"sync"
 
 	"github.com/adrg/frontmatter"
-	"github.com/sm-me/lnta/internal/fingerprint"
+	"github.com/sm-me-dev/lnta/internal/fingerprint"
 )
 
 // ErrNoPack is returned when no pack matches and there is no fallback.

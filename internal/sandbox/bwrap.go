@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sm-me/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/audit"
 )
 
 // defaultTimeout is the execution timeout applied when the caller passes 0.
@@ -288,10 +288,6 @@ func exitCodeOf(err error) int {
 	return 126
 }
 
-// runBwrap executes the command inside a bwrap sandbox.
-func runBwrap(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
-	return runBwrapEnv(ctx, cmdStr, cwd, timeout, nil)
-}
 
 // runBwrapEnv is runBwrap with extra KEY=VALUE environment entries (used to
 // pass verify_cmd arguments as data, never as shell text).

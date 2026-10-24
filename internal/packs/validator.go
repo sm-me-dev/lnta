@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 // ValidationSeverity represents the severity of a validation issue.
@@ -488,9 +488,10 @@ func FormatValidationResults(results []ValidationResult, config ValidatorConfig)
 			validPacks++
 		}
 		for _, i := range r.Issues {
-			if i.Severity == SeverityError {
+			switch i.Severity {
+			case SeverityError:
 				totalErrors++
-			} else if i.Severity == SeverityWarning {
+			case SeverityWarning:
 				totalWarnings++
 			}
 		}
@@ -501,32 +502,33 @@ func FormatValidationResults(results []ValidationResult, config ValidatorConfig)
 		}
 	}
 
-	b.WriteString(fmt.Sprintf("Validated %d pack(s): %d valid, %d invalid\n", totalPacks, validPacks, totalPacks-validPacks))
-	b.WriteString(fmt.Sprintf("Errors: %d, Warnings: %d\n\n", totalErrors, totalWarnings))
+	fmt.Fprintf(&b, "Validated %d pack(s): %d valid, %d invalid\n", totalPacks, validPacks, totalPacks-validPacks)
+	fmt.Fprintf(&b, "Errors: %d, Warnings: %d\n\n", totalErrors, totalWarnings)
 
 	for _, r := range results {
 		status := "✓"
 		if !r.Valid {
 			status = "✗"
 		}
-		b.WriteString(fmt.Sprintf("%s %s (%s)\n", status, r.PackID, r.Path))
+		fmt.Fprintf(&b, "%s %s (%s)\n", status, r.PackID, r.Path)
 
 		for _, i := range r.Issues {
 			prefix := "  ERROR: "
-			if i.Severity == SeverityWarning {
+			switch i.Severity {
+			case SeverityWarning:
 				prefix = "  WARN:  "
-			} else if i.Severity == SeverityInfo {
+			case SeverityInfo:
 				prefix = "  INFO:  "
 			}
-			b.WriteString(fmt.Sprintf("%s[%s] %s\n", prefix, i.Field, i.Message))
+			fmt.Fprintf(&b, "%s[%s] %s\n", prefix, i.Field, i.Message)
 			if i.Suggestion != "" {
-				b.WriteString(fmt.Sprintf("         → %s\n", i.Suggestion))
+				fmt.Fprintf(&b, "         → %s\n", i.Suggestion)
 			}
 		}
 		for _, w := range r.Warnings {
-			b.WriteString(fmt.Sprintf("  WARN:  [%s] %s\n", w.Field, w.Message))
+			fmt.Fprintf(&b, "  WARN:  [%s] %s\n", w.Field, w.Message)
 			if w.Suggestion != "" {
-				b.WriteString(fmt.Sprintf("         → %s\n", w.Suggestion))
+				fmt.Fprintf(&b, "         → %s\n", w.Suggestion)
 			}
 		}
 		b.WriteString("\n")
@@ -544,12 +546,12 @@ func FormatValidationResultsJSON(results []ValidationResult) (string, error) {
 		if i > 0 {
 			b.WriteString(",\n")
 		}
-		b.WriteString(fmt.Sprintf(`  {"pack_id": "%s", "path": "%s", "valid": %t, "issues": [`, r.PackID, r.Path, r.Valid))
+		fmt.Fprintf(&b, `  {"pack_id": "%s", "path": "%s", "valid": %t, "issues": [`, r.PackID, r.Path, r.Valid)
 		for j, issue := range r.Issues {
 			if j > 0 {
 				b.WriteString(", ")
 			}
-			b.WriteString(fmt.Sprintf(`{"severity": "%s", "field": "%s", "message": "%s"}`, issue.Severity, issue.Field, issue.Message))
+			fmt.Fprintf(&b, `{"severity": "%s", "field": "%s", "message": "%s"}`, issue.Severity, issue.Field, issue.Message)
 		}
 		b.WriteString("]}")
 	}

@@ -3,7 +3,6 @@ package sandbox
 
 import (
 	"context"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -327,26 +326,4 @@ func TestUnshareFlagsPresent(t *testing.T) {
 	// In a new network namespace, we should only see loopback
 	res2, _ := RunReadOnly(ctx, `cat /proc/net/dev 2>/dev/null | grep -v "lo:" | grep -v "Inter" | grep -v "face" | wc -l`, home, 10*time.Second)
 	t.Logf("Non-loopback interfaces count: %s", res2.Stdout)
-}
-
-// Helper to check if we can make a TCP connection (for manual verification)
-func canConnectTCP(host string, port int) bool {
-	// Simple port string conversion for common ports
-	portStr := ""
-	switch port {
-	case 53:
-		portStr = "53"
-	case 80:
-		portStr = "80"
-	case 443:
-		portStr = "443"
-	default:
-		portStr = "53"
-	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, portStr), 2*time.Second)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
 }

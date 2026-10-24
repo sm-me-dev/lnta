@@ -17,16 +17,16 @@ import (
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
-	lnta "github.com/sm-me/lnta"
-	"github.com/sm-me/lnta/internal/agent"
-	"github.com/sm-me/lnta/internal/audit"
-	"github.com/sm-me/lnta/internal/fingerprint"
-	"github.com/sm-me/lnta/internal/mcp"
-	"github.com/sm-me/lnta/internal/packs"
-	"github.com/sm-me/lnta/internal/sandbox"
-	"github.com/sm-me/lnta/internal/shell"
-	"github.com/sm-me/lnta/internal/transport"
-	"github.com/sm-me/lnta/internal/ui"
+	lnta "github.com/sm-me-dev/lnta"
+	"github.com/sm-me-dev/lnta/internal/agent"
+	"github.com/sm-me-dev/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/fingerprint"
+	"github.com/sm-me-dev/lnta/internal/mcp"
+	"github.com/sm-me-dev/lnta/internal/packs"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/shell"
+	"github.com/sm-me-dev/lnta/internal/transport"
+	"github.com/sm-me-dev/lnta/internal/ui"
 )
 
 var (
@@ -461,7 +461,7 @@ var fixCmd = &cobra.Command{
 
 		// Parse exit code
 		exitCode := 0
-		fmt.Sscanf(lastExit, "%d", &exitCode)
+		_, _ = fmt.Sscanf(lastExit, "%d", &exitCode)
 
 		// For now, we'll just run the standard prompt with a fix context
 		// In the future, this could re-run in sandbox and construct FixContext
@@ -673,7 +673,7 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("create SSH executor: %w", err))
 		}
-		defer executor.Close()
+		defer func() { _ = executor.Close() }()
 
 		// Preflight: fingerprint remote host
 		ctx := context.Background()
@@ -768,15 +768,11 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 // extractVerifiedCommand extracts the verified command from the result for --command-only mode.
 func extractVerifiedCommand(result string) string {
 	// The result should contain the verified command from complete_task
-	// Look for patterns in the result
 	lines := strings.Split(result, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "TASK_COMPLETE:") {
-			// The summary might contain the command, but we want just the command
-			// In practice, the pack's verify_cmd or the agent should output just the command
-			// For now, return empty to indicate we need the agent to output the command
-			continue
+			return strings.TrimSpace(strings.TrimPrefix(line, "TASK_COMPLETE:"))
 		}
 	}
 	return ""
@@ -1091,7 +1087,7 @@ func checkLLMConnectivity() error {
 	if err != nil {
 		return fmt.Errorf("connect to %s: %w", cfg.BaseURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("API returned status %d", resp.StatusCode)
@@ -1144,7 +1140,7 @@ func checkKernelSandbox() error {
 		if doctorVerbose {
 			fmt.Printf("    Landlock: unavailable (%v)\n", err)
 		}
-		return fmt.Errorf("Landlock unavailable: %w", err)
+		return fmt.Errorf("landlock unavailable: %w", err)
 	}
 	if doctorVerbose {
 		fmt.Printf("    Landlock: available\n")

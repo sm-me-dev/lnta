@@ -1,34 +1,24 @@
 # LNTA — Linux Natural-Language Terminal Assistant
 
 <p align="center">
-  <a href="https://github.com/sm-me/lnta/actions"><img src="https://img.shields.io/github/actions/workflow/status/sm-me/lnta/ci.yml?branch=main&label=build" alt="Build Status"></a>
-  <a href="https://goreportcard.com/report/github.com/sm-me/lnta"><img src="https://goreportcard.com/badge/github.com/sm-me/lnta" alt="Go Report Card"></a>
+  <a href="https://github.com/sm-me-dev/lnta/actions"><img src="https://img.shields.io/github/actions/workflow/status/sm-me-dev/lnta/ci.yml?branch=main&label=CI%20Build" alt="Build Status"></a>
+  <a href="https://goreportcard.com/report/github.com/sm-me-dev/lnta"><img src="https://goreportcard.com/badge/github.com/sm-me-dev/lnta" alt="Go Report Card"></a>
   <a href="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu"><img src="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu" alt="Ubuntu 24.04/26.04 AppArmor Ready"></a>
   <a href="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
 </p>
 
 <p align="center">
-  <strong>Grounded Linux system administration with airgapped sandboxes, strict path scopes, and deterministic verification gates.</strong>
+  <strong>Fast, kernel-sandboxed Linux terminal assistant in Go with deterministic verification gates and atomic rollbacks.</strong>
 </p>
 
----
-
-## Table of Contents
-
-- [The Problem & Solution in 3 Bullet Points](#the-problem--solution-in-3-bullet-points)
-- [60-Second Quickstart](#60-second-quickstart)
-  - [1. One-Line Install](#1-one-line-install)
-  - [2. Shell Integration](#2-shell-integration)
-  - [3. Four Immediately Useful Real-World Commands](#3-four-immediately-useful-real-world-commands)
-- [How It Works](#how-it-works)
-  - [System Architecture Diagram](#system-architecture-diagram)
-- [Technical Comparison](#technical-comparison)
-- [Documentation Suite](#documentation-suite)
-- [Key Features](#key-features)
-- [Installation Packages & Options](#installation-packages--options)
-- [Diagnostics & AppArmor Setup](#diagnostics--apparmor-setup)
-- [License](#license)
+<p align="center">
+  <a href="#60-second-quickstart"><strong>Quickstart</strong></a> •
+  <a href="#daily-workflows"><strong>Daily Workflows</strong></a> •
+  <a href="#how-it-works"><strong>Architecture</strong></a> •
+  <a href="docs/SECURITY_MODEL.md"><strong>Security</strong></a> •
+  <a href="#documentation-suite"><strong>Docs</strong></a>
+</p>
 
 ---
 
@@ -48,7 +38,7 @@ Giving an LLM raw `/bin/bash` access is an invitation to accidental data loss, c
 
 ```bash
 # Detects distribution (deb/rpm/arch/tarball), verifies SHA-256, and installs cleanly
-curl -fsSL https://raw.githubusercontent.com/sm-me/lnta/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sm-me-dev/lnta/main/scripts/install.sh | bash
 ```
 
 ### 2. Shell Integration
@@ -74,7 +64,8 @@ export LNTA_API_KEY="sk-..."
 
 ---
 
-### 3. Four Immediately Useful Real-World Commands
+<a id="daily-workflows"></a>
+### 3. Four Immediately Useful Real-World Commands (Daily Workflows)
 
 #### 1. One-Shot System Task (`lnta "..."`)
 Create a validated Freedesktop `.desktop` launcher without memorizing syntax:
@@ -117,12 +108,12 @@ lnta undo -i
 ```
 
 ```text
-┌─ Past Runs ───────────────────────┐┌─ Run Details: 20261024-101502 ────────────────┐
-│ ✓ [desktop] create backup-sync    ││ Status:    Verified (✓)                        │
-│ ✗ [network] open port 443 in ufw  ││ Pack:      linux-desktop-entries               │
-│ ↩ [systemd] bad sync timer        ││ File:      ~/.local/share/applications/        │
-│                                   ││            backup-sync.desktop                 │
-└───────────────────────────────────┘└────────────────────────────────────────────────┘
+┌─ Past Runs ─────────────────────────┐┌─ Run Details: 20261024-101502 ─────────────────┐
+│ [OK]   create backup-sync.desktop   ││ Status:   Verified (PASS)                      │
+│ [FAIL] open port 443 in ufw         ││ Pack:     linux-desktop-entries                │
+│ [UNDO] bad sync timer               ││ File:     ~/.local/share/applications/         │
+│                                     ││           backup-sync.desktop                  │
+└─────────────────────────────────────┘└────────────────────────────────────────────────┘
   ↑/↓: Select  •  Enter/u: Rollback  •  Tab: Switch Pane  •  q: Quit
 ```
 
@@ -149,24 +140,33 @@ LNTA implements a strict, unidirectional pipeline where LLM execution is bounded
 ### System Architecture Diagram
 
 ```mermaid
-flowchart TD
-    PROMPT["User Prompt / Pipeline Input"] --> FP["Host Fingerprint (<5ms)<br>OS, Init, Sockets, Binaries"]
-    FP --> ROUTER["Local Pack Router (<5ms)<br>Scored n-gram Matcher"]
-    ROUTER --> PACK["Selected Instruction Pack<br>allowed_paths, required_bins, verify_cmd"]
-    
-    PACK --> SANDBOX["Airgapped Sandbox (bwrap / Landlock)<br>• --ro-bind / /  • --unshare-net<br>• Masked ~/.ssh, ~/.gnupg, .env*<br>• Phantom Dotfile Masks (CVE-2026-25725)"]
-    
-    SANDBOX --> AGENT["Agent Reasoning Loop<br>(Only 4 strictly typed tools)"]
-    
-    AGENT --> CLASSIFY{"Semantic Blast-Radius Classifier"}
-    CLASSIFY -- "Low / Elevated" --> CONFIRM["Interactive TTY Approval<br>[y/N] (huh.Confirm)"]
-    CLASSIFY -- "Critical Destructive" --> CHALLENGE["Anti-Fatigue Gate<br>Type 4-char Challenge Code"]
-    
-    CONFIRM & CHALLENGE --> MUTATE["Scoped Mutation & Atomic Snapshot<br>Backed up to ~/.local/share/lnta/snapshots/"]
-    
-    MUTATE --> VERIFY{"Mandatory Verification Gate<br>Run verify_cmd (e.g. systemd-analyze)"}
-    VERIFY -- "Exit ≠ 0" --> AGENT
-    VERIFY -- "Exit 0" --> COMPLETE["Task Complete ✓"]
+flowchart LR
+    subgraph S1["1. Pre-Flight (<5ms)"]
+        direction TB
+        PROMPT["User Prompt / Stdin"] --> FP["Host Fingerprint<br/>OS, init, bins, sockets"]
+        FP --> ROUTER["Pack Router<br/>n-gram match"]
+        ROUTER --> PACK["Instruction Pack<br/>allowed_paths & verify_cmd"]
+    end
+
+    subgraph S2["2. Sandboxed Agent Loop"]
+        direction TB
+        SANDBOX["bwrap / Landlock Sandbox<br/>• Read-only root (--ro-bind / /)<br/>• Airgapped (--unshare-net)<br/>• Masked ~/.ssh & dotfiles"]
+        SANDBOX --> AGENT["Agent Reasoning Loop<br/>4 typed tools only"]
+        AGENT --> RISK{"Blast-Radius<br/>Classifier"}
+        RISK --> GATE["Interactive TTY Gate<br/>• Low/Elevated: [y/N]<br/>• Critical: Challenge Code"]
+    end
+
+    subgraph S3["3. Verification & Undo Gate"]
+        direction TB
+        SNAPSHOT["Atomic Snapshot<br/>~/.local/share/lnta/snapshots/"]
+        SNAPSHOT --> VERIFY{"Deterministic<br/>verify_cmd"}
+        VERIFY -- "Exit 0" --> COMPLETE["Task Complete ✓"]
+        SNAPSHOT -. "Rollback" .-> UNDO["Atomic Undo<br/>lnta undo -i"]
+    end
+
+    PACK --> SANDBOX
+    GATE --> SNAPSHOT
+    VERIFY -- "Exit ≠ 0 (retry)" --> AGENT
 ```
 
 ---
@@ -221,16 +221,16 @@ Dive deeper into LNTA's architecture, security controls, and extensibility:
 
 | Distribution | Installation Command |
 |---|---|
-| **Ubuntu / Debian** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
-| **Fedora / RHEL / openSUSE** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta-0.8.0-1.x86_64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
-| **Arch Linux / Manjaro** | `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta-0.8.0-1-x86_64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
-| **Static Binary (Any Linux)**| `curl -fsSL https://github.com/sm-me/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
+| **Ubuntu / Debian** | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
+| **Fedora / RHEL / openSUSE** | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.8.0-1.x86_64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
+| **Arch Linux / Manjaro** | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.8.0-1-x86_64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
+| **Static Binary (Any Linux)**| `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.8.0_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
 
 <details>
 <summary><strong>Building from Source</strong></summary>
 
 ```bash
-git clone https://github.com/sm-me/lnta.git
+git clone https://github.com/sm-me-dev/lnta.git
 cd lnta
 go build -o lnta ./cmd/lnta
 sudo mv lnta /usr/local/bin/

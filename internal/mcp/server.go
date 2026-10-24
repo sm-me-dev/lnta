@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sm-me/lnta/internal/packs"
-	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/packs"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 // JSON-RPC 2.0 types
@@ -286,7 +286,7 @@ func (s *Server) toolInspectSandboxed(ctx context.Context, args map[string]inter
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("exit_code=%d duration=%s\n", res.ExitCode, res.Duration))
+	fmt.Fprintf(&b, "exit_code=%d duration=%s\n", res.ExitCode, res.Duration)
 	if res.Truncated {
 		b.WriteString("[OUTPUT TRUNCATED]\n")
 	}
@@ -316,13 +316,13 @@ func (s *Server) toolGetPackRunbook(args map[string]interface{}) (toolCallResult
 
 	var b strings.Builder
 	b.WriteString("---\n")
-	b.WriteString(fmt.Sprintf("id: %s\n", pack.ID))
-	b.WriteString(fmt.Sprintf("name: %s\n", pack.Name))
-	b.WriteString(fmt.Sprintf("triggers: %v\n", pack.Triggers))
-	b.WriteString(fmt.Sprintf("allowed_paths: %v\n", pack.AllowedPaths))
-	b.WriteString(fmt.Sprintf("required_bins: %v\n", pack.RequiredBins))
-	b.WriteString(fmt.Sprintf("context_cmd: %s\n", pack.ContextCmd))
-	b.WriteString(fmt.Sprintf("verify_cmd: %s\n", pack.VerifyCmd))
+	fmt.Fprintf(&b, "id: %s\n", pack.ID)
+	fmt.Fprintf(&b, "name: %s\n", pack.Name)
+	fmt.Fprintf(&b, "triggers: %v\n", pack.Triggers)
+	fmt.Fprintf(&b, "allowed_paths: %v\n", pack.AllowedPaths)
+	fmt.Fprintf(&b, "required_bins: %v\n", pack.RequiredBins)
+	fmt.Fprintf(&b, "context_cmd: %s\n", pack.ContextCmd)
+	fmt.Fprintf(&b, "verify_cmd: %s\n", pack.VerifyCmd)
 	b.WriteString("---\n")
 	b.WriteString(pack.Body)
 
@@ -362,16 +362,16 @@ func (s *Server) toolVerifyTask(ctx context.Context, args map[string]interface{}
 	var b strings.Builder
 	if res.ExitCode == 0 {
 		b.WriteString("VERIFICATION PASSED\n")
-		b.WriteString(fmt.Sprintf("Command: %s\n", verifyCmd))
-		b.WriteString(fmt.Sprintf("Exit code: %d\n", res.ExitCode))
+		fmt.Fprintf(&b, "Command: %s\n", verifyCmd)
+		fmt.Fprintf(&b, "Exit code: %d\n", res.ExitCode)
 		if res.Stdout != "" {
 			b.WriteString("--- stdout ---\n")
 			b.WriteString(res.Stdout)
 		}
 	} else {
 		b.WriteString("VERIFICATION FAILED\n")
-		b.WriteString(fmt.Sprintf("Command: %s\n", verifyCmd))
-		b.WriteString(fmt.Sprintf("Exit code: %d\n", res.ExitCode))
+		fmt.Fprintf(&b, "Command: %s\n", verifyCmd)
+		fmt.Fprintf(&b, "Exit code: %d\n", res.ExitCode)
 		if res.Stderr != "" {
 			b.WriteString("--- stderr ---\n")
 			b.WriteString(res.Stderr)

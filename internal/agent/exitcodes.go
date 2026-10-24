@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/sm-me/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/audit"
 )
 
 // Deterministic CLI exit codes for scripting and CI pipelines:

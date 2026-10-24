@@ -5,8 +5,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/sm-me/lnta/internal/agent"
-	"github.com/sm-me/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/agent"
+	"github.com/sm-me-dev/lnta/internal/audit"
 )
 
 var (

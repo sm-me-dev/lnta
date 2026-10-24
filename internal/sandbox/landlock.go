@@ -20,7 +20,7 @@ import (
 	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
 	"golang.org/x/sys/unix"
 
-	"github.com/sm-me/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/audit"
 )
 
 const (
@@ -38,11 +38,11 @@ const minLandlockABI = 4
 
 // ErrLandlockUnavailable is returned when Landlock is not supported (or is too
 // old to provide the confinement lnta promises) on this kernel.
-var ErrLandlockUnavailable = errors.New("Landlock LSM not available on this kernel")
+var ErrLandlockUnavailable = errors.New("landlock LSM not available on this kernel")
 
 // ErrLandlockNotRootless is returned when Landlock rules cannot be applied
 // because the process lacks the necessary ambient capabilities.
-var ErrLandlockNotRootless = errors.New("Landlock requires rootless/container environment")
+var ErrLandlockNotRootless = errors.New("landlock requires rootless/container environment")
 
 // landlockExePath is the path to the lnta binary for self-re-exec.
 // Can be overridden in tests.
@@ -131,9 +131,7 @@ func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) landl
 		Cmd: cmdStr,
 		Env: envList(sandboxEnvMap(home, tmp), extraEnv),
 	}
-	for _, d := range []string{"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/proc", "/sys", "/opt", "/var/log"} {
-		cfg.RODirs = append(cfg.RODirs, d)
-	}
+	cfg.RODirs = append(cfg.RODirs, "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/proc", "/sys", "/opt", "/var/log")
 	cfg.RWDirs = []string{tmp}
 	cfg.RWFiles = []string{"/dev/null"}
 	cfg.ROFiles = []string{"/dev/zero", "/dev/urandom", "/dev/random"}

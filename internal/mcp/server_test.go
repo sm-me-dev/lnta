@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sm-me/lnta/internal/packs"
-	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/packs"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 // TestMCP_Initialize tests the initialize handshake

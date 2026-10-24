@@ -11,9 +11,9 @@ import (
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
-	"github.com/sm-me/lnta/internal/agent"
-	"github.com/sm-me/lnta/internal/shell"
-	"github.com/sm-me/lnta/internal/ui"
+	"github.com/sm-me-dev/lnta/internal/agent"
+	"github.com/sm-me-dev/lnta/internal/shell"
+	"github.com/sm-me-dev/lnta/internal/ui"
 )
 
 var setupCmd = &cobra.Command{

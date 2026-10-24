@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 // LocalExecutor wraps the local sandbox and file transaction operations.

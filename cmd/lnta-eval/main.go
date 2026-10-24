@@ -27,9 +27,9 @@ import (
 	"time"
 
 	"github.com/sashabaranov/go-openai"
-	"github.com/sm-me/lnta/internal/agent"
-	"github.com/sm-me/lnta/internal/fingerprint"
-	"github.com/sm-me/lnta/internal/packs"
+	"github.com/sm-me-dev/lnta/internal/agent"
+	"github.com/sm-me-dev/lnta/internal/fingerprint"
+	"github.com/sm-me-dev/lnta/internal/packs"
 )
 
 //go:embed testdata/dummy.md

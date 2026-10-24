@@ -12,8 +12,8 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/sm-me/lnta/internal/audit"
-	"github.com/sm-me/lnta/internal/sandbox"
+	"github.com/sm-me-dev/lnta/internal/audit"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 // TimeMachineModel is the main model for the time-machine TUI.
@@ -59,19 +59,6 @@ func statusIcon(status audit.RunStatus) string {
 		return warnStyle.Render("↩")
 	default:
 		return mutedStyle.Render("?")
-	}
-}
-
-func statusIconPlain(status audit.RunStatus) string {
-	switch status {
-	case audit.RunStatusVerified:
-		return "✓"
-	case audit.RunStatusFailed:
-		return "✗"
-	case audit.RunStatusRolledBack:
-		return "↩"
-	default:
-		return "?"
 	}
 }
 
@@ -402,8 +389,8 @@ func (m *TimeMachineModel) renderDetail() {
 
 	// Token usage
 	b.WriteString(labelStyle.Render("Tokens:      "))
-	b.WriteString(fmt.Sprintf("prompt=%d completion=%d total=%d",
-		run.TokensUsed.PromptTokens, run.TokensUsed.CompletionTokens, run.TokensUsed.TotalTokens))
+	fmt.Fprintf(&b, "prompt=%d completion=%d total=%d",
+		run.TokensUsed.PromptTokens, run.TokensUsed.CompletionTokens, run.TokensUsed.TotalTokens)
 	b.WriteString("\n\n")
 
 	// Files changed
@@ -411,14 +398,14 @@ func (m *TimeMachineModel) renderDetail() {
 		b.WriteString(titleStyle.Render("Files Changed"))
 		b.WriteString("\n")
 		for _, diff := range run.FilesChanged {
-			b.WriteString(fmt.Sprintf("  %s %s\n",
+			fmt.Fprintf(&b, "  %s %s\n",
 				func() string {
 					if diff.Created {
 						return okStyle.Render("[NEW]")
 					}
 					return labelStyle.Render("[MOD]")
 				}(),
-				diff.TargetPath))
+				diff.TargetPath)
 			if diff.Diff != "" {
 				b.WriteString(RenderDiff(diff.Diff))
 			}
@@ -435,7 +422,7 @@ func (m *TimeMachineModel) renderDetail() {
 			if cmd.ExitCode != 0 {
 				statusStr = errStyle.Render(fmt.Sprintf("✗ (%d)", cmd.ExitCode))
 			}
-			b.WriteString(fmt.Sprintf("  %s [%s] %s\n", statusStr, cmd.Source, truncateString(cmd.Command, 60)))
+			fmt.Fprintf(&b, "  %s [%s] %s\n", statusStr, cmd.Source, truncateString(cmd.Command, 60))
 			if cmd.Stdout != "" && len(cmd.Stdout) < 200 {
 				b.WriteString(mutedStyle.Render("    → " + strings.TrimSpace(cmd.Stdout) + "\n"))
 			}
@@ -452,7 +439,7 @@ func (m *TimeMachineModel) renderDetail() {
 			if !vr.Passed {
 				statusStr = errStyle.Render("✗ failed")
 			}
-			b.WriteString(fmt.Sprintf("  %s %s (exit %d)\n", statusStr, vr.Command, vr.ExitCode))
+			fmt.Fprintf(&b, "  %s %s (exit %d)\n", statusStr, vr.Command, vr.ExitCode)
 			if vr.Output != "" && len(vr.Output) < 200 {
 				b.WriteString(mutedStyle.Render("    → " + strings.TrimSpace(vr.Output) + "\n"))
 			}
@@ -557,30 +544,30 @@ func (m *TimeMachineModel) View() string {
 // exportMarkdown generates a Markdown report for a run.
 func exportMarkdown(run *audit.RunSummary) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("# LNTA Run Report: %s\n\n", run.RunID))
-	b.WriteString(fmt.Sprintf("- **Timestamp**: %s\n", run.Timestamp.Local().Format(time.RFC3339)))
-	b.WriteString(fmt.Sprintf("- **Prompt**: %s\n", run.Prompt))
-	b.WriteString(fmt.Sprintf("- **Pack**: %s\n", run.SelectedPack))
-	b.WriteString(fmt.Sprintf("- **CWD**: %s\n", run.CWD))
-	b.WriteString(fmt.Sprintf("- **Status**: %s\n", run.Status))
-	b.WriteString(fmt.Sprintf("- **Tokens**: prompt=%d completion=%d total=%d\n\n",
-		run.TokensUsed.PromptTokens, run.TokensUsed.CompletionTokens, run.TokensUsed.TotalTokens))
+	fmt.Fprintf(&b, "# LNTA Run Report: %s\n\n", run.RunID)
+	fmt.Fprintf(&b, "- **Timestamp**: %s\n", run.Timestamp.Local().Format(time.RFC3339))
+	fmt.Fprintf(&b, "- **Prompt**: %s\n", run.Prompt)
+	fmt.Fprintf(&b, "- **Pack**: %s\n", run.SelectedPack)
+	fmt.Fprintf(&b, "- **CWD**: %s\n", run.CWD)
+	fmt.Fprintf(&b, "- **Status**: %s\n", run.Status)
+	fmt.Fprintf(&b, "- **Tokens**: prompt=%d completion=%d total=%d\n\n",
+		run.TokensUsed.PromptTokens, run.TokensUsed.CompletionTokens, run.TokensUsed.TotalTokens)
 
 	if run.Error != "" {
-		b.WriteString(fmt.Sprintf("**Error**: %s\n\n", run.Error))
+		fmt.Fprintf(&b, "**Error**: %s\n\n", run.Error)
 	}
 
 	if len(run.FilesChanged) > 0 {
 		b.WriteString("## Files Changed\n\n")
 		for _, diff := range run.FilesChanged {
-			b.WriteString(fmt.Sprintf("### %s %s\n\n",
+			fmt.Fprintf(&b, "### %s %s\n\n",
 				func() string {
 					if diff.Created {
 						return "[NEW]"
 					}
 					return "[MODIFIED]"
 				}(),
-				diff.TargetPath))
+				diff.TargetPath)
 			if diff.Diff != "" {
 				b.WriteString("```diff\n")
 				b.WriteString(diff.Diff)
@@ -592,7 +579,7 @@ func exportMarkdown(run *audit.RunSummary) string {
 	if len(run.CommandsExecuted) > 0 {
 		b.WriteString("## Commands Executed\n\n")
 		for _, cmd := range run.CommandsExecuted {
-			b.WriteString(fmt.Sprintf("### %s [%s] (exit %d)\n\n", cmd.Source, cmd.Command, cmd.ExitCode))
+			fmt.Fprintf(&b, "### %s [%s] (exit %d)\n\n", cmd.Source, cmd.Command, cmd.ExitCode)
 			if cmd.Stdout != "" {
 				b.WriteString("**Stdout:**\n```\n")
 				b.WriteString(cmd.Stdout)
@@ -613,7 +600,7 @@ func exportMarkdown(run *audit.RunSummary) string {
 			if !vr.Passed {
 				status = "FAILED"
 			}
-			b.WriteString(fmt.Sprintf("- **%s**: %s (exit %d)\n", status, vr.Command, vr.ExitCode))
+			fmt.Fprintf(&b, "- **%s**: %s (exit %d)\n", status, vr.Command, vr.ExitCode)
 			if vr.Output != "" {
 				b.WriteString("  ```\n")
 				b.WriteString(vr.Output)
@@ -629,16 +616,16 @@ func exportMarkdown(run *audit.RunSummary) string {
 func exportShellScript(run *audit.RunSummary) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n")
-	b.WriteString(fmt.Sprintf("# LNTA Run Reproduction Script: %s\n", shellQuote(run.RunID)))
+	fmt.Fprintf(&b, "# LNTA Run Reproduction Script: %s\n", shellQuote(run.RunID))
 	sanitizedPrompt := strings.ReplaceAll(run.Prompt, "\n", " ")
-	b.WriteString(fmt.Sprintf("# Original prompt: %s\n", sanitizedPrompt))
-	b.WriteString(fmt.Sprintf("# Pack: %s\n", run.SelectedPack))
+	fmt.Fprintf(&b, "# Original prompt: %s\n", sanitizedPrompt)
+	fmt.Fprintf(&b, "# Pack: %s\n", run.SelectedPack)
 	b.WriteString("set -euo pipefail\n\n")
-	b.WriteString(fmt.Sprintf("cd %s\n\n", shellQuote(run.CWD)))
+	fmt.Fprintf(&b, "cd %s\n\n", shellQuote(run.CWD))
 
 	for _, cmd := range run.CommandsExecuted {
 		if cmd.Source == "inspect_system" || cmd.Source == "mutate_system" {
-			b.WriteString(fmt.Sprintf("# %s (exit %d)\n", cmd.Source, cmd.ExitCode))
+			fmt.Fprintf(&b, "# %s (exit %d)\n", cmd.Source, cmd.ExitCode)
 			b.WriteString(cmd.Command + "\n\n")
 		}
 	}
@@ -647,16 +634,16 @@ func exportShellScript(run *audit.RunSummary) string {
 		b.WriteString("# File changes (apply manually or with a tool)\n")
 		for _, diff := range run.FilesChanged {
 			if diff.Created {
-				b.WriteString(fmt.Sprintf("# Created: %s\n", diff.TargetPath))
+				fmt.Fprintf(&b, "# Created: %s\n", diff.TargetPath)
 			} else {
-				b.WriteString(fmt.Sprintf("# Modified: %s\n", diff.TargetPath))
+				fmt.Fprintf(&b, "# Modified: %s\n", diff.TargetPath)
 			}
 		}
 	}
 
 	b.WriteString("# Verification commands\n")
 	for _, vr := range run.VerificationReceipt {
-		b.WriteString(fmt.Sprintf("# %s (exit %d)\n", vr.Command, vr.ExitCode))
+		fmt.Fprintf(&b, "# %s (exit %d)\n", vr.Command, vr.ExitCode)
 		b.WriteString(vr.Command + "\n")
 	}
 

@@ -56,7 +56,6 @@ type Logger struct {
 var (
 	defaultOnce   sync.Once
 	defaultLogger *Logger
-	defaultErr    error
 )
 
 // homeDir returns the user's home directory.
@@ -81,7 +80,7 @@ func dataRoot() string {
 // silently dropped.
 func DefaultLogger() *Logger {
 	defaultOnce.Do(func() {
-		defaultLogger, defaultErr = NewLogger("")
+		defaultLogger, _ = NewLogger("")
 	})
 	return defaultLogger
 }

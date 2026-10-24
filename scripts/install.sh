@@ -1,7 +1,7 @@
 #!/bin/sh
 # Universal LNTA Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/sm-me/lnta/main/scripts/install.sh | bash
-# Usage: curl -fsSL https://raw.githubusercontent.com/sm-me/lnta/main/scripts/install.sh | sudo bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/sm-me-dev/lnta/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/sm-me-dev/lnta/main/scripts/install.sh | sudo bash
 #
 # This script:
 # 1. Detects architecture (amd64/arm64) and distribution
@@ -11,7 +11,7 @@
 
 set -eu
 
-REPO="sm-me/lnta"
+REPO="sm-me-dev/lnta"
 BINARY_NAME="lnta"
 INSTALL_DIR="/usr/local/bin"
 
