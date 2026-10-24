@@ -109,6 +109,14 @@ func (o *Orchestrator) RunID() string {
 	return o.runID
 }
 
+// RunSummary returns the current snapshot of the run summary if available.
+func (o *Orchestrator) RunSummary() *audit.RunSummary {
+	if o.runCollector != nil {
+		return o.runCollector.Snapshot()
+	}
+	return nil
+}
+
 // NewOpenAIClient builds an LLMClient backed by sashabaranov/go-openai using the
 // given config. It supports any OpenAI-compatible endpoint (OpenAI, OpenRouter,
 // Ollama, Anthropic proxy, Gemini).

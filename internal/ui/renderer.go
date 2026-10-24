@@ -8,10 +8,33 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
+
+// EnforceColorProfile respects NO_COLOR and TERM=dumb environment variables.
+// If either NO_COLOR is non-empty or TERM equals "dumb", Lipgloss color output is disabled.
+func EnforceColorProfile() {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		lipgloss.SetColorProfile(termenv.Ascii)
+	}
+}
+
+// ResetColorProfile resets the color profile based on the current environment.
+func ResetColorProfile() {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		lipgloss.SetColorProfile(termenv.Ascii)
+	} else {
+		lipgloss.SetColorProfile(termenv.EnvColorProfile())
+	}
+}
+
+func init() {
+	EnforceColorProfile()
+}
 
 // ---------------------------------------------------------------------------
 // Palette

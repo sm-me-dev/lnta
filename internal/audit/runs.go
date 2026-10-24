@@ -76,6 +76,8 @@ type RunSummary struct {
 	TokensUsed         TokenUsage     `json:"tokens_used"`
 	VerificationReceipt []VerificationRecord `json:"verification_receipt"`
 	Error              string         `json:"error,omitempty"`
+	Plan               string         `json:"plan,omitempty"`
+	ExitCode           int            `json:"exit_code"`
 }
 
 // summaryPath returns the summary.json path for a run id.
@@ -247,6 +249,20 @@ func (c *RunSummaryCollector) SetError(err string) {
 	c.summary.Error = err
 }
 
+// SetPlan records the execution plan.
+func (c *RunSummaryCollector) SetPlan(plan string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.summary.Plan = plan
+}
+
+// SetExitCode records the exit code.
+func (c *RunSummaryCollector) SetExitCode(code int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.summary.ExitCode = code
+}
+
 // Snapshot returns a copy of the current summary.
 func (c *RunSummaryCollector) Snapshot() *RunSummary {
 	c.mu.Lock()
@@ -271,6 +287,8 @@ func (c *RunSummaryCollector) Snapshot() *RunSummary {
 		TokensUsed:          c.summary.TokensUsed,
 		VerificationReceipt: vrs,
 		Error:               c.summary.Error,
+		Plan:                c.summary.Plan,
+		ExitCode:            c.summary.ExitCode,
 	}
 }
 

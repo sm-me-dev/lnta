@@ -42,6 +42,7 @@
 | Command | Purpose | Mutation Risk |
 |---|---|---|
 | `lnta "<prompt>"` | Execute one-shot task with automatic pack routing | Approved only |
+| `lnta --json "<prompt>"` | Emit structured `RunSummary` JSON to stdout for CI/automation | Approved only |
 | `lnta chat` | Multi-turn conversational session with run persistence | Approved only |
 | `journalctl -xe \| lnta "fix"` | Pipe system logs into LNTA for diagnosis and repair | Approved only |
 | `lnta fix` | Automatically diagnose and fix the last failed shell command | Approved only |
@@ -51,6 +52,8 @@
 | `lnta undo -i` / `lnta sessions` | Visual Time Machine TUI for browsing and reverting past runs | Restorative |
 | `lnta --ssh user@host "<prompt>"` | Execute operations safely on a remote host | Approved only |
 | `lnta --local "<prompt>"` | Force 100% offline execution via local Ollama models | Approved only |
+| `lnta setup` | 20-second interactive onboarding wizard (Ollama / Cloud providers) | **Zero** |
+| `lnta gc [--keep-last N]` | Garbage collect old run snapshots and rotate audit logs | **Zero** |
 | `lnta doctor` | Diagnose API connectivity, kernel sandboxing, and validators | **Zero** |
 
 ---
@@ -326,7 +329,70 @@ model: "gpt-4o-mini"
 temperature: 0.2
 max_tokens: 4096
 timeout_sec: 120
+gc_max_runs: 100       # Maximum historical run snapshots to keep
+gc_max_mb: 100         # Maximum snapshot disk storage before background pruning
 ```
+
+---
+
+### Secure Keyring Storage & Permission Hardening
+
+LNTA protects secret credentials from world-readable exposure:
+1. **OS Keyring Integration (`zalando/go-keyring`)**:
+   Keys are securely stored using the native Linux Secret Service, GNOME Keyring, KWallet, or `libsecret` via D-Bus.
+2. **0600 Fallback File (`~/.config/lnta/credentials`)**:
+   In headless or container environments without D-Bus, keys fall back to `~/.config/lnta/credentials` enforced at strict `0600` (`-rw-------`) permissions.
+3. **OpenSSH-Style Auto-Hardening**:
+   If `config.yaml` or `credentials` has group- or world-readable permissions (`mode & 0077 != 0`), LNTA prints a clear security warning to `stderr` and automatically executes `chmod 0600`.
+
+---
+
+### Interactive Setup Wizard (`lnta setup`)
+
+If you run `lnta` without a configured API key or local Ollama, LNTA launches an interactive 20-second setup wizard powered by `charmbracelet/huh`:
+1. Auto-detects if a local Ollama instance is active on `:11434` and offers 1-click zero-key configuration.
+2. Lets you choose your preferred cloud provider (OpenRouter, Anthropic, OpenAI, Gemini, Custom).
+3. Safely prompts for your API key (masked) and stores it in the OS Keyring.
+4. Executes a 1-second connectivity and sandbox self-test (`lnta doctor`).
+
+You can re-run the wizard anytime with:
+```bash
+lnta setup
+```
+
+---
+
+### Automatic Storage Garbage Collection (`lnta gc`)
+
+To prevent snapshot directories and audit logs from growing unbounded over time:
+- **Automatic Background Pruning**: At the end of every run, LNTA prunes older snapshots beyond `gc_max_runs` (default `100`) or `gc_max_mb` (default `100MB`).
+- **Log Rotation**: If `~/.local/share/lnta/logs/audit.jsonl` exceeds `10MB`, it is rotated to `audit.jsonl.1` with strict `0600` permissions.
+- **Manual Pruning**:
+  ```bash
+  lnta gc --keep-last 20
+  ```
+
+---
+
+### Scripting, CI/CD, and CLI Standards Compliance
+
+#### Deterministic Exit Codes
+For robust shell scripting and CI gate enforcement:
+- `0` = Completed & Verified (`TASK_COMPLETE:` and verification passed).
+- `1` = General / Execution Error (configuration, network, invalid arguments).
+- `2` = Verification Failed (`HARNESS_VERIFICATION_FAILED` or `verify_cmd` non-zero).
+- `3` = User Cancelled / Approval Denied (`huh.Confirm` rejected mutation or SIGINT).
+- `4` = Sandbox / Environment Error (`bwrap` missing, Landlock restriction failure).
+
+#### Machine-Readable JSON Mode (`--json`)
+Emits the complete structured `RunSummary` (run id, prompt, plan, diffs, commands executed, verification receipt, exit code) as clean JSON to `stdout`:
+```bash
+lnta --json "audit open network ports and bound processes"
+```
+
+#### Color and Terminal UX (`NO_COLOR`, `TERM=dumb`)
+LNTA respects standard terminal environments:
+- Setting `NO_COLOR=1` or `TERM=dumb` instantly disables all ANSI color escapes across all `lipgloss` styles and headers.
 
 ---
 

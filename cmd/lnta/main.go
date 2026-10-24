@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,10 +14,12 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
 	lnta "github.com/sm-me/lnta"
 	"github.com/sm-me/lnta/internal/agent"
+	"github.com/sm-me/lnta/internal/audit"
 	"github.com/sm-me/lnta/internal/fingerprint"
 	"github.com/sm-me/lnta/internal/mcp"
 	"github.com/sm-me/lnta/internal/packs"
@@ -31,6 +34,7 @@ var (
 	explainMode    bool
 	dryRunMode     bool
 	commandOnly    bool
+	jsonOutput     bool
 	sshTarget      string
 	localModelFlag string
 
@@ -174,32 +178,36 @@ func runLocalOllama(prompt string, commandOnly bool) error {
 		}
 	}
 
-	fmt.Printf("Offline mode: using local Ollama model %s\n", selected)
-	fmt.Printf("Prompt: %s\n\n", prompt)
+	if !commandOnly && !jsonOutput {
+		fmt.Printf("Offline mode: using local Ollama model %s\n", selected)
+		fmt.Printf("Prompt: %s\n\n", prompt)
+	}
 
 	sys, err := fingerprint.Fingerprint()
 	if err != nil {
-		return fmt.Errorf("fingerprint: %w", err)
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("fingerprint: %w", err))
 	}
 
 	router, err := packs.NewRouter(lnta.EmbeddedPacks, "packs/*.md", userConfigDir)
 	if err != nil {
-		return fmt.Errorf("load packs: %w", err)
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("load packs: %w", err))
 	}
 	packs.SetDefaultRouter(router)
 
 	selectedPacks, err := router.SelectPacks(prompt, sys)
 	if err != nil {
-		return fmt.Errorf("route: %w", err)
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("route: %w", err))
 	}
 	pack := selectedPacks[0]
 
 	// Display environment-specific warnings.
-	for _, w := range packs.PackEnvironmentWarnings(pack, sys) {
-		fmt.Printf("[env-warning] %s\n", w)
+	if !commandOnly && !jsonOutput {
+		for _, w := range packs.PackEnvironmentWarnings(pack, sys) {
+			fmt.Printf("[env-warning] %s\n", w)
+		}
 	}
 
-	if !commandOnly {
+	if !commandOnly && !jsonOutput {
 		fmt.Println(ui.StatusLine(pack.ID, "Planning (offline)", "", false))
 		fmt.Println()
 	}
@@ -207,7 +215,7 @@ func runLocalOllama(prompt string, commandOnly bool) error {
 	// Build an OpenAI-compatible client pointed at local Ollama (no API key needed).
 	client, err := agent.NewOllamaClient(selected)
 	if err != nil {
-		return fmt.Errorf("ollama client: %w", err)
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("ollama client: %w", err))
 	}
 
 	runID := nextRunID()
@@ -230,9 +238,35 @@ func runLocalOllama(prompt string, commandOnly bool) error {
 	ctx, cancel := agent.WithSignalCancellation()
 	defer cancel()
 
-	result, err := o.Run(ctx, prompt, "", commandOnly)
-	if err != nil {
-		return fmt.Errorf("run: %w", err)
+	result, runErr := o.Run(ctx, prompt, "", commandOnly || jsonOutput)
+	summary := o.RunSummary()
+
+	exitCode := agent.DetermineExitCode(runErr, result, summary)
+	if summary != nil {
+		summary.ExitCode = exitCode
+	}
+
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if summary != nil {
+			_ = enc.Encode(summary)
+		} else {
+			_ = enc.Encode(map[string]interface{}{
+				"run_id":    runID,
+				"prompt":    prompt,
+				"exit_code": exitCode,
+				"error":     result,
+			})
+		}
+		if exitCode != agent.ExitCodeSuccess {
+			return agent.NewExitError(exitCode, runErr)
+		}
+		return nil
+	}
+
+	if runErr != nil {
+		return agent.NewExitError(exitCode, runErr)
 	}
 
 	if !commandOnly {
@@ -242,6 +276,10 @@ func runLocalOllama(prompt string, commandOnly bool) error {
 		if cmd != "" {
 			fmt.Println(cmd)
 		}
+	}
+
+	if exitCode != agent.ExitCodeSuccess {
+		return agent.NewExitError(exitCode, nil)
 	}
 	return nil
 }
@@ -468,8 +506,17 @@ func main() {
 	defer sandbox.KillAllChildren()
 
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		var exitErr *agent.ExitError
+		if errors.As(err, &exitErr) {
+			if !jsonOutput && exitErr.Err != nil {
+				fmt.Fprintln(os.Stderr, exitErr.Err)
+			}
+			os.Exit(exitErr.Code)
+		}
+		if !jsonOutput {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		os.Exit(agent.ExitCodeGeneralError)
 	}
 }
 
@@ -511,11 +558,17 @@ func init() {
 		"Dry-run mode: print proposed file diffs and commands, block all writes")
 	rootCmd.PersistentFlags().BoolVar(&commandOnly, "command-only", false,
 		"Output only the verified command (for shell widgets)")
+	rootCmd.Flags().BoolVar(&jsonOutput, "json", false,
+		"Output structured RunSummary (plan, diffs, verification receipt, exit code) as clean JSON to stdout")
 	rootCmd.PersistentFlags().StringVar(&sshTarget, "ssh", "",
 		"Execute on remote host via SSH (format: user@host[:port])")
 	rootCmd.PersistentFlags().StringVar(&localModelFlag, "local", "",
 		"Force 100% offline execution via the best detected local Ollama model. "+
 			"Optionally provide a prompt to run immediately with the local model.")
+
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		ui.EnforceColorProfile()
+	}
 
 	rootCmd.Version = lnta.Version
 	rootCmd.SetVersionTemplate("LNTA version {{.Version}}\n")
@@ -549,47 +602,66 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	if stdinIsPipe {
 		ctx, _, err := shell.ReadPipeContext(os.Stdin)
 		if err != nil {
-			return fmt.Errorf("read pipe context: %w", err)
+			return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("read pipe context: %w", err))
 		}
 		pipeContext = ctx
 	}
 
 	sys, err := fingerprint.Fingerprint()
 	if err != nil {
-		return fmt.Errorf("fingerprint: %w", err)
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("fingerprint: %w", err))
 	}
 
 	router, err := packs.NewRouter(lnta.EmbeddedPacks, "packs/*.md", userConfigDir)
 	if err != nil {
-		return fmt.Errorf("load packs: %w", err)
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("load packs: %w", err))
 	}
 	packs.SetDefaultRouter(router)
 
 	selected, err := router.SelectPacks(prompt, sys)
 	if err != nil {
-		return fmt.Errorf("route: %w", err)
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("route: %w", err))
 	}
 	pack := selected[0]
 
 	// Display environment-specific warnings (WSL2, container, headless SSH).
-	for _, w := range packs.PackEnvironmentWarnings(pack, sys) {
-		fmt.Printf("[env-warning] %s\n", w)
+	if !commandOnly && !jsonOutput {
+		for _, w := range packs.PackEnvironmentWarnings(pack, sys) {
+			fmt.Printf("[env-warning] %s\n", w)
+		}
 	}
 
 	// Compact status line at the start of execution.
-	if !commandOnly {
+	if !commandOnly && !jsonOutput {
 		fmt.Println(ui.StatusLine(pack.ID, "Planning", "", false))
 		fmt.Println()
 	}
 
 	// Build the orchestrator backed by a real LLM client.
-	cfg, err := agent.LoadConfig()
+	cfg, err := agent.LoadConfigDir(userConfigDir)
 	if err != nil {
-		return fmt.Errorf("config: %w", err)
+		if errors.Is(err, agent.ErrNoAPIKey) || strings.Contains(err.Error(), "no LLM API key configured") {
+			// Auto-launch interactive setup wizard if running interactively on a terminal
+			if !jsonOutput && !commandOnly && !stdinIsPipe && term.IsTerminal(os.Stdin.Fd()) {
+				fmt.Println("No API key configured. Starting interactive setup wizard...")
+				if serr := runSetup(cmd); serr != nil {
+					return serr
+				}
+				cfg, err = agent.LoadConfigDir(userConfigDir)
+				if err != nil {
+					return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("config error after setup: %w", err))
+				}
+			} else {
+				return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("no LLM API key configured: run 'lnta setup' or set LNTA_API_KEY"))
+			}
+		} else {
+			return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("config: %w", err))
+		}
 	}
+
 	client, err := agent.NewOpenAIClient(cfg)
 	if err != nil {
-		return fmt.Errorf("llm client: %w", err)
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("llm client: %w", err))
 	}
 
 	runID := nextRunID()
@@ -599,18 +671,18 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	if sshTarget != "" {
 		executor, err = transport.NewSSHExecutor(sshTarget, runID, ".")
 		if err != nil {
-			return fmt.Errorf("create SSH executor: %w", err)
+			return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("create SSH executor: %w", err))
 		}
 		defer executor.Close()
 
 		// Preflight: fingerprint remote host
 		ctx := context.Background()
 		if err := executor.Preflight(ctx); err != nil {
-			return fmt.Errorf("SSH preflight: %w", err)
+			return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("SSH preflight: %w", err))
 		}
 
 		// Display remote fingerprint for user confirmation
-		if fp := executor.RemoteFingerprint(); fp != nil && !commandOnly {
+		if fp := executor.RemoteFingerprint(); fp != nil && !commandOnly && !jsonOutput {
 			fmt.Printf("Connected to %s (%s %s)\n", sshTarget, fp.OSRelease["ID"], fp.OSRelease["VERSION_ID"])
 			fmt.Println()
 		}
@@ -619,8 +691,6 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	}
 
 	// One approval function for every path (piped or interactive stdin).
-	// ConfirmWithTTY opens /dev/tty; if no controlling terminal is available
-	// (CI), it returns an error and the mutation is denied (fail closed).
 	approveFn := approveMutation(executor.TargetID())
 
 	opts := []agent.Option{
@@ -642,9 +712,41 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	ctx, cancel := agent.WithSignalCancellation()
 	defer cancel()
 
-	result, err := o.Run(ctx, prompt, pipeContext, commandOnly)
-	if err != nil {
-		return fmt.Errorf("run: %w", err)
+	result, runErr := o.Run(ctx, prompt, pipeContext, commandOnly || jsonOutput)
+	summary := o.RunSummary()
+
+	// Determine deterministic exit code
+	exitCode := agent.DetermineExitCode(runErr, result, summary)
+	if summary != nil {
+		summary.ExitCode = exitCode
+	}
+
+	// Trigger lightweight automatic storage garbage collection in background
+	if cfg != nil {
+		go audit.AutoGC(cfg.GCMaxRuns, cfg.GCMaxMB)
+	}
+
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if summary != nil {
+			_ = enc.Encode(summary)
+		} else {
+			_ = enc.Encode(map[string]interface{}{
+				"run_id":    runID,
+				"prompt":    prompt,
+				"exit_code": exitCode,
+				"error":     result,
+			})
+		}
+		if exitCode != agent.ExitCodeSuccess {
+			return agent.NewExitError(exitCode, runErr)
+		}
+		return nil
+	}
+
+	if runErr != nil {
+		return agent.NewExitError(exitCode, runErr)
 	}
 
 	if !commandOnly {
@@ -655,6 +757,10 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 		if cmd != "" {
 			fmt.Println(cmd)
 		}
+	}
+
+	if exitCode != agent.ExitCodeSuccess {
+		return agent.NewExitError(exitCode, nil)
 	}
 	return nil
 }
@@ -934,18 +1040,23 @@ func runDoctor(cmd *cobra.Command) error {
 }
 
 func checkLLMConfig() error {
-	cfg, err := agent.LoadConfig()
+	cfg, err := agent.LoadConfigDir(userConfigDir)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.APIKey == "" {
+	isOllama := strings.Contains(cfg.BaseURL, "11434")
+	if cfg.APIKey == "" && !isOllama {
 		return errors.New("LNTA_API_KEY not set")
 	}
 	if cfg.BaseURL == "" {
 		return errors.New("LNTA_BASE_URL not set")
 	}
 	if doctorVerbose {
-		fmt.Printf("    API Key: %s... (len=%d)\n", cfg.APIKey[:min(8, len(cfg.APIKey))], len(cfg.APIKey))
+		keyDisplay := "(none/local)"
+		if cfg.APIKey != "" {
+			keyDisplay = fmt.Sprintf("%s... (len=%d)", cfg.APIKey[:min(8, len(cfg.APIKey))], len(cfg.APIKey))
+		}
+		fmt.Printf("    API Key: %s\n", keyDisplay)
 		fmt.Printf("    Base URL: %s\n", cfg.BaseURL)
 		fmt.Printf("    Model: %s\n", cfg.Model)
 	}
@@ -953,22 +1064,28 @@ func checkLLMConfig() error {
 }
 
 func checkLLMConnectivity() error {
-	cfg, err := agent.LoadConfig()
+	cfg, err := agent.LoadConfigDir(userConfigDir)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.APIKey == "" || cfg.BaseURL == "" {
+	isOllama := strings.Contains(cfg.BaseURL, "11434")
+	if (cfg.APIKey == "" && !isOllama) || cfg.BaseURL == "" {
 		return errors.New("API key or base URL not configured")
 	}
 
 	// Quick HTTP request to check endpoint reachability
-	// Use the models endpoint which is lightweight
 	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest("GET", strings.TrimSuffix(cfg.BaseURL, "/")+"/models", nil)
+	targetURL := strings.TrimSuffix(cfg.BaseURL, "/") + "/models"
+	if isOllama {
+		targetURL = "http://127.0.0.1:11434/api/tags"
+	}
+	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	if cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

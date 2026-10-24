@@ -1,6 +1,6 @@
 # Binaries built by the project
-lnta
-lnta-eval
+/lnta
+/lnta-eval
 
 # Go build artifacts
 *.exe
@@ -42,6 +42,7 @@ bin/
 # Temporary files
 *.tmp
 *.temp
+*.disabled
 
 # Project-specific generated/config directories
 # These are user-specific tool configurations that shouldn't be committed
