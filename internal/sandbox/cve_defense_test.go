@@ -21,10 +21,8 @@ func TestRunReadOnlyBlocksNetworkEgress(t *testing.T) {
 
 	// Skip if we can't verify network isolation (some CI environments)
 	// This test attempts to connect to a known external address.
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -52,10 +50,8 @@ func TestRunReadOnlyBlocksNetworkEgress(t *testing.T) {
 // inside the sandbox --unshare-net (loopback is preserved in new network namespace).
 func TestRunReadOnlyAllowsLoopback(t *testing.T) {
 	requireBwrap(t)
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -109,16 +105,14 @@ c.close()
 // even when they don't exist (CVE-2026-25725 defense).
 //
 // Protection mechanisms:
-// - Files directly in $HOME (e.g., .bashrc, .zshrc): protected by --ro-bind /dev/null
-// - Files in secret directories (e.g., .ssh/authorized_keys): protected by --tmpfs isolation
-//   (writes succeed in sandbox but don't persist to host)
-// - Files in .config/ subdirs: protected by --tmpfs on parent directory
+//   - Files directly in $HOME (e.g., .bashrc, .zshrc): protected by --ro-bind /dev/null
+//   - Files in secret directories (e.g., .ssh/authorized_keys): protected by --tmpfs isolation
+//     (writes succeed in sandbox but don't persist to host)
+//   - Files in .config/ subdirs: protected by --tmpfs on parent directory
 func TestPhantomDotfileProtection(t *testing.T) {
 	requireBwrap(t)
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -219,10 +213,8 @@ func TestPhantomDotfileProtection(t *testing.T) {
 // parent directories don't exist (e.g., ~/.config/claude doesn't exist).
 func TestPhantomDotfileProtectionNonExistentDir(t *testing.T) {
 	requireBwrap(t)
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 
 	// Ensure ~/.config/claude doesn't exist
 	claudeDir := filepath.Join(home, ".config", "claude")
@@ -256,16 +248,8 @@ func TestLandlockBlocksNetworkEgress(t *testing.T) {
 		t.Skipf("Landlock unavailable: %v", err)
 	}
 
-	landlockExePath = "/tmp/lnta_test"
-	if _, err := os.Stat(landlockExePath); err != nil {
-		t.Skipf("lnta test binary not found at %s", landlockExePath)
-	}
-	defer func() { landlockExePath = "" }()
-
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -284,10 +268,8 @@ func TestLandlockBlocksNetworkEgress(t *testing.T) {
 // network namespace with only loopback interface.
 func TestNetworkNamespaceIsolation(t *testing.T) {
 	requireBwrap(t)
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -310,10 +292,8 @@ func TestNetworkNamespaceIsolation(t *testing.T) {
 // isolation flags (--unshare-net, --unshare-ipc, --unshare-pid, --new-session).
 func TestUnshareFlagsPresent(t *testing.T) {
 	requireBwrap(t)
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

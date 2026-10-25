@@ -362,13 +362,30 @@ func TestMCP_ToolsListResult(t *testing.T) {
 
 // TestMCP_ContextCmdExecution tests the inspect_sandboxed tool logic
 func TestMCP_InspectSandboxed_ContextCmd(t *testing.T) {
+	home, err := os.MkdirTemp(".", ".lnta-mcp-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	home, err = filepath.Abs(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	project := filepath.Join(home, "project")
+	if err := os.Mkdir(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := sandbox.SandboxAvailable(); err != nil {
 		t.Skipf("skipping: sandbox unavailable (%v)", err)
 	}
 
 	// This tests the tool logic by calling the sandbox directly
 	ctx := context.Background()
-	res, err := sandbox.RunReadOnly(ctx, "echo hello", "/tmp", 5*time.Second)
+	res, err := sandbox.RunReadOnly(ctx, "echo hello", project, 5*time.Second)
 	if err != nil {
 		t.Fatalf("RunReadOnly: %v", err)
 	}

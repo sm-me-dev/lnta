@@ -549,16 +549,3 @@ func homeDir() string {
 	}
 	return ""
 }
-
-// truncateOutput caps s at maxOutputBytes, appending a clear marker when cut.
-func truncateOutput(s string) string {
-	if len(s) <= maxOutputBytes {
-		return s
-	}
-	marker := fmt.Sprintf("\n\n[OUTPUT TRUNCATED: %d total bytes]\n", len(s))
-	keep := maxOutputBytes - len(marker)
-	if keep < 0 {
-		keep = 0
-	}
-	return s[:keep] + marker
-}

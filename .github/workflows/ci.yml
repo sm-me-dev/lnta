@@ -184,7 +184,7 @@ jobs:
              ! sudo aa-status 2>/dev/null | grep -q 'bwrap-userns-restrict'; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "::notice::SKIPPED restricted Bubblewrap integration: runner does not expose the expected distro-owned AppArmor policy and restriction. No security setting or profile was changed."
-            echo "Restricted Bubblewrap integration skipped: runner lacks the expected distro-owned policy/restriction; no host policy was changed." >> "$GITHUB_STEP_SUMMARY"
+            echo "SKIPPED: restricted Bubblewrap integration; runner lacks the expected distro-owned policy/restriction, and no host policy was changed." >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Run restricted Bubblewrap to Landlock fallback check
         if: steps.policy.outputs.skip != 'true'
@@ -202,15 +202,27 @@ jobs:
           # sandbox result specifically: exit 4 is the sandbox failure code and
           # the Kernel Sandbox line must report OK.
           if [ "$status" -eq 4 ] || ! printf '%s\n' "$output" | grep -q 'Kernel Sandbox\.\.\. OK'; then
+            echo "FAIL: restricted runner did not establish a supported sandbox backend." >> "$GITHUB_STEP_SUMMARY"
             echo "restricted runner could not establish any supported sandbox backend (doctor exit status $status)" >&2
             exit 1
           fi
           if printf '%s\n' "$output" | grep -q 'Bubblewrap unavailable; Landlock fallback operational'; then
-            echo "Restricted Bubblewrap fallback was exercised successfully." >> "$GITHUB_STEP_SUMMARY"
+            if LNTA_REQUIRE_LANDLOCK=1 go test ./internal/sandbox -run '^TestEffectiveSandboxCredentialAndFilesystemRestrictions$' -count=1; then
+              echo "PASS: restricted Bubblewrap was blocked and effective Landlock sentinel/filesystem checks passed." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "FAIL: effective restricted Bubblewrap-to-Landlock sentinel/filesystem checks failed." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
           elif printf '%s\n' "$output" | grep -q 'Bubblewrap available and operational'; then
             echo "::notice::SKIPPED fallback assertion: distro policy is loaded but this runner's Bubblewrap probe is operational, so restriction did not block the backend."
-            echo "Fallback assertion skipped: Bubblewrap remained operational under the runner's loaded distro policy." >> "$GITHUB_STEP_SUMMARY"
+            if go test ./internal/sandbox -run '^TestEffectiveSandboxCredentialAndFilesystemRestrictions$' -count=1; then
+              echo "SKIPPED: Landlock fallback assertion; Bubblewrap remained operational. PASS: effective Bubblewrap sentinel/filesystem checks passed." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "FAIL: effective Bubblewrap sentinel/filesystem checks failed." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
           else
+            echo "FAIL: doctor did not report an expected operational sandbox backend." >> "$GITHUB_STEP_SUMMARY"
             echo "doctor did not report an expected operational sandbox backend" >&2
             exit 1
           fi

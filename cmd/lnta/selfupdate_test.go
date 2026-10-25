@@ -7,10 +7,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 func TestCompareSemVer(t *testing.T) {
@@ -163,5 +166,12 @@ func TestDetectPackageManagerNonExistent(t *testing.T) {
 	managed, pkgManager := detectPackageManager(context.Background(), "/nonexistent/dummy/path/to/lnta")
 	if managed {
 		t.Errorf("expected nonexistent path to not be package-managed, got managed by %s", pkgManager)
+	}
+}
+
+func TestRunUpdateCommandPreservesOutputLimit(t *testing.T) {
+	_, _, err := runUpdateCommand(context.Background(), "test_output_limit", "sh", []string{"-c", "head -c 1048577 /dev/zero"}, nil)
+	if !errors.Is(err, sandbox.ErrOutputLimit) {
+		t.Fatalf("runUpdateCommand error = %v, want ErrOutputLimit", err)
 	}
 }

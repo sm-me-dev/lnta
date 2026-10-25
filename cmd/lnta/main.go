@@ -438,6 +438,17 @@ var sandboxExecCmd = &cobra.Command{
 	SilenceErrors: true,
 }
 
+var restrictedExecCmd = &cobra.Command{
+	Use:    "__restricted_exec",
+	Short:  "Internal: process-group restricted executor (do not call directly)",
+	Hidden: true,
+	Run: func(cmd *cobra.Command, args []string) {
+		os.Exit(sandbox.RestrictedExecMain())
+	},
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
 var initCmd = &cobra.Command{
 	Use:   "init <zsh|bash|fish>",
 	Short: "Generate shell integration script for terminal prompt enhancement",
@@ -599,6 +610,7 @@ func init() {
 
 	// Hidden command for Landlock sandbox self-re-exec
 	rootCmd.AddCommand(sandboxExecCmd)
+	rootCmd.AddCommand(restrictedExecCmd)
 }
 
 // runPrompt runs one-shot execution mode through the agent orchestrator.

@@ -219,6 +219,50 @@ func TestProjectSecretScanFailsClosedOnSymlinks(t *testing.T) {
 	}
 }
 
+func TestProjectSecretScanConcurrentTreeChangesRemainBounded(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside-secret")
+	if err := os.WriteFile(outside, []byte("harmless concurrent scan sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed := filepath.Join(root, "changing-entry")
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = os.Remove(changed)
+			if i%2 == 0 {
+				_ = os.Symlink(outside, changed)
+			} else {
+				_ = os.WriteFile(changed, []byte("ordinary file"), 0o600)
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		<-done
+	})
+
+	for i := 0; i < 100; i++ {
+		paths, err := maskProjectSecrets(root)
+		if err != nil {
+			// Concurrent disappearance and symlink discovery both fail closed.
+			continue
+		}
+		for _, path := range paths {
+			if !pathWithin(path, root) {
+				t.Fatalf("scanner returned a path outside the project: %q", path)
+			}
+		}
+	}
+}
+
 func TestLandlockAllowlistScanHonorsResourceBounds(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "entry"), nil, 0o600); err != nil {

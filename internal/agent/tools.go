@@ -418,60 +418,46 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		"NO_COLOR=1",
 	}
 
-	// C9/C2/H2/H13: finite timeout, own process group, capped output.
-	mctx, mcancel := context.WithTimeout(ctx, 10*time.Minute)
-	defer mcancel()
-
-	cmd := exec.CommandContext(mctx, "sh", "-c", in.Command)
-	cmd.Dir = in.CWD
-	cmd.Stdin = nil
-	cmd.Env = mutateEnv
-	sandbox.ConfigureProcessGroup(cmd)
-
-	out := sandbox.NewCappedBuffer(16*1024, 8<<20, mcancel)
-	errOut := sandbox.NewCappedBuffer(16*1024, 8<<20, mcancel)
-	cmd.Stdout = out
-	cmd.Stderr = errOut
-	cmd.WaitDelay = 5 * time.Second
-
-	childStarted, err := sandbox.StartChild("mutate_system", cmd)
-	if err != nil {
-		return fmt.Sprintf("mutate_system failed to start: %v", err), nil
-	}
-
-	err = sandbox.WaitChild("mutate_system", cmd, childStarted, mctx, out, errOut)
-	var exitCode int
+	// Approved commands run through a bounded hidden launcher that denies
+	// process-group/session escape before exec. Filter setup failure is closed.
+	res, err := sandbox.RunRestrictedCommand(ctx, in.Command, in.CWD, mutateEnv, 10*time.Minute)
 	var ex *exec.ExitError
-	if errors.As(err, &ex) {
-		exitCode = ex.ExitCode()
-	} else if err != nil {
-		exitCode = -1
-	}
+	_ = errors.As(err, &ex)
+	exitCode := res.ExitCode
 
 	// Record command for time-machine TUI using capped/rendered output.
 	if deps.RunCollector != nil {
 		deps.RunCollector.RecordCommand(audit.CommandRecord{
 			Command:   in.Command,
 			ExitCode:  exitCode,
-			Stdout:    out.Render(),
-			Stderr:    errOut.Render(),
+			Stdout:    res.Stdout,
+			Stderr:    res.Stderr,
 			Timestamp: time.Now().UTC(),
 			Source:    "mutate_system",
+			Truncated: res.Truncated,
 		})
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Sprintf("TOOL_ERROR: mutate_system timed out and its process group was killed\n--- stdout ---\n%s\n--- stderr ---\n%s",
-			out.Render(), errOut.Render()), nil
+			res.Stdout, res.Stderr), nil
+	}
+	if errors.Is(err, sandbox.ErrOutputLimit) {
+		return fmt.Sprintf("TOOL_ERROR: mutate_system output limit exceeded; its process group was terminated\n--- stdout ---\n%s\n--- stderr ---\n%s",
+			res.Stdout, res.Stderr), nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Sprintf("TOOL_ERROR: mutate_system was canceled and its process group was terminated\n--- stdout ---\n%s\n--- stderr ---\n%s",
+			res.Stdout, res.Stderr), nil
 	}
 	if ex != nil {
 		return fmt.Sprintf("exit_code=%d\n--- stdout ---\n%s\n--- stderr ---\n%s",
-			ex.ExitCode(), out.Render(), errOut.Render()), nil
+			ex.ExitCode(), res.Stdout, res.Stderr), nil
 	}
 	if err != nil {
-		return fmt.Sprintf("mutate_system failed to start: %v\nstderr: %s", err, errOut.Render()), nil
+		return fmt.Sprintf("mutate_system restricted launcher failed: %v\nstderr: %s", err, res.Stderr), nil
 	}
-	return fmt.Sprintf("exit_code=0\n--- stdout ---\n%s", out.Render()), nil
+	return fmt.Sprintf("exit_code=0\n--- stdout ---\n%s", res.Stdout), nil
 }
 
 type completeInput struct {

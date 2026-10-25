@@ -92,6 +92,25 @@ func TestFailedStartLeavesNoRegistryEntry(t *testing.T) {
 	}
 }
 
+func TestStartChildRejectsMissingOwnedProcessGroupBeforeStarting(t *testing.T) {
+	cmd := exec.Command("/bin/true")
+	if _, err := StartChild("lifecycle_test", cmd); err == nil {
+		t.Fatal("child without an owned process group was started")
+	}
+	if cmd.Process != nil {
+		t.Fatal("invalid child setup started a process")
+	}
+	if n := registrySize(); n != 0 {
+		t.Fatalf("invalid setup left %d registry entries", n)
+	}
+}
+
+func TestGroupCleanupDoesNotSignalUnobservablePID(t *testing.T) {
+	if got := killGroupAfterLeaderExit(1 << 30); got != "unobservable" {
+		t.Fatalf("cleanup status=%q, want unobservable", got)
+	}
+}
+
 func TestNonzeroExitIsOrdinaryFailureNotTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -133,6 +152,10 @@ func TestTimeoutIsDistinguishableAndKillsDescendants(t *testing.T) {
 	if err == nil {
 		t.Fatal("timed-out child reported success")
 	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("timeout lost ExitError details: %v", err)
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout is indistinguishable from an ordinary failure: %v", err)
 	}
@@ -169,6 +192,9 @@ func TestCancellationKillsDescendantsAndIsNotATimeout(t *testing.T) {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("explicit cancellation was reported as a timeout: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("explicit cancellation is not distinguishable: %v", err)
 	}
 	if !waitProcessGone(pid, 2*time.Second) {
 		t.Fatalf("grandchild %d survived cancellation", pid)
@@ -248,6 +274,12 @@ func TestLargeStdoutAndStderrStreamsAreBoundedAndKilled(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("killed flood reported success")
+	}
+	if !errors.Is(err, ErrOutputLimit) {
+		t.Fatalf("output-cap termination is not distinguishable: %v", err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("output-cap termination has the wrong classification: %v", err)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("output-cap kill was reported as a timeout: %v", err)

@@ -112,8 +112,10 @@ When `bwrap` is missing or blocked by kernel policies (e.g. hardened containers 
 2. **Landlock Ruleset Creation**: Restricts filesystem access rights to read-only (`LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_READ_DIR`).
 3. **No-New-Privs**: Invokes `prctl(PR_SET_NO_NEW_PRIVS, 1)` before applying the ruleset.
 4. **Network Socket Restrictions**: Landlock network rules are combined with seccomp that rejects creation of IPv4, IPv6, and MPTCP sockets. This does not revoke already-open descriptors; LNTA starts children without inherited application descriptors.
-5. **Host Process Protection**: Because Landlock has no PID namespace, the fallback does not grant `/proc` and blocks process signaling and inspection syscalls. Host process inspection is unavailable in this backend.
+5. **Host Process Protection**: Because Landlock has no PID namespace, the fallback does not grant `/proc` and blocks process signaling, inspection, and session/process-group detachment syscalls. Host process inspection is unavailable in this backend.
 6. **Fail-Closed Guarantee**: If Landlock or the required seccomp filters are unavailable, execution fails rather than falling back to uncontained shell execution.
+
+Approved `mutate_system` commands need host filesystem writes, so they do not use the read-only Landlock policy. They run in LNTA's managed process group with a hidden launcher that denies `setsid` and `setpgid` before executing the shell. This prevents those commands from deliberately detaching from that group; it does not provide filesystem isolation or a complete process-tree guarantee.
 
 ---
 
@@ -191,6 +193,8 @@ LNTA neutralizes CVE-2026-25725 through a 3-layer mask strategy:
 3. **Project Credential Scan**: The project tree is scanned in bounded directory batches through ignored directories as well as ordinary source directories, with a maximum depth of 32 and 5,000 entries. Bubblewrap masks discovered credential files; Landlock omits them from its allowlist. Landlock's separate allowlist walk is capped at depth 32 and 20,000 entries. Neither scan follows project symlinks. If a symlink, traversal error, depth boundary, or entry limit makes coverage incomplete, the sandbox refuses to run. These bounds are deliberate resource limits and are never reported as complete masking when the scan stops early.
 
 ---
+
+The project scan and backend setup are path-based rather than an atomic filesystem snapshot. A concurrent writer can add or replace entries after discovery and before Bubblewrap mounts paths or Landlock applies its rules. The current fail-closed checks cover the tree as observed during each scan; they do not guarantee race-free masking against a process that can modify the project concurrently. Avoid running inspections while an untrusted process is changing the project tree.
 
 ## Network Isolation & Exfiltration Defense
 

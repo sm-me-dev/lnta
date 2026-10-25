@@ -25,6 +25,7 @@ func TestProcessLifecycleDetailsAreBoundedAndPrivate(t *testing.T) {
 	for key, want := range map[string]string{
 		"role": "mutate_system", "pid": "1234", "pgid": "1234", "exit_status": "0",
 		"canceled": "false", "timed_out": "false", "stdout_bytes": "15", "stderr_bytes": "7",
+		"termination_reason": "completed", "cleanup_status": "not_recorded",
 	} {
 		if complete[key] != want {
 			t.Errorf("completion details[%q]=%q want %q", key, complete[key], want)
@@ -48,6 +49,21 @@ func TestProcessLifecycleDetailsMarkTimeout(t *testing.T) {
 	details := processCompletionDetails("bwrap", "55", time.Now(), ctx, 137, 0, 32)
 	if details["canceled"] != "true" || details["timed_out"] != "true" {
 		t.Fatalf("timeout flags missing: %#v", details)
+	}
+	if details["termination_reason"] != "deadline" {
+		t.Fatalf("timeout reason missing: %#v", details)
+	}
+}
+
+func TestProcessLifecycleDetailsRecordCleanupFailureSafely(t *testing.T) {
+	details := processCompletionDetailsWithGroup("mutate_system", "23", "23", time.Now(), nil, 126, 0, 0, "cleanup_failed", "unobservable")
+	if details["termination_reason"] != "cleanup_failed" || details["cleanup_status"] != "unobservable" {
+		t.Fatalf("cleanup result missing from lifecycle metadata: %#v", details)
+	}
+	for _, value := range details {
+		if strings.Contains(value, "secret") || strings.Contains(value, "command") {
+			t.Fatalf("unexpected sensitive lifecycle value %q", value)
+		}
 	}
 }
 

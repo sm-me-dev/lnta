@@ -25,6 +25,10 @@ var childRegistry struct {
 	pgid map[int]int // process PID -> process group ID
 }
 
+// ErrProcessGroupCleanup indicates that LNTA could not safely confirm or
+// complete cleanup of a child process group.
+var ErrProcessGroupCleanup = errors.New("child process group cleanup failed")
+
 func init() {
 	childRegistry.pgid = make(map[int]int)
 }
@@ -85,6 +89,9 @@ func UnregisterChild(cmd *exec.Cmd) {
 // command, prompt, environment value, or child output.
 func StartChild(role string, cmd *exec.Cmd) (time.Time, error) {
 	started := time.Now()
+	if cmd == nil || cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid || cmd.SysProcAttr.Pgid != 0 {
+		return started, fmt.Errorf("child must be configured with its own process group before start")
+	}
 	childRegistry.mu.Lock()
 	if err := cmd.Start(); err != nil {
 		childRegistry.mu.Unlock()
@@ -106,33 +113,68 @@ func StartChild(role string, cmd *exec.Cmd) (time.Time, error) {
 // also closes any output pipes a surviving descendant inherited, so Wait does
 // not stall for WaitDelay and report a successful command as failed.
 //
-// If the context's deadline expired, the returned error additionally matches
-// context.DeadlineExceeded (errors.Is) while still unwrapping to the
-// *exec.ExitError, so timeouts are distinguishable from ordinary failures and
-// from cancellation (including the output-cap kill, which cancels the context).
+// Deadline, cancellation, and output-cap errors retain their distinct
+// errors.Is classifications while preserving *exec.ExitError through
+// errors.As. Failed or unobservable process-group cleanup is returned as an
+// error even if the direct child exited successfully.
 func WaitChild(role string, cmd *exec.Cmd, started time.Time, ctx context.Context, stdout, stderr *CappedBuffer) error {
 	pgid := 0
+	cleanupStatus := "not_started"
 	if cmd != nil && cmd.Process != nil {
 		pgid = registeredProcessGroup(cmd.Process.Pid)
 		// An inherited group is owned and reaped by its registered leader.
 		if pgid > 0 && pgid == cmd.Process.Pid {
-			killGroupAfterLeaderExit(pgid)
+			cleanupStatus = killGroupAfterLeaderExit(pgid)
+		} else {
+			cleanupStatus = "not_owned"
 		}
 	}
 	err := cmd.Wait()
 	UnregisterChild(cmd)
-	if err != nil && ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
-		err = fmt.Errorf("%w: %w", err, context.DeadlineExceeded)
-	}
 	var stdoutBytes, stderrBytes int64
+	outputLimit := false
 	if stdout != nil {
 		stdoutBytes = stdout.Total()
+		outputLimit = outputLimit || stdout.HardLimitExceeded()
 	}
 	if stderr != nil {
 		stderrBytes = stderr.Total()
+		outputLimit = outputLimit || stderr.HardLimitExceeded()
+	}
+	terminationReason := "completed"
+	if outputLimit {
+		terminationReason = "output_limit"
+		if err == nil {
+			err = ErrOutputLimit
+		} else {
+			err = fmt.Errorf("%w: %w", err, ErrOutputLimit)
+		}
+	} else if err != nil && ctx != nil {
+		switch ctx.Err() {
+		case context.DeadlineExceeded:
+			terminationReason = "deadline"
+			if !errors.Is(err, context.DeadlineExceeded) {
+				err = fmt.Errorf("%w: %w", err, context.DeadlineExceeded)
+			}
+		case context.Canceled:
+			terminationReason = "canceled"
+			if !errors.Is(err, context.Canceled) {
+				err = fmt.Errorf("%w: %w", err, context.Canceled)
+			}
+		}
+	}
+	if cleanupStatus == "failed" || cleanupStatus == "unobservable" || cleanupStatus == "not_owned" {
+		if err == nil {
+			err = ErrProcessGroupCleanup
+		} else {
+			err = fmt.Errorf("%w: %w", err, ErrProcessGroupCleanup)
+		}
+		if terminationReason == "completed" {
+			terminationReason = "cleanup_failed"
+		}
 	}
 	exitStatus := exitCodeOf(err)
-	audit.Log("process.complete", "", processCompletionDetailsWithGroup(role, processID(cmd), strconv.Itoa(pgid), started, ctx, exitStatus, stdoutBytes, stderrBytes))
+	audit.Log("process.complete", "", processCompletionDetailsWithGroup(role, processID(cmd), strconv.Itoa(pgid), started, ctx, exitStatus, stdoutBytes, stderrBytes, terminationReason, cleanupStatus))
 	return err
 }
 
@@ -140,7 +182,7 @@ func WaitChild(role string, cmd *exec.Cmd, started time.Time, ctx context.Contex
 // reaping it (waitid WNOWAIT), then SIGKILLs the process group pid. If the
 // leader cannot be observed (for example it was already reaped elsewhere) no
 // signal is sent, because the group id may no longer belong to this child.
-func killGroupAfterLeaderExit(pid int) {
+func killGroupAfterLeaderExit(pid int) string {
 	var info unix.Siginfo
 	for {
 		err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT, nil)
@@ -148,11 +190,17 @@ func killGroupAfterLeaderExit(pid int) {
 			continue
 		}
 		if err != nil {
-			return
+			return "unobservable"
 		}
 		break
 	}
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		if err == syscall.ESRCH {
+			return "already_gone"
+		}
+		return "failed"
+	}
+	return "killed"
 }
 
 func processStartDetails(role string, pid int) map[string]string {
@@ -165,22 +213,38 @@ func processStartDetails(role string, pid int) map[string]string {
 }
 
 func processCompletionDetails(role, id string, started time.Time, ctx context.Context, exitStatus int, stdoutBytes, stderrBytes int64) map[string]string {
-	return processCompletionDetailsWithGroup(role, id, id, started, ctx, exitStatus, stdoutBytes, stderrBytes)
+	return processCompletionDetailsWithGroup(role, id, id, started, ctx, exitStatus, stdoutBytes, stderrBytes, terminationReason(ctx), "not_recorded")
 }
 
-func processCompletionDetailsWithGroup(role, id, pgid string, started time.Time, ctx context.Context, exitStatus int, stdoutBytes, stderrBytes int64) map[string]string {
+func terminationReason(ctx context.Context) string {
+	if ctx == nil {
+		return "completed"
+	}
+	switch ctx.Err() {
+	case context.DeadlineExceeded:
+		return "deadline"
+	case context.Canceled:
+		return "canceled"
+	default:
+		return "completed"
+	}
+}
+
+func processCompletionDetailsWithGroup(role, id, pgid string, started time.Time, ctx context.Context, exitStatus int, stdoutBytes, stderrBytes int64, reason, cleanupStatus string) map[string]string {
 	canceled := ctx != nil && ctx.Err() != nil
 	timedOut := ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
 	return map[string]string{
-		"role":         role,
-		"pid":          id,
-		"pgid":         pgid,
-		"elapsed_ms":   strconv.FormatInt(time.Since(started).Milliseconds(), 10),
-		"exit_status":  strconv.Itoa(exitStatus),
-		"canceled":     strconv.FormatBool(canceled),
-		"timed_out":    strconv.FormatBool(timedOut),
-		"stdout_bytes": strconv.FormatInt(stdoutBytes, 10),
-		"stderr_bytes": strconv.FormatInt(stderrBytes, 10),
+		"role":               role,
+		"pid":                id,
+		"pgid":               pgid,
+		"elapsed_ms":         strconv.FormatInt(time.Since(started).Milliseconds(), 10),
+		"exit_status":        strconv.Itoa(exitStatus),
+		"canceled":           strconv.FormatBool(canceled),
+		"timed_out":          strconv.FormatBool(timedOut),
+		"stdout_bytes":       strconv.FormatInt(stdoutBytes, 10),
+		"stderr_bytes":       strconv.FormatInt(stderrBytes, 10),
+		"termination_reason": reason,
+		"cleanup_status":     cleanupStatus,
 	}
 }
 
@@ -216,16 +280,20 @@ func KillAllChildren() {
 // killed outright. Only the first maxOutputBytes are ever retained.
 const hardOutputBytes = 8 << 20
 
+// ErrOutputLimit identifies child termination caused by the hard output cap.
+var ErrOutputLimit = errors.New("child output limit exceeded")
+
 // CappedBuffer keeps only the first `limit` bytes written to it, counts the
 // rest, and (optionally) invokes kill once more than `hard` bytes were written
 // so a runaway producer (`yes`, `cat /dev/zero`) cannot exhaust memory or time.
 type CappedBuffer struct {
-	mu    sync.Mutex
-	head  bytes.Buffer
-	limit int
-	hard  int64
-	total int64
-	kill  context.CancelFunc
+	mu                sync.Mutex
+	head              bytes.Buffer
+	limit             int
+	hard              int64
+	total             int64
+	kill              context.CancelFunc
+	hardLimitExceeded bool
 }
 
 // NewCappedBuffer returns a CappedBuffer retaining `limit` bytes. When kill is
@@ -247,6 +315,7 @@ func (c *CappedBuffer) Write(p []byte) (int, error) {
 		c.head.Write(p[:room])
 	}
 	if c.kill != nil && c.hard > 0 && c.total > c.hard {
+		c.hardLimitExceeded = true
 		c.kill()
 		c.kill = nil
 	}
@@ -265,6 +334,13 @@ func (c *CappedBuffer) Total() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.total
+}
+
+// HardLimitExceeded reports whether this buffer canceled its child at the hard cap.
+func (c *CappedBuffer) HardLimitExceeded() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hardLimitExceeded
 }
 
 // Truncated reports whether bytes were discarded.

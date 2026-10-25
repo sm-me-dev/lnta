@@ -325,64 +325,10 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			return "", fmt.Errorf("create stream: %w", err)
 		}
 
-		var assistantContent strings.Builder
-		// pending accumulates in-call tool calls keyed by stream index.
-		pending := make(map[int]*streamingToolCall)
-		var order []int
-		var finishReason openai.FinishReason
-
-		for {
-			if err := ctx.Err(); err != nil {
-				stream.Close()
-				return "", fmt.Errorf("cancelled during stream: %w", err)
-			}
-			sr, err := stream.Recv()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				stream.Close()
-				return "", fmt.Errorf("stream recv: %w", err)
-			}
-			if len(sr.Choices) == 0 {
-				continue
-			}
-			delta := sr.Choices[0].Delta
-			if sr.Choices[0].FinishReason != "" {
-				finishReason = sr.Choices[0].FinishReason
-			}
-			assistantContent.WriteString(delta.Content)
-			if assistantContent.Len() > 64*1024 {
-				stream.Close()
-				return "", fmt.Errorf("provider response exceeded 64 KiB text limit")
-			}
-			for _, tc := range delta.ToolCalls {
-				if tc.Index == nil {
-					stream.Close()
-					return "", fmt.Errorf("malformed streamed tool call: missing index")
-				}
-				idx := *tc.Index
-				p, exists := pending[idx]
-				if !exists {
-					p = &streamingToolCall{index: idx}
-					pending[idx] = p
-					order = append(order, idx)
-				}
-				if tc.ID != "" {
-					p.id = tc.ID
-				}
-				p.typ = string(tc.Type)
-				if tc.Function.Name != "" {
-					p.name = tc.Function.Name
-				}
-				p.args += tc.Function.Arguments
-				if len(p.args) > 1<<20 {
-					stream.Close()
-					return "", fmt.Errorf("tool call arguments exceeded 1 MiB limit")
-				}
-			}
+		assistantText, order, pending, finishReason, err := collectStreamedCompletion(ctx, stream)
+		if err != nil {
+			return "", err
 		}
-		stream.Close()
 		if len(order) > 0 && finishReason != openai.FinishReasonToolCalls {
 			return "", fmt.Errorf("incomplete streamed tool call response: finish reason %q", finishReason)
 		}
@@ -390,9 +336,10 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 		// Include streamed tool names and arguments in the completion budget;
 		// otherwise a provider could exceed the budget through tool payloads.
 		var completionText strings.Builder
-		completionText.WriteString(assistantContent.String())
+		completionText.WriteString(assistantText)
 		for _, idx := range order {
 			if call := pending[idx]; call != nil {
+				completionText.WriteString(call.id)
 				completionText.WriteString(call.name)
 				completionText.WriteString(call.args)
 			}
@@ -414,8 +361,8 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 		assistantMsg := openai.ChatCompletionMessage{
 			Role: openai.ChatMessageRoleAssistant,
 		}
-		if assistantContent.Len() > 0 {
-			assistantMsg.Content = assistantContent.String()
+		if assistantText != "" {
+			assistantMsg.Content = assistantText
 		}
 		if len(order) > 0 {
 			assistantMsg.ToolCalls = make([]openai.ToolCall, 0, len(order))
@@ -440,7 +387,7 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				o.runCollector.SetError("provider response did not invoke complete_task")
 				_ = o.runCollector.Save()
 			}
-			return assistantContent.String(), fmt.Errorf("provider response did not invoke complete_task; task is unverified")
+			return assistantText, fmt.Errorf("provider response did not invoke complete_task; task is unverified")
 		}
 
 		// Execute each tool call in order.
@@ -592,9 +539,102 @@ type streamingToolCall struct {
 	args  string
 }
 
+const (
+	maxStreamedAssistantText = 64 << 10
+	maxStreamedToolArgument  = 1 << 20
+	maxStreamedToolCalls     = 64
+	maxStreamedCompletion    = 8 << 20
+)
+
+// collectStreamedCompletion bounds retained completion data and closes the
+// stream immediately on malformed or oversized deltas. Tool execution happens
+// only after this function returns successfully.
+func collectStreamedCompletion(ctx context.Context, stream ChatStream) (string, []int, map[int]*streamingToolCall, openai.FinishReason, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if stream == nil {
+		return "", nil, nil, "", fmt.Errorf("provider returned an empty stream")
+	}
+	var assistant strings.Builder
+	pending := make(map[int]*streamingToolCall)
+	var order []int
+	var finishReason openai.FinishReason
+	var aggregateBytes int
+	reserve := func(n int) bool {
+		if n < 0 || n > maxStreamedCompletion-aggregateBytes {
+			return false
+		}
+		aggregateBytes += n
+		return true
+	}
+	fail := func(err error) (string, []int, map[int]*streamingToolCall, openai.FinishReason, error) {
+		_ = stream.Close()
+		return "", nil, nil, "", err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return fail(fmt.Errorf("cancelled during stream: %w", err))
+		}
+		sr, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fail(fmt.Errorf("stream recv: %w", err))
+		}
+		if len(sr.Choices) == 0 {
+			continue
+		}
+		delta := sr.Choices[0].Delta
+		if sr.Choices[0].FinishReason != "" {
+			finishReason = sr.Choices[0].FinishReason
+		}
+		if len(delta.Content) > maxStreamedAssistantText-assistant.Len() {
+			return fail(fmt.Errorf("provider response exceeded 64 KiB text limit"))
+		}
+		if !reserve(len(delta.Content)) {
+			return fail(fmt.Errorf("provider response exceeded 8 MiB aggregate limit"))
+		}
+		assistant.WriteString(delta.Content)
+
+		for _, tc := range delta.ToolCalls {
+			if tc.Index == nil {
+				return fail(fmt.Errorf("malformed streamed tool call: missing index"))
+			}
+			idx := *tc.Index
+			p, exists := pending[idx]
+			if !exists {
+				if len(order) >= maxStreamedToolCalls {
+					return fail(fmt.Errorf("provider response exceeded 64 tool call limit"))
+				}
+				p = &streamingToolCall{index: idx}
+				pending[idx] = p
+				order = append(order, idx)
+			}
+			id, typ, name, args := tc.ID, string(tc.Type), tc.Function.Name, tc.Function.Arguments
+			if len(args) > maxStreamedToolArgument-len(p.args) {
+				return fail(fmt.Errorf("tool call arguments exceeded 1 MiB limit"))
+			}
+			if !reserve(len(id) + len(typ) + len(name) + len(args)) {
+				return fail(fmt.Errorf("provider response exceeded 8 MiB aggregate limit"))
+			}
+			p.id += id
+			if typ != "" {
+				p.typ = typ
+			}
+			p.name += name
+			p.args += args
+		}
+	}
+	_ = stream.Close()
+	return assistant.String(), order, pending, finishReason, nil
+}
+
 func validateStreamedToolCalls(order []int, pending map[int]*streamingToolCall, tools map[string]Tool) error {
-	if len(order) > 16 {
-		return fmt.Errorf("provider returned more than 16 tool calls")
+	if len(order) > maxStreamedToolCalls {
+		return fmt.Errorf("provider returned more than %d tool calls", maxStreamedToolCalls)
 	}
 	ids := make(map[string]struct{}, len(order))
 	mutations := make(map[string]struct{})

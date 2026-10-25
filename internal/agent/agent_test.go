@@ -24,12 +24,20 @@ import (
 //go:embed testdata/dummy.md
 var embedFS embed.FS
 
+func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "__restricted_exec" {
+		os.Exit(sandbox.RestrictedExecMain())
+	}
+	os.Exit(m.Run())
+}
+
 // --- mock LLM + stream ------------------------------------------------------
 
 // mockStream is a fake chatStream yielding a fixed slice of responses, then io.EOF.
 type mockStream struct {
-	responses []openai.ChatCompletionStreamResponse
-	idx       int
+	responses  []openai.ChatCompletionStreamResponse
+	idx        int
+	closeCount int
 }
 
 func (m *mockStream) Recv() (openai.ChatCompletionStreamResponse, error) {
@@ -41,7 +49,10 @@ func (m *mockStream) Recv() (openai.ChatCompletionStreamResponse, error) {
 	return r, nil
 }
 
-func (m *mockStream) Close() error { return nil }
+func (m *mockStream) Close() error {
+	m.closeCount++
+	return nil
+}
 
 // mockLLM returns one canned stream per ChatCompletionStream call, in order.
 // turnCount reports how many streams were requested.
@@ -107,21 +118,28 @@ func buildArgs(m map[string]any) string {
 
 // --- tests ------------------------------------------------------------------
 
-// testDirUnderHome creates a throwaway directory under $HOME. Files under $HOME
-// remain visible inside the bwrap sandbox (only /tmp is masked with an empty
-// tmpfs, and secret dot-dirs are masked), so bwrap-based verify_cmds can stat
-// them.
+// testDirUnderHome creates an isolated HOME outside /tmp so sandbox tests can
+// see it after Bubblewrap mounts its private /tmp.
 func testDirUnderHome(t *testing.T) string {
 	t.Helper()
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		t.Skip("HOME not available")
+	home, err := os.MkdirTemp(".", ".lnta-agent-home-")
+	if err != nil {
+		t.Fatalf("create isolated HOME: %v", err)
 	}
-	d := filepath.Join(home, ".lnta-agent-test")
+	absHome, err := filepath.Abs(home)
+	if err != nil {
+		_ = os.RemoveAll(home)
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", absHome)
+	t.Cleanup(func() { _ = os.RemoveAll(absHome) })
+	d := filepath.Join(absHome, ".lnta-agent-test")
 	if err := os.MkdirAll(d, 0o700); err != nil {
 		t.Fatalf("mkdir %q: %v", d, err)
 	}
-	t.Cleanup(func() { os.RemoveAll(d) })
+	if err := os.Mkdir(filepath.Join(d, ".git"), 0o700); err != nil {
+		t.Fatalf("create isolated project marker: %v", err)
+	}
 	return d
 }
 

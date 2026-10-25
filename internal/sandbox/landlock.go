@@ -454,13 +454,25 @@ func denyIPSocketCreation() error {
 }
 
 // denyProcessControlSyscalls prevents a Landlock fallback command from
-// signaling or inspecting host processes when PID namespaces are unavailable.
+// signaling, inspecting, or escaping the managed process group when PID
+// namespaces are unavailable.
 func denyProcessControlSyscalls() error {
 	blocked := []uint32{
 		unix.SYS_KILL, unix.SYS_TKILL, unix.SYS_TGKILL, unix.SYS_PTRACE,
 		unix.SYS_PROCESS_VM_READV, unix.SYS_PROCESS_VM_WRITEV,
 		unix.SYS_PIDFD_GETFD, unix.SYS_PIDFD_SEND_SIGNAL,
+		unix.SYS_SETSID, unix.SYS_SETPGID,
 	}
+	return denySyscalls(blocked)
+}
+
+// denySessionGroupSyscalls prevents commands from escaping LNTA's managed
+// process group. The filter is inherited by forked and exec'd descendants.
+func denySessionGroupSyscalls() error {
+	return denySyscalls([]uint32{unix.SYS_SETSID, unix.SYS_SETPGID})
+}
+
+func denySyscalls(blocked []uint32) error {
 	filters := []unix.SockFilter{{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0}}
 	for _, nr := range blocked {
 		filters = append(filters,
@@ -532,15 +544,4 @@ func LandlockExecCommand() error {
 		return fmt.Errorf("sandboxed command exited with status %d", code)
 	}
 	return nil
-}
-
-// joinPaths joins non-empty paths with ':'.
-func joinPaths(paths []string) string {
-	var out []string
-	for _, p := range paths {
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return strings.Join(out, ":")
 }

@@ -329,8 +329,8 @@ func runSystemSSH(ctx context.Context, user, host, port, cmdStr string, stdin io
 	err = sandbox.WaitChild("ssh", cmd, start, ctx, out, errOut)
 	duration := time.Since(start)
 
-	if ctx.Err() == context.DeadlineExceeded {
-		return sshResult{ExitCode: 124, Stderr: "ssh timed out", Duration: duration, Truncated: out.Truncated() || errOut.Truncated()}, ctx.Err()
+	if errors.Is(err, context.DeadlineExceeded) {
+		return sshResult{ExitCode: 124, Stderr: "ssh timed out", Duration: duration, Truncated: out.Truncated() || errOut.Truncated()}, err
 	}
 	exitCode := 0
 	if err != nil {

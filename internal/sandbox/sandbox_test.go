@@ -15,6 +15,7 @@ import (
 
 func requireBwrap(t *testing.T) {
 	t.Helper()
+	t.Setenv("HOME", sandboxTempDir(t))
 	if err := SandboxAvailable(); err != nil {
 		t.Skipf("sandbox unavailable: %v", err)
 	}
@@ -24,10 +25,8 @@ func requireBwrap(t *testing.T) {
 // writing to $HOME fails inside the sandbox and nothing lands on the host.
 func TestRunReadOnlyBlocksHostWrites(t *testing.T) {
 	requireBwrap(t)
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 	testFile := filepath.Join(home, ".lnta-ro-write-test")
 	defer os.Remove(testFile)
 
@@ -49,10 +48,8 @@ func TestRunReadOnlyBlocksHostWrites(t *testing.T) {
 // a file written to /tmp inside the sandbox never appears on the host /tmp.
 func TestRunReadOnlyBlocksHostTmp(t *testing.T) {
 	requireBwrap(t)
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 	hostTmp := filepath.Join(os.TempDir(), ".lnta-ro-tmp-test")
 	defer os.Remove(hostTmp)
 
@@ -73,10 +70,8 @@ func TestRunReadOnlyBlocksHostTmp(t *testing.T) {
 // credentials cannot be exfiltrated by a prompt-injected command.
 func TestRunReadOnlyMasksSSH(t *testing.T) {
 	requireBwrap(t)
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/home/sm-me"
-	}
+	home := sandboxTempDir(t)
+	t.Setenv("HOME", home)
 	sshDir := filepath.Join(home, ".ssh")
 	sshExisted := true
 	if _, statErr := os.Stat(sshDir); os.IsNotExist(statErr) {

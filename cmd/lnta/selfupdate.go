@@ -105,9 +105,6 @@ func runUpdateCommand(parent context.Context, role, executable string, args []st
 		return "", "", err
 	}
 	err = sandbox.WaitChild(role, cmd, started, ctx, stdout, stderr)
-	if ctx.Err() != nil {
-		err = ctx.Err()
-	}
 	return stdout.Render(), stderr.Render(), err
 }
 

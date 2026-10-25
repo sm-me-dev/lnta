@@ -1119,9 +1119,6 @@ func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin 
 		return err
 	}
 	err = WaitChild("ssh_rollback", sshCmd, started, ctx, out, errOut)
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
 	return err
 }
 
