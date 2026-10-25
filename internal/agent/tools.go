@@ -178,8 +178,14 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 		in.CWD = deps.CWD
 	}
 	res, err := deps.Executor.RunReadOnly(ctx, in.Command, in.CWD, 0)
-	if err != nil {
-		return fmt.Sprintf("inspect_system error: %v\nstderr: %s", err, res.Stderr), nil
+	if err != nil || res.ExitCode != 0 {
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		} else {
+			errMsg = fmt.Sprintf("exit status %d", res.ExitCode)
+		}
+		return fmt.Sprintf("TOOL_ERROR: inspect_system failed for command %q (%s)\nstderr: %s\nHint: 'command' must be a full executable shell command (e.g. 'ss -tulpn', 'ps aux', 'lsof -i'), not an argument.", in.Command, errMsg, res.Stderr), nil
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "exit_code=%d duration=%s\n", res.ExitCode, res.Duration)
@@ -210,10 +216,10 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 }
 
 type writeInput struct {
-	Path   string `json:"path"`
+	Path    string `json:"path"`
 	Content string `json:"content"`
-	Mode   string `json:"mode"`
-	Reason string `json:"reason"`
+	Mode    string `json:"mode"`
+	Reason  string `json:"reason"`
 }
 
 func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (string, error) {
