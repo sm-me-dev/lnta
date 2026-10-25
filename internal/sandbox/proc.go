@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/sm-me-dev/lnta/internal/audit"
 )
 
@@ -96,19 +98,32 @@ func StartChild(role string, cmd *exec.Cmd) (time.Time, error) {
 
 // WaitChild waits for a previously started child, unregisters it, and records
 // bounded lifecycle metadata. Output content and command details are omitted.
+//
+// When the child leads its own process group, the whole group is killed as
+// soon as the leader has exited, BEFORE the leader is reaped. While the
+// unreaped leader exists its pid (and therefore the group id) cannot be
+// recycled, so the group kill can never hit an unrelated group. Killing early
+// also closes any output pipes a surviving descendant inherited, so Wait does
+// not stall for WaitDelay and report a successful command as failed.
+//
+// If the context's deadline expired, the returned error additionally matches
+// context.DeadlineExceeded (errors.Is) while still unwrapping to the
+// *exec.ExitError, so timeouts are distinguishable from ordinary failures and
+// from cancellation (including the output-cap kill, which cancels the context).
 func WaitChild(role string, cmd *exec.Cmd, started time.Time, ctx context.Context, stdout, stderr *CappedBuffer) error {
-	err := cmd.Wait()
-	// A successful parent exit does not imply its descendants exited. Reap any
-	// remaining members when this process owns a dedicated process group. An
-	// inherited group is owned and reaped by its registered leader.
 	pgid := 0
 	if cmd != nil && cmd.Process != nil {
 		pgid = registeredProcessGroup(cmd.Process.Pid)
+		// An inherited group is owned and reaped by its registered leader.
 		if pgid > 0 && pgid == cmd.Process.Pid {
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			killGroupAfterLeaderExit(pgid)
 		}
 	}
+	err := cmd.Wait()
 	UnregisterChild(cmd)
+	if err != nil && ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("%w: %w", err, context.DeadlineExceeded)
+	}
 	var stdoutBytes, stderrBytes int64
 	if stdout != nil {
 		stdoutBytes = stdout.Total()
@@ -119,6 +134,25 @@ func WaitChild(role string, cmd *exec.Cmd, started time.Time, ctx context.Contex
 	exitStatus := exitCodeOf(err)
 	audit.Log("process.complete", "", processCompletionDetailsWithGroup(role, processID(cmd), strconv.Itoa(pgid), started, ctx, exitStatus, stdoutBytes, stderrBytes))
 	return err
+}
+
+// killGroupAfterLeaderExit blocks until the process pid has exited without
+// reaping it (waitid WNOWAIT), then SIGKILLs the process group pid. If the
+// leader cannot be observed (for example it was already reaped elsewhere) no
+// signal is sent, because the group id may no longer belong to this child.
+func killGroupAfterLeaderExit(pid int) {
+	var info unix.Siginfo
+	for {
+		err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return
+		}
+		break
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
 func processStartDetails(role string, pid int) map[string]string {

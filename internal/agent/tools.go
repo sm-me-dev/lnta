@@ -440,7 +440,8 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 
 	err = sandbox.WaitChild("mutate_system", cmd, childStarted, mctx, out, errOut)
 	var exitCode int
-	if ex, ok := err.(*exec.ExitError); ok {
+	var ex *exec.ExitError
+	if errors.As(err, &ex) {
 		exitCode = ex.ExitCode()
 	} else if err != nil {
 		exitCode = -1
@@ -458,7 +459,11 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		})
 	}
 
-	if ex, ok := err.(*exec.ExitError); ok {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("TOOL_ERROR: mutate_system timed out and its process group was killed\n--- stdout ---\n%s\n--- stderr ---\n%s",
+			out.Render(), errOut.Render()), nil
+	}
+	if ex != nil {
 		return fmt.Sprintf("exit_code=%d\n--- stdout ---\n%s\n--- stderr ---\n%s",
 			ex.ExitCode(), out.Render(), errOut.Render()), nil
 	}

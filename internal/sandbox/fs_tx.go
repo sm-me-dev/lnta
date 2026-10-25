@@ -1094,6 +1094,8 @@ func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin 
 		}
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	sshCmd := exec.CommandContext(ctx, "ssh",
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
@@ -1106,8 +1108,6 @@ func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin 
 	)
 	sshCmd.Stdin = stdin
 	ConfigureProcessGroup(sshCmd)
-	_, cancel := context.WithCancel(ctx)
-	defer cancel()
 	out := NewCappedBuffer(16*1024, 8<<20, cancel)
 	errOut := NewCappedBuffer(16*1024, 8<<20, cancel)
 	sshCmd.Stdout = out
