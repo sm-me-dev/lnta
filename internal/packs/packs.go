@@ -14,7 +14,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -42,12 +41,19 @@ type Pack struct {
 	RequiredBins []string `yaml:"required_bins" json:"required_bins"`
 	ContextCmd   string   `yaml:"context_cmd" json:"context_cmd"`
 	VerifyCmd    string   `yaml:"verify_cmd" json:"verify_cmd"`
+	// VerificationRequired defaults to true. A pack may explicitly set false
+	// only when task completion has no meaningful external check.
+	VerificationRequired *bool `yaml:"verification_required" json:"verification_required,omitempty"`
 
 	// Body is the markdown body following the frontmatter. Not part of YAML.
 	Body string `yaml:"-" json:"-"`
 
 	// source is the origin ("embedded:<file>" or "user:<file>") for debugging.
 	source string
+}
+
+func (p Pack) RequiresVerification() bool {
+	return p.VerificationRequired == nil || *p.VerificationRequired
 }
 
 // Router holds the loaded pack registry and performs intent routing.
@@ -76,7 +82,12 @@ func NewRouter(embedFS embed.FS, packGlob string, userDir string) (*Router, erro
 		for i := range loaded {
 			byID[loaded[i].ID] = &loaded[i]
 		}
+		seenUserIDs := make(map[string]bool, len(userPacks))
 		for i := range userPacks {
+			if seenUserIDs[userPacks[i].ID] {
+				return nil, fmt.Errorf("duplicate user pack id %q", userPacks[i].ID)
+			}
+			seenUserIDs[userPacks[i].ID] = true
 			byID[userPacks[i].ID] = &userPacks[i]
 		}
 		loaded = packsFromMap(byID)
@@ -115,6 +126,7 @@ func loadEmbedded(embedFS embed.FS, packGlob string) ([]Pack, error) {
 	sort.Strings(matches)
 
 	var packs []Pack
+	seenIDs := make(map[string]string)
 	for _, m := range matches {
 		data, err := fs.ReadFile(embedFS, m)
 		if err != nil {
@@ -124,6 +136,10 @@ func loadEmbedded(embedFS embed.FS, packGlob string) ([]Pack, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", m, err)
 		}
+		if prior, exists := seenIDs[p.ID]; exists {
+			return nil, fmt.Errorf("duplicate embedded pack id %q in %s and %s", p.ID, prior, m)
+		}
+		seenIDs[p.ID] = m
 		packs = append(packs, *p)
 	}
 	return packs, nil
@@ -143,6 +159,13 @@ func loadDir(dir string) ([]Pack, error) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("user pack %q is not a regular file", path)
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, err
@@ -236,7 +259,7 @@ func (r *Router) SelectPacks(prompt string, sys fingerprint.SystemContext) ([]Pa
 	promptBigrams := bigramSet(promptTokens)
 
 	type scored struct {
-		pack Pack
+		pack  Pack
 		score int
 	}
 	scoredPacks := make([]scored, 0, len(r.packs))
@@ -455,18 +478,4 @@ func (r *Router) AllPacks() []Pack {
 	copy(out, r.packs)
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
-}
-
-// placeholder regexp for future placeholder rendering in verify_cmd.
-var placeholderRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
-
-// RenderVerifyCmd replaces ${var} placeholders in the verify command.
-func RenderVerifyCmd(cmd string, vars map[string]string) string {
-	return placeholderRe.ReplaceAllStringFunc(cmd, func(match string) string {
-		name := match[2 : len(match)-1] // strip ${ }
-		if v, ok := vars[name]; ok {
-			return v
-		}
-		return match
-	})
 }

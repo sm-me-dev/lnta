@@ -5,7 +5,7 @@ triggers: []
 allowed_paths: []
 required_bins: []
 context_cmd: true
-verify_cmd: true
+verification_required: false
 ---
 # General Diagnostics
 

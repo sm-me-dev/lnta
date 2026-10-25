@@ -22,7 +22,7 @@ LNTA is built for production Linux systems. We maintain strict architectural con
 
 Before submitting code, review our non-negotiable architectural invariants:
 
-1. **Language & Stack**: Go 1.23+. CLI via `spf13/cobra`. Terminal UI/Output via `charmbracelet/lipgloss`, `bubbletea`, and `charmbracelet/huh`. YAML/Frontmatter via `gopkg.in/yaml.v3` and `adrg/frontmatter`. LLM Client via `sashabaranov/go-openai`.
+1. **Language & Stack**: Go 1.27.2+. CLI via `spf13/cobra`. Terminal UI/Output via `charmbracelet/lipgloss`, `bubbletea`, and `charmbracelet/huh`. YAML/Frontmatter via `gopkg.in/yaml.v3` and `adrg/frontmatter`. LLM Client via `sashabaranov/go-openai`.
 2. **Zero Raw Unbounded Bash**: The LLM **NEVER** gets a raw shell execution tool. It interacts with the operating system strictly through four typed tools:
    - `inspect_system`: Executes strictly inside `bwrap` with `--ro-bind / /`, `--tmpfs /tmp`, and `--tmpfs` masking `~/.ssh`, `~/.gnupg`, `~/.aws`, and `~/.config/lnta`. Stdin is `/dev/null`.
    - `write_scoped_file`: Atomically backs up existing target to `~/.local/share/lnta/snapshots/<run_id>/`, checks that target path matches the active Instruction Pack's `allowed_paths` glob, and writes via temp-file rename.
@@ -36,7 +36,7 @@ Before submitting code, review our non-negotiable architectural invariants:
 
 ### Prerequisites
 - Linux OS (Ubuntu 22.04+, Debian 12+, Fedora 39+, Arch, or openSUSE)
-- Go 1.23 or newer
+- Go 1.27.2 or newer
 - Bubblewrap (`bwrap`) installed (`sudo apt install bubblewrap` / `sudo dnf install bubblewrap`)
 - Recommended validators: `desktop-file-validate`, `systemd-analyze`, `shellcheck`, `ufw`, `iproute2` (`ss`)
 

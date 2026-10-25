@@ -107,13 +107,14 @@ bwrap \
 
 ### Tier 2: Linux Landlock LSM Fallback
 
-When `bwrap` is missing or blocked by kernel policies (e.g. hardened containers or restricted user namespaces), LNTA transparently falls back to **Linux Landlock** (kernel 5.13+):
+When `bwrap` is missing or blocked by kernel policies (e.g. hardened containers or restricted user namespaces), LNTA attempts the **Linux Landlock** backend. It requires ABI 10 and an additional seccomp network filter; older or restricted kernels are refused rather than run without isolation:
 
 1. **Self-Re-execution**: LNTA re-executes itself via a hidden internal command: `lnta __sandbox_exec`.
 2. **Landlock Ruleset Creation**: Restricts filesystem access rights to read-only (`LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_READ_DIR`).
 3. **No-New-Privs**: Invokes `prctl(PR_SET_NO_NEW_PRIVS, 1)` before applying the ruleset.
-4. **Network Socket Restrictions**: Enforces socket creation filters to block network egress.
-5. **Fail-Closed Guarantee**: If Landlock is unsupported on the running kernel and `bwrap` is unavailable, execution fails immediately rather than falling back to uncontained shell execution.
+4. **Network Socket Restrictions**: Landlock network rules are combined with seccomp that rejects creation of IPv4, IPv6, and MPTCP sockets. This does not revoke already-open descriptors; LNTA starts children without inherited application descriptors.
+5. **Host Process Protection**: Because Landlock has no PID namespace, the fallback does not grant `/proc` and blocks process signaling and inspection syscalls. Host process inspection is unavailable in this backend.
+6. **Fail-Closed Guarantee**: If Landlock or the required seccomp filters are unavailable, execution fails rather than falling back to uncontained shell execution.
 
 ---
 
@@ -121,12 +122,20 @@ When `bwrap` is missing or blocked by kernel policies (e.g. hardened containers 
 
 | Feature | Bubblewrap (`bwrap`) | Landlock LSM Fallback |
 |---|---|---|
-| **Kernel Requirements** | Linux 3.8+ (User Namespaces) | Linux 5.13+ (Landlock LSM enabled) |
+| **Kernel Requirements** | Linux user namespaces and required mounts | Landlock ABI 10 plus seccomp filter support |
 | **Filesystem Isolation** | Mount namespace (`--ro-bind / /`) | Kernel LSM syscall-level filtering |
-| **Network Isolation** | Network namespace (`--unshare-net`) | Landlock TCP bind/connect restrictions |
+| **Network Isolation** | Network namespace (`--unshare-net`) | Landlock network rules plus seccomp socket-family denial |
 | **Secret Masking** | Ephemeral `tmpfs` mounts over secret paths | Selective path access denial |
-| **PID Isolation** | Complete PID namespace (`--unshare-pid`) | Host PID table visible |
+| **PID Isolation** | Complete PID namespace (`--unshare-pid`) | No PID namespace; `/proc` is denied and process-control syscalls are blocked |
 | **Process Cleanup** | Automatic via `--die-with-parent` | PR_SET_PDEATHSIG signal handling |
+
+---
+
+### Remote SSH Inspection
+
+Remote inspection uses Bubblewrap on the target. LNTA probes the actual user, PID, network, IPC, UTS namespaces and required mounts before allowing any protected command; a missing binary, failed probe, or unsupported capability is an error. There is no plain-shell fallback. The remote profile uses a read-only root, private `/tmp`, `/var/tmp`, and `/run`, drops capabilities, clears the environment, disables SSH agent forwarding, and masks remote credential directories plus common credential files in the working directory. Remote scoped writes and native desktop-entry verification currently fail closed because their local snapshot and verifier guarantees are not implemented on the target. Remote inspection does not use the local Landlock fallback.
+
+The SSH client still uses the operator's configured SSH authentication and host-key policy. Remote commands run as the configured account, so Bubblewrap confines process access but does not replace remote account separation or protect against a compromised remote kernel/SSH server.
 
 ---
 

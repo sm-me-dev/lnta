@@ -853,7 +853,15 @@ func approveMutation(target string) agent.ApproveFunc {
 			shell.SanitizeForDisplay(cwd),
 			shell.SanitizeForDisplay(reason),
 		)
-		if riskLevel == sandbox.RiskCriticalDestructive.String() {
+		if riskLevel == "write" {
+			ok, err := shell.ConfirmWithTTY("write_scoped_file", desc)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "approval error: %v\n", err)
+				return false
+			}
+			return ok
+		}
+		{
 			challenge := sandbox.GenerateChallengeCode()
 			ok, err := shell.ConfirmChallengeWithTTY(fmt.Sprintf("mutate_system (%s risk)", riskLevel), desc, challenge)
 			if err != nil {
@@ -862,12 +870,6 @@ func approveMutation(target string) agent.ApproveFunc {
 			}
 			return ok
 		}
-		ok, err := shell.ConfirmWithTTY(fmt.Sprintf("mutate_system (%s risk)", riskLevel), desc)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "approval error: %v\n", err)
-			return false
-		}
-		return ok
 	}
 }
 
@@ -1023,8 +1025,6 @@ func runDoctor(cmd *cobra.Command) error {
 			fmt.Println(labelStyle.Render("OK"))
 		}
 	}
-
-
 
 	fmt.Println()
 	if allPassed {

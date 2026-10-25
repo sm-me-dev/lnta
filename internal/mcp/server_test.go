@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -108,40 +109,40 @@ func TestMCP_ToolsList(t *testing.T) {
 // TestMCP_JSONRPCRequestParsing tests JSON-RPC request parsing
 func TestMCP_JSONRPCRequestParsing(t *testing.T) {
 	tests := []struct {
-		name        string
-		input       string
-		wantMethod  string
-		wantError   bool
+		name       string
+		input      string
+		wantMethod string
+		wantError  bool
 	}{
 		{
-			name:        "valid initialize",
-			input:       `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`,
-			wantMethod:  "initialize",
-			wantError:   false,
+			name:       "valid initialize",
+			input:      `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`,
+			wantMethod: "initialize",
+			wantError:  false,
 		},
 		{
-			name:        "valid tools/list",
-			input:       `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
-			wantMethod:  "tools/list",
-			wantError:   false,
+			name:       "valid tools/list",
+			input:      `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+			wantMethod: "tools/list",
+			wantError:  false,
 		},
 		{
-			name:        "valid tools/call",
-			input:       `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lnta_inspect_sandboxed","arguments":{"command":"echo test","cwd":"/tmp","reason":"test"}}}`,
-			wantMethod:  "tools/call",
-			wantError:   false,
+			name:       "valid tools/call",
+			input:      `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lnta_inspect_sandboxed","arguments":{"command":"echo test","cwd":"/tmp","reason":"test"}}}`,
+			wantMethod: "tools/call",
+			wantError:  false,
 		},
 		{
-			name:        "different jsonrpc version (parsed but will be rejected by server)",
-			input:       `{"jsonrpc":"1.0","id":1,"method":"initialize"}`,
-			wantMethod:  "initialize",
-			wantError:   false,
+			name:       "different jsonrpc version (parsed but will be rejected by server)",
+			input:      `{"jsonrpc":"1.0","id":1,"method":"initialize"}`,
+			wantMethod: "initialize",
+			wantError:  false,
 		},
 		{
-			name:        "missing jsonrpc (parsed but will be rejected by server)",
-			input:       `{"id":1,"method":"initialize"}`,
-			wantMethod:  "initialize",
-			wantError:   false,
+			name:       "missing jsonrpc (parsed but will be rejected by server)",
+			input:      `{"id":1,"method":"initialize"}`,
+			wantMethod: "initialize",
+			wantError:  false,
 		},
 		{
 			name:      "invalid json",
@@ -430,23 +431,16 @@ This is a test pack.
 
 // TestMCP_VerifyTask tests the verify_task tool logic
 func TestMCP_VerifyTask(t *testing.T) {
-	// Test that verify_cmd placeholder substitution works
-	verifyCmd := `test -f "${target}"`
-	vars := map[string]string{"target": "/tmp/testfile"}
-	result := packs.RenderVerifyCmd(verifyCmd, vars)
-
-	expected := `test -f "/tmp/testfile"`
-	if result != expected {
-		t.Errorf("expected %q, got %q", expected, result)
+	command := `test -f "${target}" && test "$LNTA_TARGET" = "${target}"`
+	value := `a'; touch /tmp/marker; #`
+	env, err := makeMCPVerificationEnv(command, value)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// Test with multiple placeholders
-	verifyCmd2 := `echo "${target}" && echo "${unit}"`
-	vars2 := map[string]string{"target": "file.desktop", "unit": "myservice.service"}
-	result2 := packs.RenderVerifyCmd(verifyCmd2, vars2)
-
-	expected2 := `echo "file.desktop" && echo "myservice.service"`
-	if result2 != expected2 {
-		t.Errorf("expected %q, got %q", expected2, result2)
+	if !slices.Contains(env, "target="+value) || !slices.Contains(env, "LNTA_TARGET="+value) {
+		t.Fatalf("verification target was not passed as data: %q", env)
+	}
+	if _, err := makeMCPVerificationEnv(`test "${unit}"`, value); err == nil {
+		t.Fatal("unprovided verify_cmd placeholder was accepted")
 	}
 }

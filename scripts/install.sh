@@ -14,6 +14,8 @@ set -eu
 REPO="sm-me-dev/lnta"
 BINARY_NAME="lnta"
 INSTALL_DIR="/usr/local/bin"
+EXPECTED_KEY_FINGERPRINT="45BFE7B566C24F984EF00F6AEE0178A118050BDB"
+RELEASE_KEY_URL="https://raw.githubusercontent.com/${REPO}/main/scripts/apt/lnta-archive-keyring.asc"
 
 # Colors for output
 RED='\033[0;31m'
@@ -76,6 +78,10 @@ if [ -z "$VERSION" ]; then
   error "Failed to parse version from release"
   exit 1
 fi
+if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+  error "Release metadata contains an invalid version"
+  exit 1
+fi
 info "Latest version: $VERSION"
 
 # Determine asset name based on package format
@@ -88,10 +94,34 @@ esac
 
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/v${VERSION}/${ASSET}"
 CHECKSUMS_URL="https://github.com/$REPO/releases/download/v${VERSION}/checksums.txt"
+SIGNATURE_URL="${CHECKSUMS_URL}.sig"
 
 # Download to temp directory
 TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+STAGED_PATH=""
+cleanup() {
+  rm -rf "$TMPDIR"
+  if [ -n "$STAGED_PATH" ]; then
+    if [ -w "$INSTALL_DIR" ]; then rm -f "$STAGED_PATH"; else sudo rm -f "$STAGED_PATH"; fi
+  fi
+}
+trap cleanup EXIT
+
+if ! command -v gpg >/dev/null 2>&1 || ! command -v gpgv >/dev/null 2>&1; then
+  error "gpg and gpgv are required to authenticate release checksums"
+  exit 1
+fi
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$RELEASE_KEY_URL" -o "$TMPDIR/release-key.asc"
+else
+  wget -q "$RELEASE_KEY_URL" -O "$TMPDIR/release-key.asc"
+fi
+ACTUAL_KEY_FINGERPRINT=$(gpg --batch --show-keys --with-colons "$TMPDIR/release-key.asc" | awk -F: '$1 == "fpr" { print $10; exit }')
+if [ "$ACTUAL_KEY_FINGERPRINT" != "$EXPECTED_KEY_FINGERPRINT" ]; then
+  error "Release signing key fingerprint did not match the pinned LNTA key"
+  exit 1
+fi
+gpg --batch --dearmor --output "$TMPDIR/release-key.gpg" "$TMPDIR/release-key.asc"
 
 info "Downloading $ASSET..."
 if command -v curl >/dev/null 2>&1; then
@@ -117,6 +147,17 @@ elif command -v wget >/dev/null 2>&1; then
     error "Failed to download checksums"
     exit 1
   fi
+fi
+
+info "Downloading checksum signature..."
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$SIGNATURE_URL" -o "$TMPDIR/checksums.txt.sig"
+else
+  wget -q "$SIGNATURE_URL" -O "$TMPDIR/checksums.txt.sig"
+fi
+if ! gpgv --keyring "$TMPDIR/release-key.gpg" "$TMPDIR/checksums.txt.sig" "$TMPDIR/checksums.txt"; then
+  error "Release checksum signature is invalid"
+  exit 1
 fi
 
 # Verify checksum
@@ -169,11 +210,19 @@ case "$PKG_FMT" in
     ;;
   tar.gz)
     tar -xzf "$ASSET" -C "$TMPDIR"
+    if [ ! -f "$TMPDIR/$BINARY_NAME" ]; then error "Release archive did not contain $BINARY_NAME"; exit 1; fi
+    chmod 0755 "$TMPDIR/$BINARY_NAME"
     if [ -w "$INSTALL_DIR" ]; then
-      mv "$TMPDIR/$BINARY_NAME" "$INSTALL_DIR/"
+      STAGED_PATH=$(mktemp "$INSTALL_DIR/.${BINARY_NAME}.install.XXXXXX")
+      install -m 0755 "$TMPDIR/$BINARY_NAME" "$STAGED_PATH"
+      mv -f "$STAGED_PATH" "$INSTALL_DIR/$BINARY_NAME"
     else
-      sudo mv "$TMPDIR/$BINARY_NAME" "$INSTALL_DIR/"
+      sudo install -d -m 0755 "$INSTALL_DIR"
+      STAGED_PATH=$(sudo mktemp "$INSTALL_DIR/.${BINARY_NAME}.install.XXXXXX")
+      sudo install -m 0755 "$TMPDIR/$BINARY_NAME" "$STAGED_PATH"
+      sudo mv -f "$STAGED_PATH" "$INSTALL_DIR/$BINARY_NAME"
     fi
+    STAGED_PATH=""
     ;;
 esac
 

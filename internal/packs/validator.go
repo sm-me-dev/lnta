@@ -28,29 +28,29 @@ const (
 
 // ValidationIssue represents a single validation finding.
 type ValidationIssue struct {
-	Severity  ValidationSeverity `json:"severity"`
-	Field     string             `json:"field,omitempty"`
-	Message   string             `json:"message"`
-	PackID    string             `json:"pack_id,omitempty"`
-	Suggestion string            `json:"suggestion,omitempty"`
+	Severity   ValidationSeverity `json:"severity"`
+	Field      string             `json:"field,omitempty"`
+	Message    string             `json:"message"`
+	PackID     string             `json:"pack_id,omitempty"`
+	Suggestion string             `json:"suggestion,omitempty"`
 }
 
 // ValidationResult contains the results of validating a pack or directory.
 type ValidationResult struct {
-	PackID   string             `json:"pack_id"`
-	Path     string             `json:"path"`
-	Valid    bool               `json:"valid"`
-	Issues   []ValidationIssue  `json:"issues"`
-	Warnings []ValidationIssue  `json:"warnings"`
+	PackID   string            `json:"pack_id"`
+	Path     string            `json:"path"`
+	Valid    bool              `json:"valid"`
+	Issues   []ValidationIssue `json:"issues"`
+	Warnings []ValidationIssue `json:"warnings"`
 }
 
 // ValidatorConfig configures the pack validator.
 type ValidatorConfig struct {
-	StrictMode      bool     // Treat warnings as errors
-	CheckBinaries   bool     // Check if required_bins exist in PATH
-	RunContextCmd   bool     // Execute context_cmd in sandbox to validate
-	CheckTriggers   bool     // Check for trigger collisions across packs
-	UserPacksDir    string   // Optional user packs directory to also validate
+	StrictMode    bool   // Treat warnings as errors
+	CheckBinaries bool   // Check if required_bins exist in PATH
+	RunContextCmd bool   // Execute context_cmd in sandbox to validate
+	CheckTriggers bool   // Check for trigger collisions across packs
+	UserPacksDir  string // Optional user packs directory to also validate
 }
 
 // DefaultValidatorConfig returns a sensible default configuration.
@@ -111,10 +111,10 @@ func ValidatePack(path string, config ValidatorConfig) (ValidationResult, error)
 	if config.RunContextCmd && pack.ContextCmd != "" && pack.ContextCmd != "true" {
 		if err := validateContextCmd(pack, &result); err != nil {
 			result.Issues = append(result.Issues, ValidationIssue{
-				Severity:  SeverityError,
-				Field:     "context_cmd",
-				Message:   fmt.Sprintf("context_cmd execution failed: %v", err),
-				PackID:    pack.ID,
+				Severity:   SeverityError,
+				Field:      "context_cmd",
+				Message:    fmt.Sprintf("context_cmd execution failed: %v", err),
+				PackID:     pack.ID,
 				Suggestion: "Ensure context_cmd is a valid read-only command that exits 0 in the sandbox",
 			})
 		}
@@ -192,10 +192,10 @@ func ValidateEmbeddedPacks(embedFS embed.FS, packGlob string, config ValidatorCo
 		if config.RunContextCmd && pack.ContextCmd != "" && pack.ContextCmd != "true" {
 			if err := validateContextCmd(pack, &result); err != nil {
 				result.Issues = append(result.Issues, ValidationIssue{
-					Severity:  SeverityError,
-					Field:     "context_cmd",
-					Message:   fmt.Sprintf("context_cmd execution failed: %v", err),
-					PackID:    pack.ID,
+					Severity: SeverityError,
+					Field:    "context_cmd",
+					Message:  fmt.Sprintf("context_cmd execution failed: %v", err),
+					PackID:   pack.ID,
 				})
 			}
 		}
@@ -237,16 +237,19 @@ func validateRequiredFields(pack *Pack, result *ValidationResult) {
 			})
 		}
 	}
-	// allowed_paths, required_bins can be empty (read-only packs)
-	// context_cmd, verify_cmd can be empty but verify_cmd is recommended
-	if pack.VerifyCmd == "" && pack.ID != "general-diagnostics" {
-		result.Warnings = append(result.Warnings, ValidationIssue{
-			Severity:  SeverityWarning,
-			Field:     "verify_cmd",
-			Message:   "verify_cmd is empty - verification gate will not run",
-			PackID:    pack.ID,
-			Suggestion: "Add a verify_cmd to enable harness-enforced verification",
+	// Read-only packs still need an explicit verification policy. Missing
+	// verification is an error unless the pack opts out explicitly.
+	if pack.RequiresVerification() && strings.TrimSpace(pack.VerifyCmd) == "" {
+		result.Issues = append(result.Issues, ValidationIssue{
+			Severity:   SeverityError,
+			Field:      "verify_cmd",
+			Message:    "verify_cmd is required unless verification_required is false",
+			PackID:     pack.ID,
+			Suggestion: "Add a verifier or explicitly set verification_required: false",
 		})
+	}
+	if !pack.RequiresVerification() && strings.TrimSpace(pack.VerifyCmd) != "" {
+		result.Issues = append(result.Issues, ValidationIssue{Severity: SeverityError, Field: "verification_required", Message: "verification_required cannot be false while verify_cmd is configured", PackID: pack.ID})
 	}
 }
 
@@ -256,10 +259,10 @@ func validateFieldFormats(pack *Pack, result *ValidationResult) {
 	if pack.ID != "" {
 		if !regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`).MatchString(pack.ID) {
 			result.Warnings = append(result.Warnings, ValidationIssue{
-				Severity:  SeverityWarning,
-				Field:     "id",
-				Message:   fmt.Sprintf("id %q should be kebab-case (lowercase, alphanumeric, hyphens only)", pack.ID),
-				PackID:    pack.ID,
+				Severity:   SeverityWarning,
+				Field:      "id",
+				Message:    fmt.Sprintf("id %q should be kebab-case (lowercase, alphanumeric, hyphens only)", pack.ID),
+				PackID:     pack.ID,
 				Suggestion: "Use format like 'my-pack-name'",
 			})
 		}
@@ -278,10 +281,10 @@ func validateFieldFormats(pack *Pack, result *ValidationResult) {
 		}
 		if seenTriggers[t] {
 			result.Warnings = append(result.Warnings, ValidationIssue{
-				Severity:  SeverityWarning,
-				Field:     "triggers",
-				Message:   fmt.Sprintf("duplicate trigger: %q", t),
-				PackID:    pack.ID,
+				Severity:   SeverityWarning,
+				Field:      "triggers",
+				Message:    fmt.Sprintf("duplicate trigger: %q", t),
+				PackID:     pack.ID,
 				Suggestion: "Remove duplicate triggers",
 			})
 		}
@@ -299,10 +302,10 @@ func validateFieldFormats(pack *Pack, result *ValidationResult) {
 		}
 		if !regexp.MustCompile(`^[a-zA-Z0-9._-]+$`).MatchString(b) {
 			result.Warnings = append(result.Warnings, ValidationIssue{
-				Severity:  SeverityWarning,
-				Field:     "required_bins",
-				Message:   fmt.Sprintf("binary name %q contains unusual characters", b),
-				PackID:    pack.ID,
+				Severity: SeverityWarning,
+				Field:    "required_bins",
+				Message:  fmt.Sprintf("binary name %q contains unusual characters", b),
+				PackID:   pack.ID,
 			})
 		}
 	}
@@ -323,10 +326,10 @@ func validateAllowedPathsGlobs(pack *Pack, result *ValidationResult) {
 		// Check for path traversal attempts
 		if strings.Contains(glob, "..") {
 			result.Warnings = append(result.Warnings, ValidationIssue{
-				Severity:  SeverityWarning,
-				Field:     "allowed_paths",
-				Message:   fmt.Sprintf("glob %q contains '..' which may allow path traversal", glob),
-				PackID:    pack.ID,
+				Severity:   SeverityWarning,
+				Field:      "allowed_paths",
+				Message:    fmt.Sprintf("glob %q contains '..' which may allow path traversal", glob),
+				PackID:     pack.ID,
 				Suggestion: "Use absolute paths or ~ expansion instead of relative parent references",
 			})
 		}
@@ -336,18 +339,18 @@ func validateAllowedPathsGlobs(pack *Pack, result *ValidationResult) {
 		testPath := expandPathForGlobTest(glob)
 		if matched, err := filepath.Match(glob, testPath); err != nil {
 			result.Issues = append(result.Issues, ValidationIssue{
-				Severity:  SeverityError,
-				Field:     "allowed_paths",
-				Message:   fmt.Sprintf("invalid glob pattern %q: %v", glob, err),
-				PackID:    pack.ID,
+				Severity: SeverityError,
+				Field:    "allowed_paths",
+				Message:  fmt.Sprintf("invalid glob pattern %q: %v", glob, err),
+				PackID:   pack.ID,
 			})
 		} else if !matched {
 			// This is OK - glob might be for a different structure
 			result.Warnings = append(result.Warnings, ValidationIssue{
-				Severity:  SeverityInfo,
-				Field:     "allowed_paths",
-				Message:   fmt.Sprintf("glob %q does not match test path %q (may be OK if targeting different paths)", glob, testPath),
-				PackID:    pack.ID,
+				Severity: SeverityInfo,
+				Field:    "allowed_paths",
+				Message:  fmt.Sprintf("glob %q does not match test path %q (may be OK if targeting different paths)", glob, testPath),
+				PackID:   pack.ID,
 			})
 		}
 	}
@@ -367,7 +370,7 @@ func expandPathForGlobTest(glob string) string {
 
 // validateVerifyCmdPlaceholders checks that verify_cmd uses expected placeholders.
 func validateVerifyCmdPlaceholders(pack *Pack, result *ValidationResult) {
-	if pack.VerifyCmd == "" {
+	if pack.VerifyCmd == "" || !pack.RequiresVerification() {
 		return
 	}
 
@@ -377,26 +380,26 @@ func validateVerifyCmdPlaceholders(pack *Pack, result *ValidationResult) {
 
 	if len(matches) == 0 {
 		result.Warnings = append(result.Warnings, ValidationIssue{
-			Severity:  SeverityWarning,
-			Field:     "verify_cmd",
-			Message:   "verify_cmd has no ${placeholder} - verification may not be dynamic",
-			PackID:    pack.ID,
+			Severity:   SeverityWarning,
+			Field:      "verify_cmd",
+			Message:    "verify_cmd has no ${placeholder} - verification may not be dynamic",
+			PackID:     pack.ID,
 			Suggestion: "Use ${target} or ${unit} etc. to parameterize verification",
 		})
 	}
 
 	// Check for common expected placeholders based on pack type
 	expectedPlaceholders := map[string][]string{
-		"linux-desktop-entries":     {"target"},
-		"systemd-user-services":     {"unit"},
-		"systemd-timers-cron":       {"calendar_expr"},
-		"network-ports-processes":   {"port"},
+		"linux-desktop-entries":      {"target"},
+		"systemd-user-services":      {"unit"},
+		"systemd-timers-cron":        {"calendar_expr"},
+		"network-ports-processes":    {"port"},
 		"docker-compose-diagnostics": {"target"},
-		"ufw-firewall-ports":        {"rule_num"},
-		"udev-device-rules":         {"device"},
-		"ssh-gpg-permissions":       {"target"},
-		"disk-mounts-fstab":         {"target"},
-		"git-repo-hygiene":          {"branch_name"},
+		"ufw-firewall-ports":         {"rule_num"},
+		"udev-device-rules":          {"device"},
+		"ssh-gpg-permissions":        {"target"},
+		"disk-mounts-fstab":          {"target"},
+		"git-repo-hygiene":           {"branch_name"},
 	}
 
 	if expected, ok := expectedPlaceholders[pack.ID]; ok {
@@ -407,10 +410,10 @@ func validateVerifyCmdPlaceholders(pack *Pack, result *ValidationResult) {
 		for _, exp := range expected {
 			if !found[exp] {
 				result.Warnings = append(result.Warnings, ValidationIssue{
-					Severity:  SeverityInfo,
-					Field:     "verify_cmd",
-					Message:   fmt.Sprintf("verify_cmd missing expected placeholder ${%s} for pack type %s", exp, pack.ID),
-					PackID:    pack.ID,
+					Severity: SeverityInfo,
+					Field:    "verify_cmd",
+					Message:  fmt.Sprintf("verify_cmd missing expected placeholder ${%s} for pack type %s", exp, pack.ID),
+					PackID:   pack.ID,
 				})
 			}
 		}
@@ -422,10 +425,10 @@ func validateBinaries(pack *Pack, result *ValidationResult) {
 	for _, bin := range pack.RequiredBins {
 		if _, err := execLookPath(bin); err != nil {
 			result.Warnings = append(result.Warnings, ValidationIssue{
-				Severity:  SeverityWarning,
-				Field:     "required_bins",
-				Message:   fmt.Sprintf("required binary %q not found in PATH", bin),
-				PackID:    pack.ID,
+				Severity:   SeverityWarning,
+				Field:      "required_bins",
+				Message:    fmt.Sprintf("required binary %q not found in PATH", bin),
+				PackID:     pack.ID,
 				Suggestion: fmt.Sprintf("Install %s or remove from required_bins if optional", bin),
 			})
 		}

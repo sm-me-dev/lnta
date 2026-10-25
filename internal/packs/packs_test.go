@@ -2,10 +2,25 @@ package packs
 
 import (
 	"embed"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/sm-me-dev/lnta/internal/fingerprint"
 )
+
+func TestRouterRejectsDuplicateUserPackIDs(t *testing.T) {
+	dir := t.TempDir()
+	content := "---\nid: duplicate\nname: Duplicate\ntriggers: [test]\nallowed_paths: []\nverify_cmd: 'test -f \"${target}\"'\n---\nbody\n"
+	for _, name := range []string{"one.md", "two.md"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := NewRouter(testEmbedFS, "testdata/*.md", dir); err == nil {
+		t.Fatal("duplicate user pack IDs were accepted")
+	}
+}
 
 //go:embed testdata/*.md
 var testEmbedFS embed.FS
@@ -160,22 +175,6 @@ Some markdown.
 	}
 	if !stringsContains(p.Body, "# Body here") {
 		t.Errorf("body not captured: %q", p.Body)
-	}
-}
-
-func TestRenderVerifyCmd(t *testing.T) {
-	cmd := RenderVerifyCmd("test -f ${target} && ${extra}", map[string]string{
-		"target": "/tmp/foo",
-		"extra":  "echo done",
-	})
-	want := "test -f /tmp/foo && echo done"
-	if cmd != want {
-		t.Errorf("RenderVerifyCmd = %q, want %q", cmd, want)
-	}
-	// Unknown placeholder left unchanged.
-	cmd2 := RenderVerifyCmd("test ${missing}", nil)
-	if cmd2 != "test ${missing}" {
-		t.Errorf("unknown placeholder should be unchanged: %q", cmd2)
 	}
 }
 

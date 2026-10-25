@@ -17,20 +17,21 @@ import (
 type RunStatus string
 
 const (
-	RunStatusVerified   RunStatus = "VERIFIED"
-	RunStatusFailed     RunStatus = "FAILED"
-	RunStatusRolledBack RunStatus = "ROLLED_BACK"
+	RunStatusVerified    RunStatus = "VERIFIED"
+	RunStatusNotRequired RunStatus = "NOT_REQUIRED"
+	RunStatusFailed      RunStatus = "FAILED"
+	RunStatusRolledBack  RunStatus = "ROLLED_BACK"
 )
 
 // CommandRecord represents a command executed during a run.
 type CommandRecord struct {
-	Command     string    `json:"command"`
-	ExitCode    int       `json:"exit_code,omitempty"`
-	Stdout      string    `json:"stdout,omitempty"`
-	Stderr      string    `json:"stderr,omitempty"`
-	Timestamp   time.Time `json:"timestamp"`
-	Source      string    `json:"source"` // "inspect_system", "mutate_system", "verify_cmd"
-	Truncated   bool      `json:"truncated,omitempty"`
+	Command   string    `json:"command"`
+	ExitCode  int       `json:"exit_code,omitempty"`
+	Stdout    string    `json:"stdout,omitempty"`
+	Stderr    string    `json:"stderr,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+	Source    string    `json:"source"` // "inspect_system", "mutate_system", "verify_cmd"
+	Truncated bool      `json:"truncated,omitempty"`
 }
 
 // TokenUsage represents token consumption for a run.
@@ -42,16 +43,26 @@ type TokenUsage struct {
 
 // VerificationRecord represents a verification command result.
 type VerificationRecord struct {
-	Command     string    `json:"command"`
-	ExitCode    int       `json:"exit_code"`
-	Output      string    `json:"output,omitempty"`
-	Timestamp   time.Time `json:"timestamp"`
-	Passed      bool      `json:"passed"`
+	Command   string    `json:"command"`
+	ExitCode  int       `json:"exit_code"`
+	Output    string    `json:"output,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+	Passed    bool      `json:"passed"`
+	Status    string    `json:"status"`
 }
+
+const (
+	VerificationPassed      = "PASSED"
+	VerificationFailed      = "FAILED"
+	VerificationUnavailable = "UNAVAILABLE"
+	VerificationNotRequired = "NOT_REQUIRED"
+)
 
 // FileDiffInfo captures the essential diff information without importing
 // sandbox.FileDiff directly (to avoid import cycles with bwrap.go).
 type FileDiffInfo struct {
+	Status     string `json:"status"`
+	Error      string `json:"error,omitempty"`
 	TargetPath string `json:"target_path"`
 	Created    bool   `json:"created"`
 	OldMode    string `json:"old_mode,omitempty"`
@@ -65,19 +76,19 @@ type FileDiffInfo struct {
 
 // RunSummary captures all metadata for a single lnta run.
 type RunSummary struct {
-	RunID              string         `json:"run_id"`
-	Timestamp          time.Time      `json:"timestamp"`
-	Prompt             string         `json:"prompt"`
-	SelectedPack       string         `json:"selected_pack"`
-	CWD                string         `json:"cwd"`
-	Status             RunStatus      `json:"status"`
-	FilesChanged       []FileDiffInfo `json:"files_changed"`
-	CommandsExecuted   []CommandRecord `json:"commands_executed"`
-	TokensUsed         TokenUsage     `json:"tokens_used"`
+	RunID               string               `json:"run_id"`
+	Timestamp           time.Time            `json:"timestamp"`
+	Prompt              string               `json:"prompt"`
+	SelectedPack        string               `json:"selected_pack"`
+	CWD                 string               `json:"cwd"`
+	Status              RunStatus            `json:"status"`
+	FilesChanged        []FileDiffInfo       `json:"files_changed"`
+	CommandsExecuted    []CommandRecord      `json:"commands_executed"`
+	TokensUsed          TokenUsage           `json:"tokens_used"`
 	VerificationReceipt []VerificationRecord `json:"verification_receipt"`
-	Error              string         `json:"error,omitempty"`
-	Plan               string         `json:"plan,omitempty"`
-	ExitCode           int            `json:"exit_code"`
+	Error               string               `json:"error,omitempty"`
+	Plan                string               `json:"plan,omitempty"`
+	ExitCode            int                  `json:"exit_code"`
 }
 
 // summaryPath returns the summary.json path for a run id.
@@ -189,15 +200,15 @@ type RunSummaryCollector struct {
 func NewRunSummaryCollector(runID, prompt, pack, cwd string) *RunSummaryCollector {
 	return &RunSummaryCollector{
 		summary: &RunSummary{
-			RunID:            runID,
-			Timestamp:        time.Now().UTC(),
-			Prompt:           prompt,
-			SelectedPack:     pack,
-			CWD:              cwd,
-			Status:           RunStatusFailed, // Default to FAILED; updated on success
-			FilesChanged:     []FileDiffInfo{},
-			CommandsExecuted: []CommandRecord{},
-			TokensUsed:       TokenUsage{},
+			RunID:               runID,
+			Timestamp:           time.Now().UTC(),
+			Prompt:              prompt,
+			SelectedPack:        pack,
+			CWD:                 cwd,
+			Status:              RunStatusFailed, // Default to FAILED; updated on success
+			FilesChanged:        []FileDiffInfo{},
+			CommandsExecuted:    []CommandRecord{},
+			TokensUsed:          TokenUsage{},
 			VerificationReceipt: []VerificationRecord{},
 		},
 		budgetTokens: &TokenUsage{},

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -74,7 +76,8 @@ func toolCallResponse(name, args string) openai.ChatCompletionStreamResponse {
 	return openai.ChatCompletionStreamResponse{
 		Choices: []openai.ChatCompletionStreamChoice{
 			{
-				Index: 0,
+				Index:        0,
+				FinishReason: openai.FinishReasonToolCalls,
 				Delta: openai.ChatCompletionStreamChoiceDelta{
 					ToolCalls: []openai.ToolCall{
 						{
@@ -216,6 +219,147 @@ func TestMutateSystemBlockedWithoutApproval(t *testing.T) {
 	}
 }
 
+func TestScopedWriteRequiresApprovalAndBindsApprovedPreview(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "file")
+	pack := &packs.Pack{AllowedPaths: []string{filepath.Join(dir, "*")}}
+	args := mustMarshal(map[string]any{"path": target, "content": "new", "reason": "test"})
+	res, err := writeScopedFile(context.Background(), args, ToolDeps{Pack: pack, CWD: dir, Executor: transport.NewLocalExecutor("run-no-approval", dir, pack.AllowedPaths)})
+	if err != nil || !strings.Contains(res, "MUTATE_BLOCKED") {
+		t.Fatalf("nil approval callback result=%q error=%v", res, err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("file was written without approval: %v", err)
+	}
+	deps := ToolDeps{Pack: pack, CWD: dir, Executor: transport.NewLocalExecutor("run-approved", dir, pack.AllowedPaths), Approve: func(command, cwd, risk, detail string) bool {
+		return command == "write_scoped_file "+target && cwd == dir && risk == "write" && strings.Contains(detail, "Proposed diff:")
+	}}
+	res, err = writeScopedFile(context.Background(), args, deps)
+	if err != nil || !strings.Contains(res, "wrote") {
+		t.Fatalf("approved write result=%q error=%v", res, err)
+	}
+}
+
+func TestVerificationTargetResolutionAndEnvironmentData(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.desktop")
+	if err := os.WriteFile(target, []byte("[Desktop Entry]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	allowed := []string{filepath.Join(dir, "*.desktop")}
+	for _, input := range []string{target, "target.desktop"} {
+		resolved, err := resolveVerificationTarget(input, dir, allowed)
+		if err != nil || resolved != target {
+			t.Errorf("resolveVerificationTarget(%q) = %q, %v", input, resolved, err)
+		}
+	}
+	link := filepath.Join(dir, "link.desktop")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveVerificationTarget(link, dir, allowed); err == nil {
+		t.Fatal("symlink verification target was accepted")
+	}
+	if _, err := resolveVerificationTarget(filepath.Join(dir, "..", "outside.desktop"), dir, allowed); err == nil {
+		t.Fatal("path traversal target was accepted")
+	}
+	env, err := makeVerificationEnv(`test "${target}" = "$LNTA_TARGET" && test "${device}" = "$(touch /tmp/nope)"`, target, map[string]string{"device": "$(touch /tmp/nope)"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(env, "device=$(touch /tmp/nope)") {
+		t.Fatalf("input was not passed as data: %q", env)
+	}
+	if _, err := makeVerificationEnv(`tool "${missing}"`, target, nil); err == nil {
+		t.Fatal("missing verification placeholder was accepted")
+	}
+}
+
+func TestStreamedToolCallValidationRejectsMalformedAndRepeatedMutations(t *testing.T) {
+	tools := toolByName(CoreTools())
+	valid := &streamingToolCall{index: 0, id: "call-1", typ: string(openai.ToolTypeFunction), name: "mutate_system", args: `{"command":"echo safe"}`}
+	tests := []struct {
+		name  string
+		calls map[int]*streamingToolCall
+		order []int
+	}{
+		{name: "missing id", calls: map[int]*streamingToolCall{0: {index: 0, typ: string(openai.ToolTypeFunction), name: "inspect_system", args: `{"command":"id"}`}}, order: []int{0}},
+		{name: "invalid JSON", calls: map[int]*streamingToolCall{0: {index: 0, id: "call-1", typ: string(openai.ToolTypeFunction), name: "inspect_system", args: `{`}}, order: []int{0}},
+		{name: "unknown tool", calls: map[int]*streamingToolCall{0: {index: 0, id: "call-1", typ: string(openai.ToolTypeFunction), name: "shell", args: `{}`}}, order: []int{0}},
+		{name: "repeated mutation", calls: map[int]*streamingToolCall{0: valid, 1: {index: 1, id: "call-2", typ: string(openai.ToolTypeFunction), name: "mutate_system", args: `{"command":"echo safe"}`}}, order: []int{0, 1}},
+		{name: "complete with other call", calls: map[int]*streamingToolCall{0: {index: 0, id: "call-1", typ: string(openai.ToolTypeFunction), name: "complete_task", args: `{"summary":"done","target_artifacts":"x"}`}, 1: {index: 1, id: "call-2", typ: string(openai.ToolTypeFunction), name: "inspect_system", args: `{"command":"id"}`}}, order: []int{0, 1}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateStreamedToolCalls(tc.order, tc.calls, tools); err == nil {
+				t.Fatal("malformed streamed tool call set was accepted")
+			}
+		})
+	}
+}
+
+func TestMutateInvocationKeyDeduplicatesAliasesAndWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	first, err := mutateInvocationKey([]byte(`{"command":"echo x","cwd":"`+dir+`"}`), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := mutateInvocationKey([]byte(`{"cmd":"echo x","cwd":""}`), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("equivalent mutation keys differ: %q vs %q", first, second)
+	}
+}
+
+func TestNativeDesktopVerifierFailsWhenValidatorMissing(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "entry.desktop")
+	if err := os.WriteFile(target, []byte("[Desktop Entry]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := findDesktopValidator([]string{dir}); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("missing validator lookup result = %v", err)
+	}
+}
+
+func TestCompleteTaskDesktopVerificationPasses(t *testing.T) {
+	if err := sandbox.SandboxAvailable(); err != nil {
+		t.Skipf("sandbox unavailable: %v", err)
+	}
+	if _, err := exec.LookPath("desktop-file-validate"); err != nil {
+		t.Skipf("desktop-file-validate unavailable: %v", err)
+	}
+	dir := testDirUnderHome(t)
+	target := filepath.Join(dir, "entry.desktop")
+	content := "[Desktop Entry]\nName=Test\nExec=/usr/bin/true\nType=Application\n"
+	if err := os.WriteFile(target, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pack := &packs.Pack{ID: "linux-desktop-entries", VerifyCmd: `desktop-file-validate "${target}"`, AllowedPaths: []string{filepath.Join(dir, "*.desktop")}}
+	result, err := completeTask(context.Background(), mustMarshal(map[string]any{"summary": "checked", "target_artifacts": target}), ToolDeps{Pack: pack, CWD: dir, Executor: transport.NewLocalExecutor("test", dir, pack.AllowedPaths)})
+	if err != nil || !strings.Contains(result, "TASK_COMPLETE") {
+		t.Fatalf("result=%q error=%v", result, err)
+	}
+}
+
+func TestCompleteTaskMarksMissingVerifierUnavailable(t *testing.T) {
+	if err := sandbox.SandboxAvailable(); err != nil {
+		t.Skipf("sandbox unavailable: %v", err)
+	}
+	dir := testDirUnderHome(t)
+	target := filepath.Join(dir, "artifact")
+	if err := os.WriteFile(target, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pack := &packs.Pack{ID: "missing-verifier", VerifyCmd: `lnta-test-verifier-that-does-not-exist "$LNTA_TARGET"`, AllowedPaths: []string{filepath.Join(dir, "*")}}
+	result, err := completeTask(context.Background(), mustMarshal(map[string]any{"summary": "check", "target_artifacts": target}), ToolDeps{Pack: pack, CWD: dir, Executor: transport.NewLocalExecutor("test", dir, pack.AllowedPaths)})
+	if err != nil || !strings.Contains(result, "HARNESS_VERIFICATION_UNAVAILABLE") {
+		t.Fatalf("result=%q error=%v", result, err)
+	}
+}
+
 // TestOrchestratorSelfCorrectsAfterFailedVerify verifies the full loop: when
 // complete_task returns HARNESS_VERIFICATION_FAILED the loop continues and the
 // agent can self-correct on the next turn (mock LLM retries with a valid target).
@@ -258,7 +402,7 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 	o := New(llm, router,
 		WithRunID("run-t1"),
 		WithCWD(home),
-		WithApprove(func(_, _, _, _ string) bool { return false }),
+		WithApprove(func(_, _, _, _ string) bool { return true }),
 		WithMaxTurns(8),
 		WithConfig(&Config{Model: "test-model"}),
 		WithExecutor(transport.NewLocalExecutor("run-t1", home, nil)),
@@ -284,6 +428,9 @@ func TestOrchestratorValidDesktop(t *testing.T) {
 	// Skip if sandbox is not available (e.g., CI without user namespaces)
 	if err := sandbox.SandboxAvailable(); err != nil {
 		t.Skipf("skipping: sandbox unavailable (%v)", err)
+	}
+	if _, err := exec.LookPath("desktop-file-validate"); err != nil {
+		t.Skipf("skipping: required desktop validator unavailable (%v)", err)
 	}
 
 	tmpDir := testDirUnderHome(t)
@@ -334,7 +481,7 @@ Categories=Utility;
 	opts := []Option{
 		WithRunID("eval-test"),
 		WithCWD(tmpDir),
-		WithApprove(func(_, _, _, _ string) bool { return false }),
+		WithApprove(func(_, _, _, _ string) bool { return true }),
 		WithMaxTurns(8),
 		WithDryRun(false),
 		WithConfig(&Config{Model: "test-model"}),

@@ -41,6 +41,15 @@ In LNTA, **Instruction Packs** are self-contained Markdown files (`.md`) with YA
 
 User packs live in `~/.config/lnta/packs/` and take precedence over embedded system packs.
 
+### Trust and executable commands
+
+Instruction packs contain executable `context_cmd` and `verify_cmd` shell
+programs. User pack files are trusted local configuration and may override an
+embedded pack with the same ID. Validation checks structure and placeholders,
+but cannot prove a shell command safe. Commands run through LNTA's read-only
+sandbox, and their output can be sent to the configured model provider. Review
+user packs before installing them, and avoid writing secrets to command output.
+
 ---
 
 ## 5-Minute Quickstart Tutorial
@@ -317,7 +326,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.27.2'
       - name: Build LNTA
         run: go build -o lnta ./cmd/lnta
       - name: Validate Packs (Strict JSON)

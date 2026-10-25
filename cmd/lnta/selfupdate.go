@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"crypto/sha256"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,8 +30,13 @@ var (
 )
 
 const (
-	defaultGitHubRepo = "sm-me-dev/lnta"
+	defaultGitHubRepo      = "sm-me-dev/lnta"
+	releaseKeyFingerprint  = "45BFE7B566C24F984EF00F6AEE0178A118050BDB"
+	maxUpdateArtifactBytes = 100 << 20
 )
+
+//go:embed release-key.asc
+var releasePublicKey embed.FS
 
 var selfUpdateCmd = &cobra.Command{
 	Use:     "self-update",
@@ -219,9 +225,14 @@ func extractBinaryFromTarGz(r io.Reader, binaryName, destPath string) error {
 			if err != nil {
 				return fmt.Errorf("create output file %s: %w", destPath, err)
 			}
-			if _, err := io.Copy(outFile, tr); err != nil {
+			written, err := io.Copy(outFile, io.LimitReader(tr, maxUpdateArtifactBytes+1))
+			if err != nil {
 				outFile.Close()
 				return fmt.Errorf("write extracted binary: %w", err)
+			}
+			if written > maxUpdateArtifactBytes {
+				outFile.Close()
+				return fmt.Errorf("extracted binary exceeds %d-byte limit", maxUpdateArtifactBytes)
 			}
 			outFile.Close()
 			return nil
@@ -264,13 +275,17 @@ func fetchLatestRelease(repo string) (*githubRelease, error) {
 	}
 
 	var rel githubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rel); err != nil {
 		return nil, fmt.Errorf("decode release metadata: %w", err)
 	}
 	return &rel, nil
 }
 
 func downloadURLToBytes(url string) ([]byte, error) {
+	return downloadURLToBytesLimit(url, maxUpdateArtifactBytes)
+}
+
+func downloadURLToBytesLimit(url string, limit int64) ([]byte, error) {
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -281,7 +296,70 @@ func downloadURLToBytes(url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download %s: status %s", url, resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read download %s: %w", url, err)
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("download %s exceeds %d-byte limit", url, limit)
+	}
+	return data, nil
+}
+
+func verifyReleaseChecksums(checksums, signature []byte) error {
+	gpgPath, err := exec.LookPath("gpg")
+	if err != nil {
+		return fmt.Errorf("gpg is required to verify release signature: %w", err)
+	}
+	gpgvPath, err := exec.LookPath("gpgv")
+	if err != nil {
+		return fmt.Errorf("gpgv is required to verify release signature: %w", err)
+	}
+	key, err := releasePublicKey.ReadFile("release-key.asc")
+	if err != nil {
+		return fmt.Errorf("read embedded release key: %w", err)
+	}
+	fingerprintCmd := exec.Command(gpgPath, "--batch", "--show-keys", "--with-colons")
+	fingerprintCmd.Stdin = strings.NewReader(string(key))
+	fingerprintOutput, err := fingerprintCmd.Output()
+	if err != nil {
+		return fmt.Errorf("inspect embedded release key: %w", err)
+	}
+	var fingerprint string
+	for _, line := range strings.Split(string(fingerprintOutput), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) > 9 && fields[0] == "fpr" {
+			fingerprint = fields[9]
+			break
+		}
+	}
+	if fingerprint != releaseKeyFingerprint {
+		return fmt.Errorf("embedded release key fingerprint mismatch")
+	}
+	tmpDir, err := os.MkdirTemp("", "lnta-update-verify-*")
+	if err != nil {
+		return fmt.Errorf("create signature verification directory: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	keyPath := filepath.Join(tmpDir, "release-key.gpg")
+	dearmor := exec.Command(gpgPath, "--batch", "--dearmor", "--output", keyPath)
+	dearmor.Stdin = strings.NewReader(string(key))
+	if output, err := dearmor.CombinedOutput(); err != nil {
+		return fmt.Errorf("prepare embedded release key: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	checksumsPath := filepath.Join(tmpDir, "checksums.txt")
+	signaturePath := filepath.Join(tmpDir, "checksums.txt.sig")
+	if err := os.WriteFile(checksumsPath, checksums, 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(signaturePath, signature, 0o600); err != nil {
+		return err
+	}
+	verify := exec.Command(gpgvPath, "--keyring", keyPath, signaturePath, checksumsPath)
+	if output, err := verify.CombinedOutput(); err != nil {
+		return fmt.Errorf("release checksum signature verification failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func runSelfUpdate(checkOnly, force bool) error {
@@ -357,6 +435,7 @@ func runSelfUpdate(checkOnly, force bool) error {
 	targetAssetName := fmt.Sprintf("lnta_%s_linux_%s.tar.gz", latestVersion, arch)
 	var assetURL string
 	var checksumsURL string
+	var signatureURL string
 
 	for _, a := range rel.Assets {
 		if a.Name == targetAssetName {
@@ -364,6 +443,9 @@ func runSelfUpdate(checkOnly, force bool) error {
 		}
 		if a.Name == "checksums.txt" {
 			checksumsURL = a.BrowserDownloadURL
+		}
+		if a.Name == "checksums.txt.sig" {
+			signatureURL = a.BrowserDownloadURL
 		}
 	}
 
@@ -373,12 +455,22 @@ func runSelfUpdate(checkOnly, force bool) error {
 	if checksumsURL == "" {
 		return fmt.Errorf("release %s is missing checksums.txt", rel.TagName)
 	}
+	if signatureURL == "" {
+		return fmt.Errorf("release %s is missing the signed checksum file", rel.TagName)
+	}
 
 	// 6. Download checksums.txt and find expected hash
 	fmt.Println("Fetching release checksums...")
-	checksumsBytes, err := downloadURLToBytes(checksumsURL)
+	checksumsBytes, err := downloadURLToBytesLimit(checksumsURL, 1<<20)
 	if err != nil {
 		return fmt.Errorf("download checksums: %w", err)
+	}
+	signatureBytes, err := downloadURLToBytesLimit(signatureURL, 1<<20)
+	if err != nil {
+		return fmt.Errorf("download checksum signature: %w", err)
+	}
+	if err := verifyReleaseChecksums(checksumsBytes, signatureBytes); err != nil {
+		return err
 	}
 
 	expectedHash, err := parseChecksums(string(checksumsBytes), targetAssetName)
@@ -417,12 +509,43 @@ func runSelfUpdate(checkOnly, force bool) error {
 	if err := os.Chmod(tempPath, 0755); err != nil {
 		return fmt.Errorf("set executable permissions: %w", err)
 	}
+	if err := validateUpdateBinary(tempPath); err != nil {
+		return err
+	}
+	if f, err := os.OpenFile(tempPath, os.O_RDWR, 0); err != nil {
+		return fmt.Errorf("open staged update for sync: %w", err)
+	} else if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync staged update: %w", err)
+	} else {
+		_ = f.Close()
+	}
 
 	// 10. Atomically replace existing binary
 	if err := os.Rename(tempPath, evalPath); err != nil {
 		return fmt.Errorf("atomically replace %s: %w", evalPath, err)
 	}
+	if dir, err := os.Open(destDir); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
 
 	fmt.Printf("Successfully updated lnta from %s to %s at %s\n", lnta.Version, rel.TagName, evalPath)
+	return nil
+}
+
+func validateUpdateBinary(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open staged update binary: %w", err)
+	}
+	defer f.Close()
+	var magic [4]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return fmt.Errorf("staged update binary is incomplete: %w", err)
+	}
+	if magic != [4]byte{0x7f, 'E', 'L', 'F'} {
+		return fmt.Errorf("staged update is not a Linux ELF binary")
+	}
 	return nil
 }

@@ -10,11 +10,12 @@ import (
 )
 
 // Deterministic CLI exit codes for scripting and CI pipelines:
-//   0 = Completed & Verified
-//   1 = General / Execution Error
-//   2 = Verification Failed
-//   3 = User Cancelled / Approval Denied
-//   4 = Sandbox / Environment Error
+//
+//	0 = Completed & Verified
+//	1 = General / Execution Error
+//	2 = Verification Failed
+//	3 = User Cancelled / Approval Denied
+//	4 = Sandbox / Environment Error
 const (
 	ExitCodeSuccess            = 0
 	ExitCodeGeneralError       = 1
@@ -56,11 +57,12 @@ func NewExitError(code int, err error) *ExitError {
 
 // DetermineExitCode inspects execution error, result string, and run summary to return
 // the deterministic exit code according to CLI standards:
-//   0: Completed & Verified
-//   1: General / Execution Error
-//   2: Verification Failed
-//   3: User Cancelled / Approval Denied
-//   4: Sandbox / Environment Error
+//
+//	0: Completed & Verified
+//	1: General / Execution Error
+//	2: Verification Failed
+//	3: User Cancelled / Approval Denied
+//	4: Sandbox / Environment Error
 func DetermineExitCode(err error, result string, summary *audit.RunSummary) int {
 	if err != nil {
 		var exitCoder ExitCoder
@@ -97,12 +99,15 @@ func DetermineExitCode(err error, result string, summary *audit.RunSummary) int 
 		strings.Contains(result, "approval error") {
 		return ExitCodeUserCancelled
 	}
-	if strings.Contains(result, "HARNESS_VERIFICATION_FAILED") {
+	if strings.Contains(result, "HARNESS_VERIFICATION_FAILED") || strings.Contains(result, "HARNESS_VERIFICATION_UNAVAILABLE") {
 		return ExitCodeVerificationFailed
 	}
 
 	if summary != nil {
 		if summary.Status == audit.RunStatusVerified {
+			return ExitCodeSuccess
+		}
+		if summary.Status == audit.RunStatusNotRequired {
 			return ExitCodeSuccess
 		}
 		if summary.Status == audit.RunStatusFailed {
@@ -135,5 +140,5 @@ func DetermineExitCode(err error, result string, summary *audit.RunSummary) int 
 		return ExitCodeSuccess
 	}
 
-	return ExitCodeSuccess
+	return ExitCodeGeneralError
 }

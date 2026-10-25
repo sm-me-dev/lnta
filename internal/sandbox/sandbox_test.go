@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -214,5 +216,188 @@ func TestScopedWriteFileNewFileAndRollback(t *testing.T) {
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("expected new file to be deleted after rollback, stat=%v", err)
+	}
+}
+
+func TestScopedWriteRejectsEmptyAllowlistAndSymlinkTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if _, err := ScopedWriteFile("run-empty-scope", target, []byte("x"), nil); err == nil {
+		t.Fatal("empty write allowlist unexpectedly permitted a write")
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, target); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ScopedWriteFile("run-symlink-target", target, []byte("replace"), []string{filepath.Join(dir, "*")})
+	if err == nil {
+		t.Fatal("symlink target unexpectedly permitted a write")
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil || string(got) != "keep" {
+		t.Fatalf("outside target changed: content=%q error=%v", got, err)
+	}
+}
+
+func TestScopedWriteRejectsParentSymlinkEscapeAndHardLinks(t *testing.T) {
+	base := t.TempDir()
+	inside := filepath.Join(base, "inside")
+	outside := filepath.Join(base, "outside")
+	if err := os.Mkdir(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "parent")
+	if err := os.Symlink(inside, link); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(snapshotDir("run-parent-link"))
+	_, err := ScopedWriteFile("run-parent-link", filepath.Join(link, "file"), []byte("x"), []string{filepath.Join(inside, "*")})
+	if err != nil {
+		t.Fatalf("canonical in-scope parent symlink should resolve safely: %v", err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err = ScopedWriteFile("run-parent-escape", filepath.Join(link, "escape"), []byte("x"), []string{filepath.Join(inside, "*")})
+	if err == nil {
+		t.Fatal("parent symlink escaping the allowed root was accepted")
+	}
+
+	target := filepath.Join(inside, "linked")
+	alias := filepath.Join(inside, "alias")
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	_, err = ScopedWriteFile("run-hardlink", target, []byte("replacement"), []string{filepath.Join(inside, "*")})
+	if err == nil || !strings.Contains(err.Error(), "multiple hard links") {
+		t.Fatalf("hard-linked target was not rejected: %v", err)
+	}
+}
+
+func TestScopedWriteApprovalPreviewDetectsConcurrentMutation(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "config")
+	if err := os.WriteFile(target, []byte("original"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	allowed := []string{filepath.Join(dir, "*")}
+	preview, err := PreviewScopedWrite(target, []byte("approved"), allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("external change"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	_, err = ScopedWriteFileApproved("run-preview-race", target, []byte("approved"), allowed, &preview)
+	if err == nil || !strings.Contains(err.Error(), "changed after approval") {
+		t.Fatalf("stale approval was not rejected: %v", err)
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != "external change" {
+		t.Fatalf("concurrent content was overwritten: %q", got)
+	}
+}
+
+func TestScopedWriteUsesRequestedCreateModeAndRollbackRejectsConflict(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "new")
+	allowed := []string{filepath.Join(dir, "*")}
+	runID := "run-mode-conflict"
+	defer os.RemoveAll(snapshotDir(runID))
+	diff, err := ScopedWriteFileApprovedMode(runID, target, []byte("created"), 0o600, allowed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.Mode.Perm() != 0o600 {
+		t.Fatalf("reported mode = %o, want 600", diff.Mode.Perm())
+	}
+	info, err := os.Stat(target)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("created mode = %v, error=%v", info, err)
+	}
+	if err := os.WriteFile(target, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RollbackRun(runID); err == nil || !strings.Contains(err.Error(), "concurrent modification") {
+		t.Fatalf("rollback conflict was not surfaced: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != "external" {
+		t.Fatalf("rollback overwrote external content: %q, %v", got, err)
+	}
+}
+
+func TestScopedWriteConcurrentWritersLeaveCompleteContent(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "shared")
+	allowed := []string{filepath.Join(dir, "*")}
+	const workers = 8
+	for i := 0; i < workers; i++ {
+		defer os.RemoveAll(snapshotDir(fmt.Sprintf("run-concurrent-%d", i)))
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := ScopedWriteFile(fmt.Sprintf("run-concurrent-%d", i), target, []byte(strings.Repeat(string(rune('a'+i)), 10000)), allowed)
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent write failed: %v", err)
+		}
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || len(got) != 10000 {
+		t.Fatalf("concurrent write left partial content: size=%d error=%v", len(got), err)
+	}
+	for _, b := range got {
+		if b != got[0] {
+			t.Fatal("concurrent write left mixed content")
+		}
+	}
+}
+
+func TestLandlockRequiresCompleteNetworkConfinementABI(t *testing.T) {
+	if err := checkLandlockABI(minLandlockABI - 1); !errors.Is(err, ErrLandlockUnavailable) {
+		t.Fatalf("ABI below minimum accepted: %v", err)
+	}
+	if err := checkLandlockABI(minLandlockABI); err != nil {
+		t.Fatalf("minimum supported ABI rejected: %v", err)
+	}
+}
+
+func TestLandlockFallbackDoesNotExposeHostProcfs(t *testing.T) {
+	cfg := buildLandlockConfig("/tmp", "/tmp", "/tmp/lnta-private", "true", nil)
+	for _, dir := range cfg.RODirs {
+		if dir == "/proc" {
+			t.Fatal("Landlock fallback exposes host procfs")
+		}
+	}
+}
+
+func TestScopedWriteRejectsUnboundedDiffInput(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "large")
+	_, err := PreviewScopedWrite(target, bytes.Repeat([]byte{'x'}, maxScopedFileBytes+1), []string{filepath.Join(dir, "*")})
+	if err == nil || !strings.Contains(err.Error(), "limited") {
+		t.Fatalf("oversized write preview was not rejected: %v", err)
 	}
 }

@@ -83,11 +83,24 @@ archives:
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
+signs:
+  - artifacts: checksum
+    cmd: gpg
+    args:
+      - "--batch"
+      - "--yes"
+      - "-u"
+      - "{{ .Env.GPG_FINGERPRINT }}"
+      - "--output"
+      - "${signature}"
+      - "--detach-sign"
+      - "${artifact}"
 release:
   github:
     owner: sm-me-dev
     name: lnta
-  draft: false
+  draft: true
+  use_existing_draft: true
   prerelease: auto
   name_template: "v{{.Version}}"
 changelog:

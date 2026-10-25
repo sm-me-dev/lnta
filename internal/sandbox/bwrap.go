@@ -67,9 +67,10 @@ func probeBwrap() error {
 
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, bwrap,
-		"--unshare-user", "--unshare-pid", "--unshare-net",
-		"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-		"--", "true")
+		"--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-net",
+		"--unshare-uts", "--unshare-cgroup-try", "--new-session", "--die-with-parent",
+		"--cap-drop", "ALL", "--clearenv", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+		"--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run", "--", "true")
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = &stderr
@@ -127,6 +128,7 @@ func secretMaskFiles(home string) []string {
 		".git-credentials", ".netrc", ".npmrc", ".pypirc", ".vault-token",
 		".bash_history", ".zsh_history", ".python_history", ".psql_history",
 		".mysql_history", ".lesshst", ".viminfo", ".node_repl_history", ".sqlite_history",
+		".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zprofile", ".zlogin", ".pam_environment",
 		filepath.Join(".config", "git", "credentials"),
 		filepath.Join(".cargo", "credentials.toml"),
 		filepath.Join(".cargo", "credentials"),
@@ -288,7 +290,6 @@ func exitCodeOf(err error) int {
 	return 126
 }
 
-
 // runBwrapEnv is runBwrap with extra KEY=VALUE environment entries (used to
 // pass verify_cmd arguments as data, never as shell text).
 func runBwrapEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
@@ -314,7 +315,7 @@ func runBwrapEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 	args := append(bwrapArgs(home, absCwd, extraEnv), "sh", "-c", cmdStr)
 
 	cmd := exec.CommandContext(ctx, bwrap, args...)
-	cmd.Stdin = nil // /dev/null
+	cmd.Stdin = nil                                         // /dev/null
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"} // bwrap itself: nothing from the host
 	ConfigureProcessGroup(cmd)
 
@@ -363,10 +364,10 @@ func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 //
 // It automatically selects the best available backend:
 //
-//  1. Tier 1 (bwrap): if bwrap can create its namespaces.
+//  1. Tier 1 (bwrap): if bwrap can create its namespaces and required mounts.
 //  2. Tier 2 (Landlock): if bwrap is missing or blocked (AppArmor userns
-//     restriction), via self-re-exec; requires Landlock ABI >= 4 or it
-//     refuses to run (fail closed).
+//     restriction), via self-re-exec; requires Landlock ABI >= 10 plus
+//     network-denying seccomp or it refuses to run (fail closed).
 //
 // The sandbox:
 //   - read-only root; private tmpfs /tmp, /var/tmp, /run (no host sockets)

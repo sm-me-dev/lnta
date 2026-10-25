@@ -3,12 +3,7 @@
 package transport
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -63,24 +58,25 @@ func NewSSHExecutor(target, runID, cwd string) (*SSHExecutor, error) {
 	}
 
 	return &SSHExecutor{
-		user:        user,
-		host:        host,
-		port:        port,
-		runID:       runID,
-		cwd:         cwd,
+		user:  user,
+		host:  host,
+		port:  port,
+		runID: runID,
+		cwd:   cwd,
 	}, nil
 }
 
 // Preflight performs one-time remote fingerprinting and connection validation.
 func (e *SSHExecutor) Preflight(ctx context.Context) error {
-	// Since we use system ssh, just parse available info
-	// We'll set a basic fingerprint from the SSH connection attempt
 	if e.fingerprint != nil {
+		if !e.fingerprint.HasBwrap {
+			return fmt.Errorf("remote sandbox unavailable: %s", e.fingerprint.SandboxError)
+		}
 		return nil
 	}
 
 	// Try to execute the fingerprint command via system ssh
-	fpCmd := `source /etc/os-release 2>/dev/null; echo "OS_RELEASE_ID=$ID"; echo "PATH=$PATH"; echo "UID=$(id -u)"; echo "GID=$(id -g)"; echo "USER=$(whoami)"; for b in bwrap systemctl desktop-file-validate ss ufw git; do command -v "$b" >/dev/null && echo "BIN:$b=1" || echo "BIN:$b=0"; done`
+	fpCmd := `(. /etc/os-release 2>/dev/null || true); printf 'OS_RELEASE_ID=%s\nPATH=%s\nHOME=%s\nUID=%s\nGID=%s\nUSER=%s\n' "${ID:-}" "$PATH" "$HOME" "$(id -u)" "$(id -g)" "$(id -un)"; for b in bwrap python3 systemctl desktop-file-validate ss ufw git; do command -v "$b" >/dev/null 2>&1 && echo "BIN:$b=1" || echo "BIN:$b=0"; done`
 
 	result, err := runSystemSSH(ctx, e.user, e.host, strconv.Itoa(e.port), fpCmd, nil, 15*time.Second)
 	if err != nil {
@@ -107,6 +103,8 @@ func (e *SSHExecutor) Preflight(ctx context.Context) error {
 			fp.OSRelease["ID"] = strings.TrimPrefix(line, "OS_RELEASE_ID=")
 		} else if strings.HasPrefix(line, "PATH=") {
 			fp.Path = strings.TrimPrefix(line, "PATH=")
+		} else if strings.HasPrefix(line, "HOME=") {
+			fp.Home = strings.TrimPrefix(line, "HOME=")
 		} else if strings.HasPrefix(line, "UID=") {
 			if u, err := strconv.Atoi(strings.TrimPrefix(line, "UID=")); err == nil {
 				fp.UID = u
@@ -121,23 +119,46 @@ func (e *SSHExecutor) Preflight(ctx context.Context) error {
 			parts := strings.SplitN(strings.TrimPrefix(line, "BIN:"), "=", 2)
 			if len(parts) == 2 {
 				fp.Binaries[parts[0]] = parts[1] == "1"
-				if parts[0] == "bwrap" && parts[1] == "1" {
-					fp.HasBwrap = true
-				}
 			}
 		}
 	}
 
+	// Presence is not capability. Execute the required isolation profile and
+	// fail closed if user namespaces, networking isolation, or mounts cannot
+	// be established on the remote host.
+	if !fp.Binaries["bwrap"] {
+		fp.SandboxError = "bubblewrap is not installed"
+	} else if !filepath.IsAbs(fp.Home) || filepath.Clean(fp.Home) != fp.Home {
+		fp.SandboxError = "remote home directory is missing or invalid"
+	} else {
+		probe := `bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run --unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts --cap-drop ALL --new-session --die-with-parent --clearenv --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -- /bin/sh -c 'test -r /etc/os-release'`
+		if _, probeErr := runSystemSSH(ctx, e.user, e.host, strconv.Itoa(e.port), probe, nil, 15*time.Second); probeErr != nil {
+			fp.SandboxError = "bubblewrap capability probe failed (required namespaces or mounts unavailable)"
+		} else {
+			fp.HasBwrap = true
+		}
+	}
+
 	e.fingerprint = fp
-	if e.fingerprint == nil {
-		return fmt.Errorf("preflight failed: could not fingerprint remote host")
+	if !fp.HasBwrap {
+		return fmt.Errorf("remote sandbox unavailable: %s", fp.SandboxError)
 	}
 	return nil
 }
 
 // RunReadOnly executes a read-only command on the remote host.
 func (e *SSHExecutor) RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (sandbox.CommandResult, error) {
-	remoteCmd := e.buildRemoteCommand(cmdStr)
+	return e.RunReadOnlyEnv(ctx, cmdStr, cwd, timeout, nil)
+}
+
+func (e *SSHExecutor) RunReadOnlyEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error) {
+	if e.fingerprint == nil || !e.fingerprint.HasBwrap {
+		return sandbox.CommandResult{}, fmt.Errorf("remote sandbox unavailable: run successful Preflight first")
+	}
+	remoteCmd, err := e.buildRemoteCommand(cmdStr, cwd, extraEnv)
+	if err != nil {
+		return sandbox.CommandResult{}, err
+	}
 	result, err := runSystemSSH(ctx, e.user, e.host, strconv.Itoa(e.port), remoteCmd, nil, timeout)
 	if err != nil {
 		return sandbox.CommandResult{}, err
@@ -153,13 +174,56 @@ func (e *SSHExecutor) RunReadOnly(ctx context.Context, cmdStr string, cwd string
 }
 
 // buildRemoteCommand wraps the command for remote execution with sandboxing if bwrap available.
-func (e *SSHExecutor) buildRemoteCommand(cmdStr string) string {
-	if e.fingerprint != nil && e.fingerprint.HasBwrap {
-		// Use bwrap for sandboxed execution on remote
-		return fmt.Sprintf("bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --unshare-net --unshare-ipc --unshare-pid --new-session --die-with-parent -- sh -c %s", shellQuote(cmdStr))
+func (e *SSHExecutor) buildRemoteCommand(cmdStr, cwd string, extraEnv []string) (string, error) {
+	if e.fingerprint == nil || !e.fingerprint.HasBwrap {
+		return "", fmt.Errorf("remote sandbox unavailable: protected command refused")
 	}
-	// Fallback: strict non-interactive shell
-	return fmt.Sprintf("sh -c %s", shellQuote(cmdStr))
+	if cwd == "" {
+		cwd = e.cwd
+	}
+	if cwd == "" {
+		cwd = e.fingerprint.Home
+	}
+	if !filepath.IsAbs(cwd) || filepath.Clean(cwd) != cwd {
+		return "", fmt.Errorf("invalid remote working directory")
+	}
+	args := []string{"bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run", "--unshare-user", "--unshare-pid", "--unshare-net", "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL", "--new-session", "--die-with-parent", "--clearenv", "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "--setenv", "HOME", "/tmp/lnta-home", "--chdir", cwd}
+	args = append(args, "--dir", "/tmp/lnta-home")
+	for _, item := range extraEnv {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || !validSandboxEnvKey(key) || strings.ContainsRune(value, 0) {
+			return "", fmt.Errorf("invalid sandbox environment entry")
+		}
+		args = append(args, "--setenv", key, value)
+	}
+	for _, secret := range []string{".ssh", ".gnupg", ".aws", ".kube", ".config/lnta", ".config/gcloud", ".azure"} {
+		args = append(args, "--tmpfs", filepath.Join(e.fingerprint.Home, secret))
+	}
+	// Mask common credential/config files at the remote working directory.
+	// --ro-bind-try makes absent paths harmless while overlaying existing files
+	// with /dev/null inside the sandbox.
+	for _, secret := range []string{".env", ".env.local", ".env.production", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".gitconfig", ".bashrc", ".bash_profile", ".zshrc", ".zprofile"} {
+		args = append(args, "--ro-bind-try", "/dev/null", filepath.Join(cwd, secret))
+	}
+	args = append(args, "--", "/bin/sh", "-c", cmdStr)
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		quoted[i] = shellQuote(arg)
+	}
+	return strings.Join(quoted, " "), nil
+}
+
+func validSandboxEnvKey(key string) bool {
+	if key == "" || strings.ContainsAny(key, "=\x00") || key == "PATH" || key == "HOME" || key == "LD_PRELOAD" || key == "BASH_ENV" || key == "ENV" {
+		return false
+	}
+	for i, r := range key {
+		valid := (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_' || (i > 0 && r >= '0' && r <= '9')
+		if !valid {
+			return false
+		}
+	}
+	return true
 }
 
 // shellQuote safely quotes a string for use in a shell command.
@@ -237,6 +301,10 @@ func runSystemSSH(ctx context.Context, user, host, port, cmdStr string, stdin io
 		"-o", "ServerAliveCountMax=3",
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "ControlMaster=no",
+		"-o", "ForwardAgent=no",
+		"-o", "ClearAllForwardings=yes",
+		"-o", "RequestTTY=no",
+		"-o", "PermitLocalCommand=no",
 		"-o", fmt.Sprintf("ControlPath=%s/ssh-%%r@%%h:%%p", controlDir),
 		"-p", strconv.Itoa(portInt),
 		"--", user + "@" + host,
@@ -283,13 +351,6 @@ func runSystemSSH(ctx context.Context, user, host, port, cmdStr string, stdin io
 		Duration:  duration,
 		Truncated: out.Truncated() || errOut.Truncated(),
 	}, nil
-}
-
-// runSSH executes a script on the remote host with the given stdin streamed
-// to the remote command. This is the binary-safe replacement for heredoc writes.
-func (e *SSHExecutor) runSSH(ctx context.Context, script string, stdin io.Reader) error {
-	_, err := runSystemSSH(ctx, e.user, e.host, strconv.Itoa(e.port), script, stdin, 30*time.Second)
-	return err
 }
 
 // CommandResult mirrors sandbox.CommandResult for transport package.
@@ -349,48 +410,11 @@ func (r *remoteFileInfo) IsDir() bool        { return r.isDir }
 func (r *remoteFileInfo) Sys() interface{}   { return nil }
 
 // WriteFile writes a file to the remote host, creating a local snapshot first.
-func (e *SSHExecutor) WriteFile(ctx context.Context, path string, content []byte, mode os.FileMode) (string, os.FileInfo, error) {
-	// 1. Read original file for snapshot (if exists)
-	var originalContent []byte
-	var originalMode os.FileMode = 0o644
-	var existed bool
-
-	if _, err := e.StatFile(ctx, path); err == nil {
-		existed = true
-		origContent, info, err := e.ReadFile(ctx, path)
-		if err == nil {
-			originalContent = origContent
-			originalMode = info.Mode()
-		}
-	}
-
-	// 2. Save snapshot LOCALLY
-	if err := e.saveRemoteSnapshot(path, originalContent, originalMode, existed); err != nil {
-		return "", nil, fmt.Errorf("save remote snapshot: %w", err)
-	}
-
-	// 3. Write new content via SSH. Stream bytes over stdin; no heredoc parser
-	// to confuse, so content containing "LNTA_EOF" cannot terminate early.
-	script := fmt.Sprintf("umask %03o; cat > %s", mode.Perm(), shellQuote(path))
-	if err := e.runSSH(ctx, script, bytes.NewReader(content)); err != nil {
-		return "", nil, fmt.Errorf("write remote file: %w", err)
-	}
-
-	// 4. Get updated file info
-	info, err := e.StatFile(ctx, path)
-	if err != nil {
-		return "", nil, err
-	}
-
-	// Return resolved path (expand ~)
-	resolved := path
-	if len(resolved) > 0 && resolved[0] == '~' {
-		home, _ := os.UserHomeDir()
-		resolved = filepath.Join(home, resolved[1:])
-	}
-	resolved = filepath.Clean(resolved)
-
-	return resolved, info, nil
+func (e *SSHExecutor) WriteFile(ctx context.Context, path string, content []byte, mode os.FileMode, allowedGlobs []string, expected *sandbox.FileDiff) (sandbox.FileDiff, error) {
+	// The previous implementation used `cat > path`, which followed symlinks,
+	// ignored the pack allowlist and could leave partial writes. Refuse remote
+	// writes until a descriptor-relative remote writer is available.
+	return sandbox.FileDiff{}, fmt.Errorf("remote scoped writes are unavailable: secure atomic remote writer is not configured")
 }
 
 // StatFile stats a file on the remote host.
@@ -418,110 +442,6 @@ func (e *SSHExecutor) StatFile(ctx context.Context, path string) (os.FileInfo, e
 		modTime: time.Unix(mtime, 0),
 		isDir:   false,
 	}, nil
-}
-
-// saveRemoteSnapshot saves a backup of a remote file locally before modification.
-func (e *SSHExecutor) saveRemoteSnapshot(path string, content []byte, mode os.FileMode, existed bool) error {
-	// Get snapshot root
-	home, _ := os.UserHomeDir()
-	snapRoot := filepath.Join(home, ".local", "share", "lnta", "snapshots")
-	snapDir := filepath.Join(snapRoot, e.runID)
-
-	// Remote-specific subdirectory: remote_user@host:port
-	remoteDirName := fmt.Sprintf("remote_%s@%s:%d", e.user, e.host, e.port)
-	remoteDir := filepath.Join(snapDir, remoteDirName)
-	if err := os.MkdirAll(remoteDir, 0o700); err != nil {
-		return err
-	}
-
-	// Generate backup blob name
-	var shaHex string
-	if len(content) > 0 {
-		sum := sha256.Sum256(content)
-		shaHex = hex.EncodeToString(sum[:8])
-	} else {
-		// For new files, generate random suffix
-		b := make([]byte, 4)
-		if _, err := rand.Read(b); err != nil {
-			return fmt.Errorf("generate backup suffix: %w", err)
-		}
-		shaHex = hex.EncodeToString(b)
-	}
-
-	blobName := fmt.Sprintf("backup-%s.bin", shaHex)
-	blobPath := filepath.Join(remoteDir, blobName)
-
-	if existed && len(content) > 0 {
-		if err := os.WriteFile(blobPath, content, 0o600); err != nil {
-			return err
-		}
-	}
-
-	// Update remote manifest (H14: fail closed on unmarshal or read errors)
-	manifestPath := filepath.Join(remoteDir, "manifest.json")
-	var manifest remoteManifest
-	data, err := os.ReadFile(manifestPath)
-	switch {
-	case err == nil:
-		if err := json.Unmarshal(data, &manifest); err != nil {
-			return fmt.Errorf("parse remote manifest %q: %w", manifestPath, err)
-		}
-	case os.IsNotExist(err):
-		manifest = remoteManifest{
-			RunID:      e.runID,
-			RemoteHost: fmt.Sprintf("%s@%s:%d", e.user, e.host, e.port),
-			Entries:    []remoteManifestEntry{},
-		}
-	default:
-		return fmt.Errorf("read remote manifest %q: %w", manifestPath, err)
-	}
-
-	entry := remoteManifestEntry{
-		Path:    path,
-		Created: !existed,
-		Mode:    fmt.Sprintf("%04o", mode),
-		SHA256:  shaHex,
-		Backup:  blobName,
-	}
-	manifest.Entries = append(manifest.Entries, entry)
-
-	// Write manifest atomically with fsync
-	manifestData, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := filepath.Join(remoteDir, ".manifest.tmp")
-	tf, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := tf.Write(manifestData); err != nil {
-		_ = tf.Close()
-		return err
-	}
-	if err := tf.Sync(); err != nil {
-		_ = tf.Close()
-		return err
-	}
-	if err := tf.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, manifestPath)
-}
-
-// remoteManifest represents the undo log for remote files.
-type remoteManifest struct {
-	RunID      string                  `json:"run_id"`
-	RemoteHost string                  `json:"remote_host"`
-	Entries    []remoteManifestEntry `json:"entries"`
-}
-
-type remoteManifestEntry struct {
-	Path    string `json:"path"`
-	Created bool   `json:"created"`
-	Mode    string `json:"mode,omitempty"`
-	SHA256  string `json:"sha256,omitempty"`
-	Backup  string `json:"backup,omitempty"`
 }
 
 // Close closes the SSH connection (no persistent connection for system ssh).

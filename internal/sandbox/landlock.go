@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/landlock-lsm/go-landlock/landlock"
 	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
@@ -32,9 +33,9 @@ const (
 // Landlock child process.
 const landlockHiddenCmdEnv = "LNTA_LANDLOCK_CHILD"
 
-// minLandlockABI is the lowest Landlock ABI we accept: v4 adds TCP
-// bind/connect control, without which the tier could not honour "no egress".
-const minLandlockABI = 4
+// minLandlockABI is the lowest Landlock ABI accepted. V10 adds UDP and
+// scoped restrictions; seccomp additionally blocks IP socket creation.
+const minLandlockABI = 10
 
 // ErrLandlockUnavailable is returned when Landlock is not supported (or is too
 // old to provide the confinement lnta promises) on this kernel.
@@ -83,8 +84,12 @@ func LandlockProbe() error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrLandlockUnavailable, err)
 	}
+	return checkLandlockABI(abi)
+}
+
+func checkLandlockABI(abi int) error {
 	if abi < minLandlockABI {
-		return fmt.Errorf("%w: ABI v%d < v%d (no network confinement)", ErrLandlockUnavailable, abi, minLandlockABI)
+		return fmt.Errorf("%w: ABI v%d < v%d (complete network confinement unavailable)", ErrLandlockUnavailable, abi, minLandlockABI)
 	}
 	return nil
 }
@@ -131,7 +136,10 @@ func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) landl
 		Cmd: cmdStr,
 		Env: envList(sandboxEnvMap(home, tmp), extraEnv),
 	}
-	cfg.RODirs = append(cfg.RODirs, "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/proc", "/sys", "/opt", "/var/log")
+	// Landlock has no PID namespace. Do not grant /proc: same-user process
+	// environments and descriptors can otherwise expose the parent agent's
+	// credentials. The fallback intentionally cannot inspect host processes.
+	cfg.RODirs = append(cfg.RODirs, "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/sys", "/opt", "/var/log")
 	cfg.RWDirs = []string{tmp}
 	cfg.RWFiles = []string{"/dev/null"}
 	cfg.ROFiles = []string{"/dev/zero", "/dev/urandom", "/dev/random"}
@@ -300,17 +308,69 @@ func applyLandlock(cfg landlockConfig) error {
 	if err := landlock.V4.RestrictPaths(rules...); err != nil {
 		return fmt.Errorf("apply Landlock filesystem rules: %w", err)
 	}
-	// Deny every TCP bind/connect (no rules == nothing permitted). Note: Linux
-	// does not apply Landlock TCP rules to Multipath-TCP sockets
-	// (landlock-lsm/linux#54); the bwrap tier's network namespace is the only
-	// airtight egress barrier, which is why bwrap is preferred.
-	if err := landlock.V4.RestrictNet(); err != nil {
+	if err := landlock.V10.RestrictNet(); err != nil {
 		return fmt.Errorf("apply Landlock network rules: %w", err)
 	}
-	// Defence in depth where the kernel supports them: deny UDP, and abstract
-	// Unix sockets / signals to processes outside the domain.
-	_ = landlock.V10.BestEffort().RestrictNet()
-	_ = landlock.V10.BestEffort().RestrictScoped()
+	if err := landlock.V10.RestrictScoped(); err != nil {
+		return fmt.Errorf("apply Landlock scoped rules: %w", err)
+	}
+	if err := denyIPSocketCreation(); err != nil {
+		return fmt.Errorf("apply network socket filter: %w", err)
+	}
+	if err := denyProcessControlSyscalls(); err != nil {
+		return fmt.Errorf("apply process-control filter: %w", err)
+	}
+	return nil
+}
+
+// denyIPSocketCreation closes the Multipath-TCP gap in Landlock by denying
+// socket(AF_INET/AF_INET6/AF_MPTCP, ...) for this process and its descendants.
+func denyIPSocketCreation() error {
+	filters := []unix.SockFilter{
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 5, K: unix.SYS_SOCKET},
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 2, Jf: 0, K: unix.AF_INET},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 1, Jf: 0, K: unix.AF_INET6},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: 45}, // AF_MPTCP
+		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EAFNOSUPPORT)},
+		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
+	}
+	program := unix.SockFprog{Len: uint16(len(filters)), Filter: &filters[0]}
+	if _, _, errno := unix.Syscall(unix.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); errno != 0 {
+		return errno
+	}
+	_, _, errno := unix.Syscall(unix.SYS_PRCTL, unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, uintptr(unsafe.Pointer(&program)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// denyProcessControlSyscalls prevents a Landlock fallback command from
+// signaling or inspecting host processes when PID namespaces are unavailable.
+func denyProcessControlSyscalls() error {
+	blocked := []uint32{
+		unix.SYS_KILL, unix.SYS_TKILL, unix.SYS_TGKILL, unix.SYS_PTRACE,
+		unix.SYS_PROCESS_VM_READV, unix.SYS_PROCESS_VM_WRITEV,
+		unix.SYS_PIDFD_GETFD, unix.SYS_PIDFD_SEND_SIGNAL,
+	}
+	filters := []unix.SockFilter{{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0}}
+	for _, nr := range blocked {
+		filters = append(filters,
+			unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: nr},
+			unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)},
+		)
+	}
+	filters = append(filters, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW})
+	program := unix.SockFprog{Len: uint16(len(filters)), Filter: &filters[0]}
+	if _, _, errno := unix.Syscall(unix.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); errno != 0 {
+		return errno
+	}
+	_, _, errno := unix.Syscall(unix.SYS_PRCTL, unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, uintptr(unsafe.Pointer(&program)))
+	if errno != 0 {
+		return errno
+	}
 	return nil
 }
 

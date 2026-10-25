@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"time"
 
@@ -195,7 +196,7 @@ func (s *Server) handleToolsList(req *jsonrpcRequest) {
 						"description": "Why this inspection is needed.",
 					},
 				},
-				"required": []string{"command", "cwd", "reason"},
+				"required":             []string{"command", "cwd", "reason"},
 				"additionalProperties": false,
 			},
 		},
@@ -210,7 +211,7 @@ func (s *Server) handleToolsList(req *jsonrpcRequest) {
 						"description": "The ID of the instruction pack to retrieve.",
 					},
 				},
-				"required": []string{"pack_id"},
+				"required":             []string{"pack_id"},
 				"additionalProperties": false,
 			},
 		},
@@ -229,7 +230,7 @@ func (s *Server) handleToolsList(req *jsonrpcRequest) {
 						"description": "The target artifact path to verify (substituted for ${target} in verify_cmd).",
 					},
 				},
-				"required": []string{"pack_id", "target"},
+				"required":             []string{"pack_id", "target"},
 				"additionalProperties": false,
 			},
 		},
@@ -344,17 +345,20 @@ func (s *Server) toolVerifyTask(ctx context.Context, args map[string]interface{}
 		return toolCallResult{}, fmt.Errorf("pack not found: %s", packID)
 	}
 
-	if pack.VerifyCmd == "" {
+	if !pack.RequiresVerification() {
+		return toolCallResult{Content: []toolContent{{Type: "text", Text: "VERIFICATION NOT REQUIRED"}}}, nil
+	}
+	if strings.TrimSpace(pack.VerifyCmd) == "" {
 		return toolCallResult{}, fmt.Errorf("pack %s has no verify_cmd", packID)
 	}
 
-	// Render verify_cmd with target passed out-of-band as LNTA_TARGET
-	// (single-quoted env assignment, data never shell text). Packs must
-	// reference $LNTA_TARGET literally and must not interpolate target.
-	verifyCmd := "export LNTA_TARGET='" + strings.ReplaceAll(target, "'", "'\\''") + "'; " + pack.VerifyCmd
+	verifyEnv, err := makeMCPVerificationEnv(pack.VerifyCmd, target)
+	if err != nil {
+		return toolCallResult{}, err
+	}
 
 	cwd := "."
-	res, err := sandbox.RunReadOnly(ctx, verifyCmd, cwd, 2*time.Minute)
+	res, err := sandbox.RunReadOnlyEnv(ctx, pack.VerifyCmd, cwd, 2*time.Minute, verifyEnv)
 	if err != nil {
 		return toolCallResult{}, fmt.Errorf("verify_cmd execution failed: %w", err)
 	}
@@ -362,7 +366,7 @@ func (s *Server) toolVerifyTask(ctx context.Context, args map[string]interface{}
 	var b strings.Builder
 	if res.ExitCode == 0 {
 		b.WriteString("VERIFICATION PASSED\n")
-		fmt.Fprintf(&b, "Command: %s\n", verifyCmd)
+		fmt.Fprintf(&b, "Command: %s\n", pack.VerifyCmd)
 		fmt.Fprintf(&b, "Exit code: %d\n", res.ExitCode)
 		if res.Stdout != "" {
 			b.WriteString("--- stdout ---\n")
@@ -370,7 +374,7 @@ func (s *Server) toolVerifyTask(ctx context.Context, args map[string]interface{}
 		}
 	} else {
 		b.WriteString("VERIFICATION FAILED\n")
-		fmt.Fprintf(&b, "Command: %s\n", verifyCmd)
+		fmt.Fprintf(&b, "Command: %s\n", pack.VerifyCmd)
 		fmt.Fprintf(&b, "Exit code: %d\n", res.ExitCode)
 		if res.Stderr != "" {
 			b.WriteString("--- stderr ---\n")
@@ -386,6 +390,20 @@ func (s *Server) toolVerifyTask(ctx context.Context, args map[string]interface{}
 		Content: []toolContent{{Type: "text", Text: b.String()}},
 		IsError: res.ExitCode != 0,
 	}, nil
+}
+
+var mcpVerifyPlaceholder = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+func makeMCPVerificationEnv(command, target string) ([]string, error) {
+	if target == "" || len(target) > 4096 || strings.ContainsRune(target, 0) {
+		return nil, fmt.Errorf("invalid verification target")
+	}
+	for _, match := range mcpVerifyPlaceholder.FindAllStringSubmatch(command, -1) {
+		if match[1] != "target" && match[1] != "LNTA_TARGET" {
+			return nil, fmt.Errorf("verification input %q is required by verify_cmd", match[1])
+		}
+	}
+	return []string{"LNTA_TARGET=" + target, "target=" + target}, nil
 }
 
 func (s *Server) writeResult(id json.RawMessage, result interface{}) {

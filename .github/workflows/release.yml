@@ -2,128 +2,128 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ["v*.*.*"]
 
 permissions:
-  contents: write
-  packages: write
-  pages: write
-
-env:
-  GO_VERSION: "1.27"
+  contents: read
 
 jobs:
-  goreleaser:
-    name: GoReleaser & APT Repository
+  build:
+    name: Build and validate release artifacts
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Validate release tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      # actions/setup-go v5.5.0
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: "1.27.2"
           cache: true
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+      - name: Validate source
+        run: |
+          go test ./...
+          go vet ./...
+          go build ./...
+      # goreleaser-action v6.4.0
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a
         with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
+          version: v2.11.2
+          args: release --clean --skip=sign,publish
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts as workflow artifacts
-        uses: actions/upload-artifact@v4
+          GITHUB_TOKEN: ${{ github.token }}
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: release-artifacts
+          name: release-dist
           path: dist/
-          retention-days: 30
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Publish APT Repository to GitHub Pages
+  publish:
+    name: Sign and publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: gh-pages
+          path: gh-pages
+          fetch-depth: 0
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: source
+      # actions/download-artifact v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-dist
+          path: dist
+      - name: Require signing tools and key
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ secrets.GPG_FINGERPRINT }}
         run: |
-          set -eu
-          echo "=== Setting up APT Repository Publisher ==="
-          sudo apt-get update && sudo apt-get install -y reprepro gnupg
-
-          HAVE_GPG=false
-          KEY_FP=""
-          if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
-            echo "Importing GPG release signing key..."
-            echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-            KEY_FP=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
-            if [ -n "$KEY_FP" ]; then
-              echo "Loaded GPG signing key fingerprint: $KEY_FP"
-              HAVE_GPG=true
-            fi
-          else
-            echo "::warning::GPG_PRIVATE_KEY secret is not set! Building an unsigned test repository."
-            echo "::notice::To enable signed releases, generate an Ed25519 GPG key and add it to repo secrets as GPG_PRIVATE_KEY."
-          fi
-
-          echo "Checking out or initializing gh-pages branch..."
-          git clone --branch gh-pages --single-branch "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages-apt 2>/dev/null || {
-            echo "gh-pages branch does not exist yet. Initializing new orphan branch..."
-            mkdir -p gh-pages-apt
-            cd gh-pages-apt
-            git init
-            git checkout --orphan gh-pages
-            cd ..
-          }
-
-          mkdir -p gh-pages-apt/conf
-          cp scripts/apt/distributions gh-pages-apt/conf/distributions
-
-          if [ "$HAVE_GPG" = "false" ]; then
-            echo "Disabling package signing in conf/distributions (GPG_PRIVATE_KEY not set)..."
-            sed -i '/^SignWith:/d' gh-pages-apt/conf/distributions
-          fi
-
-          echo "Adding Debian packages to reprepro repository..."
-          for deb in dist/*.deb; do
-            if [ -f "$deb" ]; then
-              echo "Including $deb..."
-              reprepro -b gh-pages-apt --ignore=existingincludedeb includedeb stable "$deb" || \
-                reprepro -b gh-pages-apt includedeb stable "$deb"
-            fi
-          done
-
-          echo "Exporting public key and static assets..."
-          if [ "$HAVE_GPG" = "true" ]; then
-            gpg --armor --export "$KEY_FP" > gh-pages-apt/lnta-archive-keyring.asc
-          elif [ -f scripts/apt/lnta-archive-keyring.asc ]; then
-            cp scripts/apt/lnta-archive-keyring.asc gh-pages-apt/lnta-archive-keyring.asc
-          fi
-
-          if [ -f scripts/apt/install-apt.sh ]; then
-            cp scripts/apt/install-apt.sh gh-pages-apt/install-apt.sh
-            chmod +x gh-pages-apt/install-apt.sh
-          fi
-
-          echo "Creating .nojekyll marker for GitHub Pages..."
-          touch gh-pages-apt/.nojekyll
-
-          echo "Generating landing page (index.html)..."
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/apt/generate-index.sh "${TAG_VERSION}" "gh-pages-apt"
-
-          echo "Committing and force-pushing to gh-pages branch..."
-          cd gh-pages-apt
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          command -v gpg >/dev/null
+          command -v gpgv >/dev/null
+          test -n "$GPG_PRIVATE_KEY"
+          test "$GPG_FINGERPRINT" = "45BFE7B566C24F984EF00F6AEE0178A118050BDB"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          actual="$(gpg --batch --list-secret-keys --with-colons "$GPG_FINGERPRINT" | awk -F: '$1=="fpr" {print $10; exit}')"
+          test "$actual" = "$GPG_FINGERPRINT"
+          echo "GPG_FINGERPRINT=$GPG_FINGERPRINT" >> "$GITHUB_ENV"
+      - name: Sign and validate artifacts
+        run: |
+          test -s dist/checksums.txt
+          gpg --batch --yes --local-user "$GPG_FINGERPRINT" --output dist/checksums.txt.sig --detach-sign dist/checksums.txt
+          gpg --batch --export "$GPG_FINGERPRINT" > /tmp/lnta-release-key.gpg
+          gpgv --keyring /tmp/lnta-release-key.gpg dist/checksums.txt.sig dist/checksums.txt
+          (cd dist && sha256sum --check checksums.txt)
+          test -n "$(find dist -maxdepth 1 -name '*.deb' -type f -print -quit)"
+          for package in dist/*.deb; do dpkg-deb --info "$package" >/dev/null; done
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -d '' artifacts < <(find dist -maxdepth 1 -type f -print0)
+          test "${#artifacts[@]}" -gt 0
+          gh release create "$GITHUB_REF_NAME" "${artifacts[@]}" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-from-tag
+      - name: Publish APT repository with fast-forward update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd gh-pages
+          sudo apt-get update
+          sudo apt-get install -y reprepro
+          mkdir -p conf
+          cp ../source/scripts/apt/distributions conf/distributions
+          sed -i "s/^SignWith:.*/SignWith: $GPG_FINGERPRINT/" conf/distributions
+          for package in ../dist/*.deb; do reprepro -b . --ignore=existingincludedeb includedeb stable "$package"; done
+          gpg --batch --armor --export "$GPG_FINGERPRINT" > lnta-archive-keyring.asc
+          cp ../source/scripts/apt/install-apt.sh ./install-apt.sh
+          chmod 0755 ./install-apt.sh
+          touch .nojekyll
+          ../source/scripts/apt/generate-index.sh "${GITHUB_REF_NAME#v}" .
+          gpg --batch --export "$GPG_FINGERPRINT" > /tmp/lnta-apt-key.gpg
+          gpgv --keyring /tmp/lnta-apt-key.gpg dists/stable/InRelease
           git add -A
-          if git diff --staged --quiet; then
-            echo "No changes in APT repository to commit."
-          else
-            git commit -m "deploy: update APT repository for ${GITHUB_REF_NAME}"
-            git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Publish $GITHUB_REF_NAME APT repository"
+          git push origin HEAD:gh-pages
+          apt_commit="$(git rev-parse HEAD)"
+          if ! gh release edit "$GITHUB_REF_NAME" --draft=false; then
+            echo "::error::Release publication failed after APT publication; attempting to revert the APT commit."
+            git revert --no-edit "$apt_commit"
+            git push origin HEAD:gh-pages || { echo "::error::APT rollback push failed; gh-pages needs manual recovery."; exit 1; }
+            exit 1
           fi
-          echo "APT repository deployment complete!"

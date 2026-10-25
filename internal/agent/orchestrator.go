@@ -4,12 +4,15 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -53,10 +56,10 @@ func (c *openaiClient) ChatCompletionStream(ctx context.Context, req openai.Chat
 
 // Orchestrator runs the agent loop for a single user prompt.
 type Orchestrator struct {
-	client  LLMClient
-	router  *packs.Router
-	tools   map[string]Tool
-	config  *Config
+	client LLMClient
+	router *packs.Router
+	tools  map[string]Tool
+	config *Config
 
 	runID    string
 	cwd      string
@@ -75,6 +78,7 @@ type Orchestrator struct {
 	// Run summary collection for time-machine TUI.
 	runCollector *audit.RunSummaryCollector
 	commandOnly  bool
+	mutations    map[string]struct{}
 }
 
 // Option configures an Orchestrator.
@@ -124,6 +128,11 @@ func (o *Orchestrator) RunSummary() *audit.RunSummary {
 func NewOpenAIClient(cfg *Config) (LLMClient, error) {
 	cliCfg := openai.DefaultConfig(cfg.APIKey)
 	cliCfg.BaseURL = cfg.BaseURL
+	timeout := time.Duration(cfg.TimeoutSec) * time.Second
+	if timeout <= 0 {
+		timeout = 90 * time.Second
+	}
+	cliCfg.HTTPClient = &http.Client{Timeout: timeout}
 	client := openai.NewClientWithConfig(cliCfg)
 	return &openaiClient{client: client}, nil
 }
@@ -135,6 +144,7 @@ func NewOpenAIClient(cfg *Config) (LLMClient, error) {
 func NewOllamaClient(model string) (LLMClient, error) {
 	cliCfg := openai.DefaultConfig("")
 	cliCfg.BaseURL = ollamaBaseURL
+	cliCfg.HTTPClient = &http.Client{Timeout: 90 * time.Second}
 	client := openai.NewClientWithConfig(cliCfg)
 	// Override the default model so callers can use WithConfig(Model=model).
 	return &openaiClient{client: client}, nil
@@ -207,6 +217,8 @@ func New(client LLMClient, router *packs.Router, opts ...Option) *Orchestrator {
 // error.
 func (o *Orchestrator) Run(ctx context.Context, prompt string, pipeContext string, commandOnly bool) (string, error) {
 	o.commandOnly = commandOnly
+	o.budgetTracker.Reset()
+	o.mutations = make(map[string]struct{})
 	// Step 1: Collect SystemContext (<5ms).
 	start := time.Now()
 	sysCtx, err := fingerprint.Fingerprint()
@@ -284,11 +296,16 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			return "", fmt.Errorf("cancelled: %w", err)
 		}
 
+		promptTokens := estimatePromptTokens(messages, toolDefs)
+		if promptTokens > o.budgetTracker.RemainingTokens() {
+			return "", fmt.Errorf("token budget would be exceeded before provider request")
+		}
+		o.budgetTracker.RecordPromptTokens(promptTokens)
 		req := openai.ChatCompletionRequest{
-			Model:       o.model(),
-			Messages:    messages,
-			Tools:       toolDefs,
-			ToolChoice:  "required",
+			Model:               o.model(),
+			Messages:            messages,
+			Tools:               toolDefs,
+			ToolChoice:          "auto",
 			Temperature:         o.temperature(),
 			MaxCompletionTokens: o.maxTokens(),
 			Stream:              true,
@@ -305,10 +322,7 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 		// pending accumulates in-call tool calls keyed by stream index.
 		pending := make(map[int]*streamingToolCall)
 		var order []int
-
-		// Track tokens from this request (approximate)
-		promptTokens := estimatePromptTokens(messages, toolDefs)
-		o.budgetTracker.RecordPromptTokens(promptTokens)
+		var finishReason openai.FinishReason
 
 		for {
 			if err := ctx.Err(); err != nil {
@@ -327,10 +341,18 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				continue
 			}
 			delta := sr.Choices[0].Delta
+			if sr.Choices[0].FinishReason != "" {
+				finishReason = sr.Choices[0].FinishReason
+			}
 			assistantContent.WriteString(delta.Content)
+			if assistantContent.Len() > 64*1024 {
+				stream.Close()
+				return "", fmt.Errorf("provider response exceeded 64 KiB text limit")
+			}
 			for _, tc := range delta.ToolCalls {
 				if tc.Index == nil {
-					continue
+					stream.Close()
+					return "", fmt.Errorf("malformed streamed tool call: missing index")
 				}
 				idx := *tc.Index
 				p, exists := pending[idx]
@@ -347,19 +369,41 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 					p.name = tc.Function.Name
 				}
 				p.args += tc.Function.Arguments
+				if len(p.args) > 1<<20 {
+					stream.Close()
+					return "", fmt.Errorf("tool call arguments exceeded 1 MiB limit")
+				}
 			}
 		}
 		stream.Close()
+		if len(order) > 0 && finishReason != openai.FinishReasonToolCalls {
+			return "", fmt.Errorf("incomplete streamed tool call response: finish reason %q", finishReason)
+		}
 
-		// Estimate completion tokens
-		completionTokens := estimateCompletionTokens(assistantContent.String())
+		// Include streamed tool names and arguments in the completion budget;
+		// otherwise a provider could exceed the budget through tool payloads.
+		var completionText strings.Builder
+		completionText.WriteString(assistantContent.String())
+		for _, idx := range order {
+			if call := pending[idx]; call != nil {
+				completionText.WriteString(call.name)
+				completionText.WriteString(call.args)
+			}
+		}
+		completionTokens := estimateCompletionTokens(completionText.String())
 		o.budgetTracker.RecordCompletionTokens(completionTokens)
+		if o.budgetTracker.IsBudgetExceeded() {
+			return "", fmt.Errorf("token budget exceeded before tool execution")
+		}
 
 		// Record tokens for time-machine TUI
 		if o.runCollector != nil {
 			o.runCollector.RecordTokens(promptTokens, completionTokens)
 		}
 
+		if err := validateStreamedToolCalls(order, pending, o.tools); err != nil {
+			return "", err
+		}
 		assistantMsg := openai.ChatCompletionMessage{
 			Role: openai.ChatMessageRoleAssistant,
 		}
@@ -383,8 +427,13 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 		messages = append(messages, assistantMsg)
 
 		if len(order) == 0 {
-			// No tool calls: surface the assistant text and stop.
-			return assistantContent.String(), nil
+			// Plain provider text is not verified task completion.
+			if o.runCollector != nil {
+				o.runCollector.SetStatus(audit.RunStatusFailed)
+				o.runCollector.SetError("provider response did not invoke complete_task")
+				_ = o.runCollector.Save()
+			}
+			return assistantContent.String(), fmt.Errorf("provider response did not invoke complete_task; task is unverified")
 		}
 
 		// Execute each tool call in order.
@@ -392,6 +441,18 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 		completed := false
 		for _, idx := range order {
 			p := pending[idx]
+			if p.name == "mutate_system" {
+				key, keyErr := mutateInvocationKey([]byte(p.args), o.cwd)
+				if keyErr != nil {
+					toolResults = append(toolResults, toolResultMessage(p.id, "", keyErr))
+					continue
+				}
+				if _, duplicate := o.mutations[key]; duplicate {
+					toolResults = append(toolResults, toolResultMessage(p.id, "", fmt.Errorf("identical mutate_system operation already attempted in this run; refusing duplicate side effects")))
+					continue
+				}
+				o.mutations[key] = struct{}{}
+			}
 			tool, ok := o.tools[p.name]
 			if !ok {
 				toolResults = append(toolResults, toolResultMessage(p.id, "", fmt.Errorf("unknown tool %q", p.name)))
@@ -435,12 +496,12 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			shouldBlock, hint := o.budgetTracker.RecordToolCall(p.name, argsJSON, err == nil && !strings.HasPrefix(result, "TOOL_ERROR:"), err)
 			if shouldBlock {
 				// Circuit breaker triggered - inject hint and stop
-			if o.runCollector != nil {
-				o.runCollector.SetStatus(audit.RunStatusFailed)
-				o.runCollector.SetError("circuit breaker triggered: " + hint)
-				_ = o.runCollector.Save()
-			}
-			return fmt.Sprintf("CIRCUIT_BREAKER_TRIGGERED: %s", hint), nil
+				if o.runCollector != nil {
+					o.runCollector.SetStatus(audit.RunStatusFailed)
+					o.runCollector.SetError("circuit breaker triggered: " + hint)
+					_ = o.runCollector.Save()
+				}
+				return fmt.Sprintf("CIRCUIT_BREAKER_TRIGGERED: %s", hint), nil
 			}
 
 			if err != nil {
@@ -451,6 +512,9 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				completed = true
 			}
 			toolResults = append(toolResults, toolResultMessage(p.id, result, nil))
+			if completed {
+				break
+			}
 		}
 		messages = append(messages, toolResults...)
 
@@ -462,8 +526,12 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			// Save run summary on completion
 			if o.runCollector != nil {
 				if strings.Contains(last.Content, "TASK_COMPLETE:") {
-					o.runCollector.SetStatus(audit.RunStatusVerified)
-				} else if strings.Contains(last.Content, "HARNESS_VERIFICATION_FAILED:") {
+					if strings.Contains(last.Content, "verification_status: NOT_REQUIRED") {
+						o.runCollector.SetStatus(audit.RunStatusNotRequired)
+					} else {
+						o.runCollector.SetStatus(audit.RunStatusVerified)
+					}
+				} else if strings.Contains(last.Content, "HARNESS_VERIFICATION_FAILED:") || strings.Contains(last.Content, "HARNESS_VERIFICATION_UNAVAILABLE:") {
 					o.runCollector.SetStatus(audit.RunStatusFailed)
 				}
 				_ = o.runCollector.Save()
@@ -485,6 +553,28 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 	return "", fmt.Errorf("max_turns (%d) reached without successful task completion", o.maxTurns)
 }
 
+func mutateInvocationKey(raw []byte, defaultCWD string) (string, error) {
+	var mutation mutateInput
+	if err := json.Unmarshal(raw, &mutation); err != nil {
+		return "", fmt.Errorf("invalid mutate_system arguments: %w", err)
+	}
+	if mutation.Command == "" {
+		mutation.Command = mutation.Cmd
+	}
+	cwd := mutation.CWD
+	if cwd == "" {
+		cwd = defaultCWD
+	}
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", fmt.Errorf("resolve mutate_system working directory: %w", err)
+	}
+	return filepath.Clean(abs) + "\x00" + mutation.Command, nil
+}
+
 // streamingToolCall accumulates one in-flight tool call from stream deltas.
 type streamingToolCall struct {
 	index int
@@ -494,13 +584,106 @@ type streamingToolCall struct {
 	args  string
 }
 
+func validateStreamedToolCalls(order []int, pending map[int]*streamingToolCall, tools map[string]Tool) error {
+	if len(order) > 16 {
+		return fmt.Errorf("provider returned more than 16 tool calls")
+	}
+	ids := make(map[string]struct{}, len(order))
+	mutations := make(map[string]struct{})
+	completeCount := 0
+	for _, idx := range order {
+		call := pending[idx]
+		if call == nil || call.id == "" || len(call.id) > 128 || strings.ContainsAny(call.id, "\r\n\x00") {
+			return fmt.Errorf("malformed streamed tool call: missing or invalid call id")
+		}
+		if _, duplicate := ids[call.id]; duplicate {
+			return fmt.Errorf("malformed streamed tool calls: duplicate call id")
+		}
+		ids[call.id] = struct{}{}
+		if call.typ != string(openai.ToolTypeFunction) {
+			return fmt.Errorf("malformed streamed tool call %q: unsupported type %q", call.id, call.typ)
+		}
+		if _, ok := tools[call.name]; !ok {
+			return fmt.Errorf("provider requested unknown tool %q", call.name)
+		}
+		if len(call.args) == 0 || !json.Valid([]byte(call.args)) {
+			return fmt.Errorf("malformed arguments for tool %q", call.name)
+		}
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(call.args), &object); err != nil || object == nil {
+			return fmt.Errorf("arguments for tool %q must be a JSON object", call.name)
+		}
+		if err := decodeToolArgs(call.name, call.args); err != nil {
+			return err
+		}
+		if call.name == "mutate_system" || call.name == "write_scoped_file" {
+			key := call.name + ":" + string(call.args)
+			if _, duplicate := mutations[key]; duplicate {
+				return fmt.Errorf("duplicate mutating tool call in one provider response refused")
+			}
+			mutations[key] = struct{}{}
+		}
+		if call.name == "complete_task" {
+			completeCount++
+		}
+	}
+	if completeCount > 0 && len(order) != 1 {
+		return fmt.Errorf("complete_task must be the only tool call in its provider response")
+	}
+	return nil
+}
+
+func decodeToolArgs(name, raw string) error {
+	var target any
+	switch name {
+	case "inspect_system":
+		target = &inspectInput{}
+	case "write_scoped_file":
+		target = &writeInput{}
+	case "mutate_system":
+		target = &mutateInput{}
+	case "complete_task":
+		target = &completeInput{}
+	default:
+		return fmt.Errorf("unknown tool %q", name)
+	}
+	decoder := json.NewDecoder(bytes.NewBufferString(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("invalid arguments for %s: %w", name, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("invalid trailing data in arguments for %s", name)
+	}
+	switch args := target.(type) {
+	case *inspectInput:
+		if args.Command == "" && args.Cmd == "" {
+			return fmt.Errorf("inspect_system requires command")
+		}
+	case *writeInput:
+		if args.Path == "" {
+			return fmt.Errorf("write_scoped_file requires path")
+		}
+	case *mutateInput:
+		if args.Command == "" && args.Cmd == "" {
+			return fmt.Errorf("mutate_system requires command")
+		}
+	case *completeInput:
+		if args.Summary == "" || (args.TargetArtifacts == "" && args.Targets == "" && args.Artifact == "") {
+			return fmt.Errorf("complete_task requires summary and target_artifacts")
+		}
+	}
+	return nil
+}
+
 func toolResultMessage(id, content string, err error) openai.ChatCompletionMessage {
 	if err != nil {
 		content = fmt.Sprintf("TOOL_ERROR: %v", err)
 	}
 	return openai.ChatCompletionMessage{
-		Role:      openai.ChatMessageRoleTool,
-		Content:   content,
+		Role:       openai.ChatMessageRoleTool,
+		Content:    content,
 		ToolCallID: id,
 	}
 }
@@ -580,9 +763,10 @@ func buildSystemPrompt(sysCtx fingerprint.SystemContext, pack packs.Pack, contex
 	}
 	b.WriteString("## Tool Rules\n")
 	b.WriteString("- Never run raw bash. Use inspect_system for read-only inspection.\n")
+	b.WriteString("- For inspect_system, command must be a full executable shell command string (e.g. \"ss -tulpn\", \"ps aux\", \"cat /path\"), never an isolated argument or option.\n")
 	b.WriteString("- Use write_scoped_file for any file write within allowed_paths.\n")
 	b.WriteString("- Use mutate_system only for out-of-scope writes or host mutations, and only after user approval.\n")
-	b.WriteString("- Always end by calling complete_task with summary and target_artifacts.\n")
+	b.WriteString("- When your inspection or task is complete, call complete_task with your findings and answer in summary.\n")
 	b.WriteString("- If complete_task returns HARNESS_VERIFICATION_FAILED, fix the issue and call complete_task again.\n")
 	return b.String()
 }

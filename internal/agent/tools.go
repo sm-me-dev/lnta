@@ -15,9 +15,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -44,13 +46,13 @@ type ToolFunc func(ctx context.Context, args json.RawMessage, deps ToolDeps) (re
 
 // ToolDeps are the dependencies injected into every tool call.
 type ToolDeps struct {
-	RunID         string
-	Pack          *packs.Pack       // active instruction pack (may be nil)
-	Approve       ApproveFunc       // mutate_system approval callback
-	CWD           string            // working directory for sandboxed commands
-	DryRun        bool              // when true, writes are diff-only previews and mutations are blocked
-	RunCollector  *audit.RunSummaryCollector // for recording run metadata
-	Executor      transport.TargetExecutor // for command execution (local or SSH)
+	RunID        string
+	Pack         *packs.Pack                // active instruction pack (may be nil)
+	Approve      ApproveFunc                // mutate_system approval callback
+	CWD          string                     // working directory for sandboxed commands
+	DryRun       bool                       // when true, writes are diff-only previews and mutations are blocked
+	RunCollector *audit.RunSummaryCollector // for recording run metadata
+	Executor     transport.TargetExecutor   // for command execution (local or SSH)
 }
 
 // ApproveFunc is consulted before executing a mutate_system command. It should
@@ -134,7 +136,8 @@ func CoreTools() []Tool {
 				"type": "object",
 				"properties": {
 					"summary": {"type": "string", "description": "Human-readable summary of what was accomplished."},
-					"target_artifacts": {"type": "string", "description": "Comma-separated target artifact paths to verify (e.g. the .desktop file path)."},
+					"target_artifacts": {"type": "string", "description": "Target artifact path to verify (for example, a .desktop file path)."},
+					"verification_inputs": {"type": "object", "description": "Values for verify_cmd placeholders other than target; values are passed as environment data.", "additionalProperties": {"type": "string"}},
 					"verification_notes": {"type": "string", "description": "Notes on how verification was performed."}
 				},
 				"required": ["summary", "target_artifacts"],
@@ -223,6 +226,12 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 			return "", fmt.Errorf("write_scoped_file: invalid mode %q: %w", in.Mode, perr)
 		}
 	}
+	fileMode := os.FileMode(0o644)
+	if in.Mode != "" {
+		if m, err := strconv.ParseUint(in.Mode, 8, 32); err == nil && m != 0 {
+			fileMode = os.FileMode(m)
+		}
+	}
 
 	// Fail closed: no pack or no allowed_paths means no writes. This prevents
 	// LocalExecutor.WriteFile from being reached with a vacuous scope (C1) and
@@ -232,14 +241,15 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 	}
 
 	allowed := deps.Pack.AllowedPaths
-	if len(allowed) == 0 {
-		return "SCOPE_VIOLATION: active pack has no allowed_paths; writing is not permitted.", nil
+	previewPath := in.Path
+	if !filepath.IsAbs(previewPath) && !strings.HasPrefix(previewPath, "~/") && deps.CWD != "" {
+		previewPath = filepath.Join(deps.CWD, previewPath)
 	}
 
 	// Dry-run mode: validate scope and show the proposed diff without
 	// persisting anything to disk.
 	if deps.DryRun {
-		diff, perr := previewScopedWrite(in.Path, []byte(in.Content), allowed)
+		diff, perr := previewScopedWriteMode(previewPath, []byte(in.Content), fileMode, allowed)
 		if perr != nil {
 			var sve *sandbox.ScopeViolationError
 			if errors.As(perr, &sve) {
@@ -259,16 +269,50 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 		return b.String(), nil
 	}
 
-	// Determine file mode (default 0644)
-	fileMode := os.FileMode(0o644)
-	if in.Mode != "" {
-		if m, err := strconv.ParseUint(in.Mode, 8, 32); err == nil && m != 0 {
-			fileMode = os.FileMode(m)
+	// Every persistent scoped write requires explicit human approval. The
+	// callback receives the resolved target and proposed diff before the write.
+	preview, perr := previewScopedWriteMode(previewPath, []byte(in.Content), fileMode, allowed)
+	if perr != nil {
+		var sve *sandbox.ScopeViolationError
+		if errors.As(perr, &sve) {
+			return fmt.Sprintf("SCOPE_VIOLATION: %s", sve.Error()), nil
 		}
+		return "", fmt.Errorf("write_scoped_file preview: %w", perr)
+	}
+	if deps.Approve == nil {
+		return "MUTATE_BLOCKED: no approval callback is configured; the file was NOT written.", nil
+	}
+	if deps.Executor == nil {
+		return "MUTATE_BLOCKED: no target executor is configured; the file was NOT written.", nil
+	}
+	approvalDetail := in.Reason + "\nResolved target: " + preview.TargetPath + "\nProposed diff:\n" + preview.Diff
+	if !deps.Approve("write_scoped_file "+preview.TargetPath, deps.CWD, "write", approvalDetail) {
+		return "MUTATE_BLOCKED: user did not approve the scoped file write; the file was NOT written.", nil
 	}
 
 	// Use the executor's WriteFile for remote-aware writing
-	writtenPath, writtenInfo, err := deps.Executor.WriteFile(ctx, in.Path, []byte(in.Content), fileMode)
+	diff, err := deps.Executor.WriteFile(ctx, in.Path, []byte(in.Content), fileMode, allowed, &preview)
+	// Preserve partial write state in the run audit even when the executor
+	// reports an error. A write can have reached PREPARED or INCOMPLETE before
+	// failing, so dropping this record would make recovery state misleading.
+	if deps.RunCollector != nil && diff.TargetPath != "" {
+		fileDiff := audit.FileDiffInfo{
+			Status:     diff.Status,
+			TargetPath: diff.TargetPath,
+			Created:    diff.Created,
+			OldMode:    fmt.Sprintf("%04o", diff.OldMode),
+			NewMode:    fmt.Sprintf("%04o", diff.Mode),
+			OldSHA256:  diff.OldSHA256,
+			NewSHA256:  diff.NewSHA256,
+			SizeOld:    diff.SizeOld,
+			SizeNew:    diff.SizeNew,
+			Diff:       diff.Diff,
+		}
+		if err != nil {
+			fileDiff.Error = err.Error()
+		}
+		deps.RunCollector.RecordFileDiff(fileDiff)
+	}
 	if err != nil {
 		var sve *sandbox.ScopeViolationError
 		if errors.As(err, &sve) {
@@ -279,37 +323,16 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 		return "", fmt.Errorf("write_scoped_file: %w", err)
 	}
 
-	// Record file diff for time-machine TUI
-	if deps.RunCollector != nil {
-		newModeStr := fmt.Sprintf("%04o", fileMode)
-		var newSize int64
-		if writtenInfo != nil {
-			newModeStr = fmt.Sprintf("%04o", writtenInfo.Mode())
-			newSize = writtenInfo.Size()
-		}
-		deps.RunCollector.RecordFileDiff(audit.FileDiffInfo{
-			TargetPath: writtenPath,
-			Created:    false,
-			OldMode:    fmt.Sprintf("%04o", 0o644),
-			NewMode:    newModeStr,
-			OldSHA256:  "",
-			NewSHA256:  "",
-			SizeOld:    0,
-			SizeNew:    newSize,
-			Diff:       "",
-		})
-	}
-
-	return fmt.Sprintf("wrote %q (mode=%o, size=%d)\n", writtenPath, writtenInfo.Mode(), writtenInfo.Size()), nil
+	return fmt.Sprintf("wrote %q (created=%v, mode=%o, size=%d, sha256=%s)\n%s", diff.TargetPath, diff.Created, diff.Mode, diff.SizeNew, diff.NewSHA256, diff.Diff), nil
 }
 
 type mutateInput struct {
 	Command       string `json:"command"`
 	Cmd           string `json:"cmd"` // common alias produced by some LLMs
 	CWD           string `json:"cwd"`
-	RiskLevel     string `json:"risk_level"`      // Deprecated: kept for backwards compatibility
+	RiskLevel     string `json:"risk_level"` // Deprecated: kept for backwards compatibility
 	Reason        string `json:"reason"`
-	ChallengeCode string `json:"challenge_code"`  // User-provided challenge code for CRITICAL_DESTRUCTIVE
+	ChallengeCode string `json:"challenge_code"` // User-provided challenge code for CRITICAL_DESTRUCTIVE
 }
 
 func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (string, error) {
@@ -323,6 +346,17 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	if in.CWD == "" {
 		in.CWD = deps.CWD
 	}
+	if in.CWD == "" {
+		in.CWD, _ = os.Getwd()
+	}
+	resolvedCWD, err := filepath.Abs(in.CWD)
+	if err != nil {
+		return "", fmt.Errorf("mutate_system: resolve working directory: %w", err)
+	}
+	if info, statErr := os.Stat(resolvedCWD); statErr != nil || !info.IsDir() {
+		return "", fmt.Errorf("mutate_system: working directory is unavailable")
+	}
+	in.CWD = resolvedCWD
 
 	// Dry-run mode: block all host mutations.
 	if deps.DryRun {
@@ -332,12 +366,9 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	// Classify the risk level of the command using the semantic blast-radius classifier.
 	classification := sandbox.ClassifyRisk(in.Command)
 
-	// Override risk_level from input if provided (backwards compat), but
-	// the classifier's decision is authoritative for CRITICAL_DESTRUCTIVE.
+	// Model-provided risk labels are display data only; classification remains
+	// authoritative and never creates an approval bypass.
 	riskLevel := classification.Level.String()
-	if in.RiskLevel != "" && classification.Level != sandbox.RiskCriticalDestructive {
-		riskLevel = in.RiskLevel
-	}
 
 	// H1: never echo the challenge code to the LLM (the tool result is fed back
 	// to the model, which would just echo it on the next call). The human
@@ -353,8 +384,8 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 			deps.Executor.TargetID() + " or use a remote-execution pack.", nil
 	}
 
-	// Check approval - for CRITICAL_DESTRUCTIVE, the approval callback should
-	// present the challenge code requirement and not accept --yes flags.
+	// Every arbitrary shell command requires a fresh human challenge, regardless
+	// of classifier output, unattended mode, or any model-provided risk label.
 	approved := false
 	if deps.Approve != nil {
 		approved = deps.Approve(in.Command, in.CWD, riskLevel, in.Reason)
@@ -408,7 +439,7 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		}
 	}()
 
-	err := cmd.Wait()
+	err = cmd.Wait()
 	var exitCode int
 	if ex, ok := err.(*exec.ExitError); ok {
 		exitCode = ex.ExitCode()
@@ -439,11 +470,12 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 }
 
 type completeInput struct {
-	Summary           string `json:"summary"`
-	TargetArtifacts   string `json:"target_artifacts"`
-	Targets           string `json:"targets"`           // alias
-	Artifact          string `json:"artifact"`          // alias
-	VerificationNotes string `json:"verification_notes"`
+	Summary            string            `json:"summary"`
+	TargetArtifacts    string            `json:"target_artifacts"`
+	Targets            string            `json:"targets"`  // alias
+	Artifact           string            `json:"artifact"` // alias
+	VerificationNotes  string            `json:"verification_notes"`
+	VerificationInputs map[string]string `json:"verification_inputs"`
 }
 
 func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (string, error) {
@@ -463,30 +495,63 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	// Fail closed: no pack or no verify_cmd means we cannot certify. The
 	// target is passed out-of-band as LNTA_TARGET (single-quoted env
 	// assignment, data never shell text) so it cannot rewrite the command.
-	if deps.Pack == nil || strings.TrimSpace(deps.Pack.VerifyCmd) == "" {
+	if deps.Pack == nil {
 		return "", errors.New("complete_task: no verify_cmd for the active pack; refusing to certify")
+	}
+	if !deps.Pack.RequiresVerification() {
+		if deps.RunCollector != nil {
+			deps.RunCollector.RecordVerification(audit.VerificationRecord{Timestamp: time.Now().UTC(), Passed: false, Status: audit.VerificationNotRequired})
+			deps.RunCollector.SetStatus(audit.RunStatusNotRequired)
+		}
+		return fmt.Sprintf("TASK_COMPLETE: %s\nverification_status: NOT_REQUIRED", in.Summary), nil
+	}
+	if strings.TrimSpace(deps.Pack.VerifyCmd) == "" {
+		return "", errors.New("complete_task: required verifier is missing; refusing to certify")
 	}
 
 	// Native Go check for linux-desktop-entries: file exists,
 	// desktop-file-validate returns 0, Exec= binary resolves via LookPath.
 	if deps.Pack.ID == "linux-desktop-entries" {
-		if err := nativeDesktopEntryVerify(in.TargetArtifacts, deps.Pack.AllowedPaths); err != nil {
+		if deps.Executor != nil && deps.Executor.IsRemote() {
+			return "HARNESS_VERIFICATION_FAILED: native desktop-entry verification is unavailable for remote targets.", nil
+		}
+		resolved, err := resolveVerificationTarget(in.TargetArtifacts, deps.CWD, deps.Pack.AllowedPaths)
+		if err != nil {
 			return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: %s. Fix the issue and verify again.", err), nil
+		}
+		in.TargetArtifacts = resolved
+		if err := nativeDesktopEntryVerify(ctx, resolved); err != nil {
+			status := audit.VerificationFailed
+			prefix := "HARNESS_VERIFICATION_FAILED"
+			var unavailable *verificationUnavailableError
+			if errors.As(err, &unavailable) {
+				status = audit.VerificationUnavailable
+				prefix = "HARNESS_VERIFICATION_UNAVAILABLE"
+			}
+			if deps.RunCollector != nil {
+				deps.RunCollector.RecordVerification(audit.VerificationRecord{Timestamp: time.Now().UTC(), Passed: false, Status: status, Output: err.Error()})
+			}
+			return fmt.Sprintf("%s: %s. Fix the issue and verify again.", prefix, err), nil
 		}
 	}
 
-	// export LNTA_TARGET makes the target available as data for the entire
-	// verify_cmd. Packs must reference $LNTA_TARGET literally and must not
-	// interpolate target_artifacts into shell text.
-	verifyCmd := "export LNTA_TARGET=" + shellQuoteTarget(in.TargetArtifacts) + "; " + deps.Pack.VerifyCmd
+	verifyEnv, err := makeVerificationEnv(deps.Pack.VerifyCmd, in.TargetArtifacts, in.VerificationInputs)
+	if err != nil {
+		return "HARNESS_VERIFICATION_FAILED: " + err.Error(), nil
+	}
+	verifyCmd := deps.Pack.VerifyCmd
 
 	// Execute verify_cmd inside the sandbox with a finite timeout.
 	cwd := deps.CWD
 	if cwd == "" {
 		cwd = "/"
 	}
-	res, err := deps.Executor.RunReadOnly(ctx, verifyCmd, cwd, 2*time.Minute)
-	if err != nil {
+	if deps.Executor == nil {
+		return "HARNESS_VERIFICATION_FAILED: no target executor is configured", nil
+	}
+	res, err := deps.Executor.RunReadOnlyEnv(ctx, verifyCmd, cwd, 2*time.Minute, verifyEnv)
+	var processExit *exec.ExitError
+	if err != nil && (ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || res.ExitCode == 0 || !errors.As(err, &processExit) || res.ExitCode == 127) {
 		// Record failed verification
 		if deps.RunCollector != nil {
 			deps.RunCollector.RecordVerification(audit.VerificationRecord{
@@ -495,9 +560,10 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 				Output:    res.Stderr,
 				Timestamp: time.Now().UTC(),
 				Passed:    false,
+				Status:    audit.VerificationUnavailable,
 			})
 		}
-		return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: verify_cmd failed to run: %v. stderr: %s. Fix the issue and verify again.",
+		return fmt.Sprintf("HARNESS_VERIFICATION_UNAVAILABLE: verify_cmd could not run: %v. stderr: %s. Install or repair the verifier, then retry.",
 			err, res.Stderr), nil
 	}
 	if res.ExitCode != 0 {
@@ -510,6 +576,7 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 				Output:    stderr,
 				Timestamp: time.Now().UTC(),
 				Passed:    false,
+				Status:    audit.VerificationFailed,
 			})
 		}
 		return fmt.Sprintf("HARNESS_VERIFICATION_FAILED: verify_cmd exited %d. stderr: %s. Fix the issue and verify again.",
@@ -524,6 +591,7 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 			Output:    res.Stdout,
 			Timestamp: time.Now().UTC(),
 			Passed:    true,
+			Status:    audit.VerificationPassed,
 		})
 	}
 
@@ -536,41 +604,175 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	return b.String(), nil
 }
 
-// shellQuoteTarget single-quotes s for shell use so it is data, never code.
-func shellQuoteTarget(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+var verifyPlaceholder = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+type verificationUnavailableError struct{ err error }
+
+func (e *verificationUnavailableError) Error() string { return e.err.Error() }
+func (e *verificationUnavailableError) Unwrap() error { return e.err }
+
+func makeVerificationEnv(command, target string, inputs map[string]string) ([]string, error) {
+	values := make(map[string]string, len(inputs)+1)
+	keyPattern := regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	for key, value := range inputs {
+		if !keyPattern.MatchString(key) || strings.ContainsRune(value, 0) || len(value) > 4096 {
+			return nil, fmt.Errorf("invalid verification input %q", key)
+		}
+		values[key] = value
+	}
+	if target != "" {
+		if existing, ok := values["target"]; ok && existing != target {
+			return nil, fmt.Errorf("verification input target conflicts with target_artifacts")
+		}
+		values["target"] = target
+	}
+	for _, match := range verifyPlaceholder.FindAllStringSubmatch(command, -1) {
+		if match[1] == "LNTA_TARGET" && target != "" {
+			continue
+		}
+		if _, ok := values[match[1]]; !ok {
+			return nil, fmt.Errorf("verification input %q is required by verify_cmd", match[1])
+		}
+	}
+	env := []string{"LNTA_TARGET=" + target}
+	for key, value := range values {
+		env = append(env, key+"="+value)
+	}
+	return env, nil
 }
 
-// nativeDesktopEntryVerify performs the native Go verification for the
-// linux-desktop-entries pack: the target desktop entry file exists,
-// desktop-file-validate returns 0 (if installed), and the binary referenced by
-// Exec= resolves via exec.LookPath.
-func nativeDesktopEntryVerify(target string, allowedPaths []string) error {
-	resolved := target
+// resolveVerificationTarget canonicalizes a target once, denies symlinks, and
+// applies the active pack's allowlist even when it is empty.
+func resolveVerificationTarget(target, cwd string, allowedPaths []string) (string, error) {
+	if target == "" {
+		return "", fmt.Errorf("verification target is empty")
+	}
+	if strings.HasPrefix(target, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		target = filepath.Join(home, target[2:])
+	}
 	if !filepath.IsAbs(target) {
-		if abs, err := filepath.Abs(target); err == nil {
-			resolved = abs
+		if cwd == "" {
+			cwd, _ = os.Getwd()
 		}
+		target = filepath.Join(cwd, target)
 	}
-	if len(allowedPaths) > 0 && !sandbox.PathAllowed(resolved, allowedPaths) {
-		return fmt.Errorf("target desktop entry %q is outside allowed_paths %v", target, allowedPaths)
-	}
-
-	if _, err := os.Stat(target); err != nil {
-		return fmt.Errorf("desktop entry %q does not exist: %v", target, err)
-	}
-
-	if validatePath, err := exec.LookPath("desktop-file-validate"); err == nil {
-		cmd := exec.Command(validatePath, target)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("desktop-file-validate %q failed: %v\n%s", target, err, string(out))
-		}
-	}
-
-	data, err := os.ReadFile(target)
+	resolved, err := filepath.Abs(target)
 	if err != nil {
-		return fmt.Errorf("read %q: %v", target, err)
+		return "", fmt.Errorf("resolve verification target: %w", err)
 	}
+	resolved = filepath.Clean(resolved)
+	parent, err := filepath.EvalSymlinks(filepath.Dir(resolved))
+	if err != nil {
+		return "", fmt.Errorf("resolve verification target parent: %w", err)
+	}
+	resolved = filepath.Join(parent, filepath.Base(resolved))
+	fi, err := os.Lstat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("verification target %q is unavailable: %w", resolved, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("verification target %q must be a regular non-symlink file", resolved)
+	}
+	if !sandbox.PathAllowed(resolved, allowedPaths) {
+		return "", fmt.Errorf("verification target %q is outside allowed_paths", resolved)
+	}
+	return resolved, nil
+}
+
+// nativeDesktopEntryVerify requires the validator and bounds its runtime and
+// output. A missing validator is an unavailable verification, never a pass.
+func nativeDesktopEntryVerify(ctx context.Context, target string) error {
+	validatePath, err := findDesktopValidator([]string{"/usr/bin", "/bin", "/usr/local/bin"})
+	if err != nil {
+		return &verificationUnavailableError{err: err}
+	}
+	parentPath := filepath.Dir(target)
+	root, err := os.OpenRoot(parentPath)
+	if err != nil {
+		return fmt.Errorf("open desktop entry parent: %w", err)
+	}
+	defer root.Close()
+	resolvedParent, err := filepath.EvalSymlinks(parentPath)
+	if err != nil || filepath.Clean(resolvedParent) != filepath.Clean(parentPath) {
+		return fmt.Errorf("desktop entry parent changed during verification")
+	}
+	openedParent, err := root.Stat(".")
+	if err != nil {
+		return fmt.Errorf("stat opened desktop entry parent: %w", err)
+	}
+	currentParent, err := os.Stat(parentPath)
+	if err != nil || !os.SameFile(openedParent, currentParent) {
+		return fmt.Errorf("desktop entry parent changed during verification")
+	}
+	base := filepath.Base(target)
+	before, err := root.Lstat(base)
+	if err != nil || !before.Mode().IsRegular() {
+		return fmt.Errorf("desktop entry is unavailable or not a regular file")
+	}
+	f, err := root.OpenFile(base, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open desktop entry without following symlinks: %w", err)
+	}
+	defer f.Close()
+	after, err := f.Stat()
+	if err != nil || !os.SameFile(before, after) {
+		return fmt.Errorf("desktop entry changed during verification")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 1<<20+1))
+	if err != nil {
+		return fmt.Errorf("read desktop entry: %w", err)
+	}
+	if len(data) > 1<<20 {
+		return fmt.Errorf("desktop entry exceeds 1 MiB limit")
+	}
+	verifyDir, err := os.MkdirTemp("", "lnta-desktop-verify-*")
+	if err != nil {
+		return fmt.Errorf("create desktop verification directory: %w", err)
+	}
+	defer os.RemoveAll(verifyDir)
+	verifyPath := filepath.Join(verifyDir, "entry.desktop")
+	verifyFile, err := os.OpenFile(verifyPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("stage desktop entry for validation: %w", err)
+	}
+	if _, err := verifyFile.Write(data); err != nil {
+		_ = verifyFile.Close()
+		return fmt.Errorf("stage desktop entry for validation: %w", err)
+	}
+	if err := verifyFile.Close(); err != nil {
+		return fmt.Errorf("close staged desktop entry: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, validatePath, verifyPath)
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + verifyDir, "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "NO_COLOR=1"}
+	sandbox.ConfigureProcessGroup(cmd)
+	stdout := sandbox.NewCappedBuffer(8*1024, 64*1024, cancel)
+	stderr := sandbox.NewCappedBuffer(8*1024, 64*1024, cancel)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.WaitDelay = 2 * time.Second
+	sandbox.RegisterChild(cmd)
+	defer sandbox.UnregisterChild(cmd)
+	defer func() {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}()
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return &verificationUnavailableError{err: fmt.Errorf("desktop-file-validate timed out or was cancelled: %w", ctx.Err())}
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return &verificationUnavailableError{err: fmt.Errorf("start desktop-file-validate: %w", err)}
+		}
+		return fmt.Errorf("desktop-file-validate failed: %w: %s", err, stderr.Render())
+	}
+
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "Exec=") {
@@ -584,16 +786,44 @@ func nativeDesktopEntryVerify(target string, allowedPaths []string) error {
 		}
 		bin := fields[0]
 		if strings.Contains(bin, "/") {
-			if _, err := os.Stat(bin); err != nil {
+			info, err := os.Stat(bin)
+			if err != nil {
 				return fmt.Errorf("exec binary %q does not exist: %v", bin, err)
+			}
+			if info.IsDir() || info.Mode()&0o111 == 0 {
+				return fmt.Errorf("exec binary %q is not executable", bin)
 			}
 			continue
 		}
-		if _, err := exec.LookPath(bin); err != nil {
-			return fmt.Errorf("exec binary %q not found in PATH: %v", bin, err)
+		if !systemPathExecutable(bin) {
+			return fmt.Errorf("exec binary %q not found in system PATH", bin)
 		}
 	}
 	return nil
+}
+
+func findDesktopValidator(dirs []string) (string, error) {
+	for _, dir := range dirs {
+		candidate := filepath.Join(dir, "desktop-file-validate")
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			resolved, err := filepath.EvalSymlinks(candidate)
+			if err == nil {
+				return resolved, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("required desktop-file-validate is unavailable in system binary paths")
+}
+
+func systemPathExecutable(name string) bool {
+	for _, dir := range []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/sbin", "/sbin"} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // stripDesktopFieldCodes removes desktop entry field codes (%f, %u, %F, %U,
@@ -615,18 +845,18 @@ func stripDesktopFieldCodes(s string) string {
 
 // --- local dry-run preview helpers -----------------------------------------
 
-// previewScopedWrite validates targetPath against allowedGlobs and computes
-// the unified diff between existing and proposed content without persisting
-// anything to disk. It mirrors sandbox.ScopedWriteFile's scope checks but
-// performs no write, so it is safe to use in --dry-run mode.
-func previewScopedWrite(targetPath string, content []byte, allowedGlobs []string) (sandbox.FileDiff, error) {
+func previewScopedWriteMode(targetPath string, content []byte, mode os.FileMode, allowedGlobs []string) (sandbox.FileDiff, error) {
 	var diff sandbox.FileDiff
 	diff.TargetPath = targetPath
+	if err := sandbox.CheckDiffLimits(nil, content); err != nil {
+		return diff, err
+	}
 
 	resolved, err := previewResolveTarget(targetPath)
 	if err != nil {
 		return diff, err
 	}
+	diff.TargetPath = resolved
 	if !previewPathAllowed(resolved, allowedGlobs) {
 		return diff, &sandbox.ScopeViolationError{
 			TargetPath:   targetPath,
@@ -635,8 +865,11 @@ func previewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 		}
 	}
 
-	fi, statErr := os.Stat(resolved)
+	fi, statErr := os.Lstat(resolved)
 	exists := statErr == nil
+	if exists && fi.Mode()&os.ModeSymlink != 0 {
+		return diff, fmt.Errorf("target %q is a symlink; refusing to preview", resolved)
+	}
 	var oldContent []byte
 	var oldMode os.FileMode = 0o644
 
@@ -646,6 +879,9 @@ func previewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 		}
 		oldContent, err = os.ReadFile(resolved)
 		if err != nil {
+			return diff, err
+		}
+		if err := sandbox.CheckDiffLimits(oldContent, content); err != nil {
 			return diff, err
 		}
 		oldMode = fi.Mode().Perm()
@@ -662,9 +898,12 @@ func previewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 	diff.SizeNew = int64(len(content))
 	diff.Diff = previewUnifiedDiff(resolved, resolved, oldContent, content)
 
-	newMode := oldMode
-	if !exists || newMode == 0 {
-		newMode = 0o644
+	newMode := oldMode.Perm()
+	if !exists {
+		newMode = mode.Perm()
+		if newMode == 0 {
+			newMode = 0o644
+		}
 	}
 	diff.Mode = newMode
 	return diff, nil
@@ -673,7 +912,11 @@ func previewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 // previewResolveTarget expands ~ and resolves symlinks on the parent directory.
 func previewResolveTarget(targetPath string) (string, error) {
 	p := previewExpandPath(targetPath)
-	p = filepath.Clean(p)
+	var err error
+	p, err = filepath.Abs(filepath.Clean(p))
+	if err != nil {
+		return "", fmt.Errorf("resolve target path: %w", err)
+	}
 	parent := filepath.Dir(p)
 	resolvedParent, err := filepath.EvalSymlinks(parent)
 	if err != nil {

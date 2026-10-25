@@ -125,7 +125,7 @@ verify_cmd: true
 ---
 Body`
 	tmpDir := t.TempDir()
-tmpFile := filepath.Join(tmpDir, "glob.md")
+	tmpFile := filepath.Join(tmpDir, "glob.md")
 	if err := os.WriteFile(tmpFile, []byte(pack), 0o644); err != nil {
 		t.Fatalf("write temp file: %v", err)
 	}

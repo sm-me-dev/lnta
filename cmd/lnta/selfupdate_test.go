@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -73,6 +74,19 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad lnta_0.1.0_linu
 	_, err = parseChecksums(checksumsData, "nonexistent.tar.gz")
 	if err == nil {
 		t.Errorf("expected error for nonexistent asset, got nil")
+	}
+}
+
+func TestVerifyReleaseChecksumsRejectsUnsignedOrInvalidData(t *testing.T) {
+	if _, err := exec.LookPath("gpg"); err != nil {
+		t.Skip("gpg is not installed")
+	}
+	if _, err := exec.LookPath("gpgv"); err != nil {
+		t.Skip("gpgv is not installed")
+	}
+	err := verifyReleaseChecksums([]byte("checksums"), []byte("not a signature"))
+	if err == nil {
+		t.Fatal("invalid checksum signature was accepted")
 	}
 }
 

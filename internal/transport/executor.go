@@ -16,13 +16,14 @@ type TargetExecutor interface {
 	// RunReadOnly executes a read-only command on the target.
 	// Mirrors sandbox.RunReadOnly signature.
 	RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (sandbox.CommandResult, error)
+	RunReadOnlyEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error)
 
 	// ReadFile reads a file from the target and returns its content.
 	ReadFile(ctx context.Context, path string) ([]byte, os.FileInfo, error)
 
-	// WriteFile writes a file to the target, creating parent dirs as needed.
-	// Returns the resolved path and file info of the written file.
-	WriteFile(ctx context.Context, path string, content []byte, mode os.FileMode) (string, os.FileInfo, error)
+	// WriteFile writes a file within the supplied allowlist and returns the
+	// accurate transactional diff. Parent directories are never created.
+	WriteFile(ctx context.Context, path string, content []byte, mode os.FileMode, allowedGlobs []string, expected *sandbox.FileDiff) (sandbox.FileDiff, error)
 
 	// StatFile stats a file on the target.
 	StatFile(ctx context.Context, path string) (os.FileInfo, error)
@@ -47,13 +48,15 @@ type TargetExecutor interface {
 
 // RemoteFingerprint captures remote host identity for display/validation.
 type RemoteFingerprint struct {
-	Host           string            // user@host:port
-	OSRelease      map[string]string // /etc/os-release key/value
-	Path           string            // $PATH
-	UID            int               // remote uid
-	GID            int               // remote gid
-	Username       string            // remote username
-	Binaries       map[string]bool   // binary availability
-	HasBwrap       bool              // whether bwrap is available on remote
+	Host            string            // user@host:port
+	OSRelease       map[string]string // /etc/os-release key/value
+	Path            string            // $PATH
+	Home            string            // remote home directory
+	UID             int               // remote uid
+	GID             int               // remote gid
+	Username        string            // remote username
+	Binaries        map[string]bool   // binary availability
+	HasBwrap        bool              // bwrap was found and the required isolation probe passed
+	SandboxError    string            // probe failure diagnostic
 	FingerprintedAt time.Time
 }

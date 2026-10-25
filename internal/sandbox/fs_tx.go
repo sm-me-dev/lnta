@@ -1,7 +1,7 @@
 // Package sandbox provides a transactional, scope-checked file writer with an
 // undo log, plus bwrap-based read-only sandboxed execution.
 //
- // See AGENTS.md "Architectural Non-Negotiables".
+// See AGENTS.md "Architectural Non-Negotiables".
 package sandbox
 
 import (
@@ -54,6 +54,7 @@ func manifestPath(runID string) string {
 // FileDiff describes the result of a ScopedWriteFile operation: what changed,
 // the old/new content hashes, and a unified diff of old vs. new.
 type FileDiff struct {
+	Status     string      `json:"status"`
 	TargetPath string      `json:"target_path"`
 	Created    bool        `json:"created"`
 	Mode       os.FileMode `json:"mode"` // new file permission bits
@@ -72,6 +73,34 @@ type ScopeViolationError struct {
 	TargetPath   string
 	Resolved     string
 	AllowedGlobs []string
+}
+
+const (
+	maxScopedFileBytes  = 1 << 20
+	maxUnifiedDiffLines = 2000
+)
+
+// CheckDiffLimits keeps the LCS-based preview bounded for both trusted files
+// and model-provided content. Oversized changes fail closed instead of
+// producing a misleading partial diff or exhausting memory.
+func CheckDiffLimits(oldContent, newContent []byte) error {
+	if len(oldContent) > maxScopedFileBytes || len(newContent) > maxScopedFileBytes {
+		return fmt.Errorf("scoped files are limited to %d bytes", maxScopedFileBytes)
+	}
+	lines := func(data []byte) int {
+		if len(data) == 0 {
+			return 0
+		}
+		count := bytes.Count(data, []byte{'\n'})
+		if data[len(data)-1] != '\n' {
+			count++
+		}
+		return count
+	}
+	if lines(oldContent)+lines(newContent) > maxUnifiedDiffLines {
+		return fmt.Errorf("scoped file diff is limited to %d combined lines", maxUnifiedDiffLines)
+	}
+	return nil
 }
 
 func (e *ScopeViolationError) Error() string {
@@ -97,6 +126,8 @@ type manifestEntry struct {
 
 // manifestMu synchronizes manifest read-modify-write operations in-process.
 var manifestMu sync.Mutex
+
+var scopedWriteLocks sync.Map // map[canonical target path]*sync.Mutex
 
 // manifest is the undo log for a single run.
 type manifest struct {
@@ -245,7 +276,10 @@ func hunkRange(hunk []edit, old bool) (start, count int) {
 // returns the fully resolved path.
 func resolveTarget(targetPath string) (string, error) {
 	p := expandPath(targetPath)
-	p = filepath.Clean(p)
+	p, err := filepath.Abs(filepath.Clean(p))
+	if err != nil {
+		return "", fmt.Errorf("resolve target path: %w", err)
+	}
 	parent := filepath.Dir(p)
 	resolvedParent, err := filepath.EvalSymlinks(parent)
 	if err != nil {
@@ -288,21 +322,32 @@ func appendManifestEntry(runID string, entry manifestEntry) error {
 	}
 
 	lockPath := filepath.Join(snapDir, ".lock")
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err == nil {
-		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX)
-		defer func() {
-			_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
-			_ = lockFile.Close()
-		}()
+	snapRoot, err := os.OpenRoot(snapDir)
+	if err != nil {
+		return fmt.Errorf("open snapshot directory: %w", err)
 	}
+	defer snapRoot.Close()
+	lockFile, err := snapRoot.OpenFile(filepath.Base(lockPath), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("open snapshot lock: %w", err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lockFile.Close()
+		return fmt.Errorf("lock snapshot manifest: %w", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+	}()
 
 	m := manifest{RunID: runID}
-	data, err := os.ReadFile(manifestPath(runID))
+	data, err := readRootFile(snapRoot, "manifest.json")
 	if err == nil {
 		if jerr := json.Unmarshal(data, &m); jerr != nil {
 			return jerr
 		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read snapshot manifest: %w", err)
 	}
 	m.Entries = append(m.Entries, entry)
 	return writeManifest(snapDir, m)
@@ -314,8 +359,13 @@ func writeManifest(snapDir string, m manifest) error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(snapDir, ".manifest.tmp")
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	root, err := os.OpenRoot(snapDir)
+	if err != nil {
+		return fmt.Errorf("open snapshot directory: %w", err)
+	}
+	defer root.Close()
+	tmp := fmt.Sprintf(".manifest.tmp-%d-%d", os.Getpid(), time.Now().UnixNano())
+	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}
@@ -330,7 +380,55 @@ func writeManifest(snapDir string, m manifest) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(snapDir, "manifest.json"))
+	if err := root.Rename(tmp, "manifest.json"); err != nil {
+		_ = root.Remove(tmp)
+		return err
+	}
+	if dir, err := root.Open("."); err == nil {
+		defer dir.Close()
+		if err := dir.Sync(); err != nil {
+			return fmt.Errorf("sync snapshot directory: %w", err)
+		}
+	}
+	return nil
+}
+
+func writeSnapshotBlob(snapDir, blobName string, content []byte) error {
+	root, err := os.OpenRoot(snapDir)
+	if err != nil {
+		return fmt.Errorf("open snapshot directory: %w", err)
+	}
+	defer root.Close()
+	if info, err := root.Lstat(blobName); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("snapshot backup %q is not a regular file", blobName)
+		}
+		existing, err := readRootFile(root, blobName)
+		if err != nil {
+			return fmt.Errorf("read existing snapshot backup: %w", err)
+		}
+		if !bytes.Equal(existing, content) {
+			return fmt.Errorf("snapshot backup name collision for %q", blobName)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect snapshot backup: %w", err)
+	}
+	f, err := root.OpenFile(blobName, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("create snapshot backup: %w", err)
+	}
+	if _, err := f.Write(content); err != nil {
+		_ = f.Close()
+		_ = root.Remove(blobName)
+		return fmt.Errorf("write snapshot backup: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = root.Remove(blobName)
+		return fmt.Errorf("sync snapshot backup: %w", err)
+	}
+	return f.Close()
 }
 
 // ScopedWriteFile atomically writes content to targetPath under the scope
@@ -349,13 +447,30 @@ func writeManifest(snapDir string, m manifest) error {
 // The manifest at ~/.local/share/lnta/snapshots/<run_id>/manifest.json is
 // updated so RollbackRun can restore exact byte-for-byte state.
 func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlobs []string) (FileDiff, error) {
+	return ScopedWriteFileApproved(runID, targetPath, content, allowedGlobs, nil)
+}
+
+// ScopedWriteFileApproved additionally requires the current file state to
+// match the diff shown during approval. A mismatch aborts before any write.
+func ScopedWriteFileApproved(runID string, targetPath string, content []byte, allowedGlobs []string, expected *FileDiff) (FileDiff, error) {
+	return ScopedWriteFileApprovedMode(runID, targetPath, content, 0o644, allowedGlobs, expected)
+}
+
+// ScopedWriteFileApprovedMode preserves an existing file's permission bits
+// and applies requestedMode to newly created files.
+func ScopedWriteFileApprovedMode(runID string, targetPath string, content []byte, requestedMode os.FileMode, allowedGlobs []string, expected *FileDiff) (FileDiff, error) {
 	var diff FileDiff
+	diff.Status = "FAILED"
 	diff.TargetPath = targetPath
+	if err := CheckDiffLimits(nil, content); err != nil {
+		return diff, err
+	}
 
 	resolved, err := resolveTarget(targetPath)
 	if err != nil {
 		return diff, err
 	}
+	diff.TargetPath = resolved
 
 	if !pathAllowed(resolved, allowedGlobs) {
 		return diff, &ScopeViolationError{
@@ -364,13 +479,54 @@ func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlo
 			AllowedGlobs: allowedGlobs,
 		}
 	}
+	if !runIDRE.MatchString(runID) || strings.Contains(runID, "..") {
+		return diff, fmt.Errorf("invalid run id %q", runID)
+	}
+	lockValue, _ := scopedWriteLocks.LoadOrStore(resolved, &sync.Mutex{})
+	pathLock := lockValue.(*sync.Mutex)
+	pathLock.Lock()
+	defer pathLock.Unlock()
+
+	parentPath := filepath.Dir(resolved)
+	root, err := os.OpenRoot(parentPath)
+	if err != nil {
+		return diff, fmt.Errorf("open target parent %q: %w", parentPath, err)
+	}
+	defer root.Close()
+	// Re-resolve after opening the directory. If the parent was replaced by a
+	// symlink between validation and open, reject instead of following it.
+	resolvedAgain, err := filepath.EvalSymlinks(parentPath)
+	if err != nil || filepath.Clean(resolvedAgain) != filepath.Clean(parentPath) {
+		return diff, fmt.Errorf("target parent changed during validation")
+	}
+	parentFD, err := root.Open(".")
+	if err != nil {
+		return diff, fmt.Errorf("open target parent descriptor: %w", err)
+	}
+	defer parentFD.Close()
+	openedParentInfo, err := root.Stat(".")
+	if err != nil {
+		return diff, fmt.Errorf("stat opened target parent: %w", err)
+	}
+	currentParentInfo, err := os.Stat(parentPath)
+	if err != nil || !os.SameFile(openedParentInfo, currentParentInfo) {
+		return diff, fmt.Errorf("target parent changed during validation")
+	}
+	if err := syscall.Flock(int(parentFD.Fd()), syscall.LOCK_EX); err != nil {
+		return diff, fmt.Errorf("lock target parent: %w", err)
+	}
+	defer syscall.Flock(int(parentFD.Fd()), syscall.LOCK_UN)
+	base := filepath.Base(resolved)
 
 	snapDir := snapshotDir(runID)
 	if err := os.MkdirAll(snapDir, 0o700); err != nil {
 		return diff, err
 	}
 
-	fi, statErr := os.Lstat(resolved)
+	fi, statErr := root.Lstat(base)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return diff, fmt.Errorf("inspect target %q: %w", resolved, statErr)
+	}
 	if statErr == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return diff, fmt.Errorf("target %q is a symlink; refusing to write", resolved)
 	}
@@ -387,9 +543,14 @@ func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlo
 			return diff, fmt.Errorf("target %q is not a regular file", resolved)
 		}
 		// Read backup with O_NOFOLLOW to avoid symlink races
-		f, rerr := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		f, rerr := root.OpenFile(base, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if rerr != nil {
 			return diff, fmt.Errorf("open target for backup %q: %w", resolved, rerr)
+		}
+		openedInfo, serr := f.Stat()
+		if serr != nil || !os.SameFile(fi, openedInfo) {
+			_ = f.Close()
+			return diff, fmt.Errorf("target %q changed during validation", resolved)
 		}
 		oldContent, err = io.ReadAll(f)
 		_ = f.Close()
@@ -397,16 +558,26 @@ func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlo
 			return diff, err
 		}
 		oldMode = fi.Mode().Perm()
+		diff.Mode = oldMode
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+			return diff, fmt.Errorf("target %q has multiple hard links; refusing to replace it", resolved)
+		}
 		diff.OldMode = oldMode
 		oldSum := sha256.Sum256(oldContent)
 		diff.OldSHA256 = hex.EncodeToString(oldSum[:])
+		if expected != nil && (expected.Created != diff.Created || expected.OldSHA256 != diff.OldSHA256 || expected.NewSHA256 != diff.NewSHA256 || expected.OldMode.Perm() != diff.OldMode.Perm() || expected.Mode.Perm() != diff.Mode.Perm() || expected.TargetPath != resolved) {
+			return diff, fmt.Errorf("target changed after approval preview; no write was performed")
+		}
 
+		diff.SizeOld = int64(len(oldContent))
+		if err := CheckDiffLimits(oldContent, content); err != nil {
+			return diff, err
+		}
 		// Backup blob: original content, mode, hash recorded in manifest.
 		blobName := fmt.Sprintf("backup-%x.bin", oldSum[:8])
-		if werr := os.WriteFile(filepath.Join(snapDir, blobName), oldContent, 0o600); werr != nil {
-			return diff, werr
+		if err := writeSnapshotBlob(snapDir, blobName, oldContent); err != nil {
+			return diff, err
 		}
-		diff.SizeOld = int64(len(oldContent))
 		if err := appendManifestEntry(runID, manifestEntry{
 			Path:       filepath.Base(resolved),
 			Root:       filepath.Dir(resolved),
@@ -418,8 +589,16 @@ func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlo
 		}); err != nil {
 			return diff, err
 		}
+		diff.Status = "PREPARED"
 	} else {
 		diff.Created = true
+		diff.Mode = requestedMode.Perm()
+		if diff.Mode == 0 {
+			diff.Mode = 0o644
+		}
+		if expected != nil && (expected.Created != diff.Created || expected.OldSHA256 != diff.OldSHA256 || expected.NewSHA256 != diff.NewSHA256 || expected.Mode.Perm() != diff.Mode.Perm() || expected.TargetPath != resolved) {
+			return diff, fmt.Errorf("target changed after approval preview; no write was performed")
+		}
 		if err := appendManifestEntry(runID, manifestEntry{
 			Path:       filepath.Base(resolved),
 			Root:       filepath.Dir(resolved),
@@ -428,40 +607,66 @@ func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlo
 		}); err != nil {
 			return diff, err
 		}
+		diff.Status = "PREPARED"
 	}
 
 	diff.Diff = unifiedDiff(resolved, resolved, oldContent, content)
 
 	// Atomic write: temp file in same directory, fsync, then rename.
-	newMode := oldMode
-	if !exists || newMode == 0 {
-		newMode = 0o644
+	newMode := oldMode.Perm()
+	if !exists {
+		newMode = requestedMode.Perm()
+		if newMode == 0 {
+			newMode = 0o644
+		}
 	}
-	tmpName := filepath.Join(filepath.Dir(resolved),
-		fmt.Sprintf(".lnta-tmp-%d-%d", os.Getpid(), time.Now().UnixNano()))
-	tf, err := os.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, newMode)
+	tmpName := fmt.Sprintf(".lnta-tmp-%d-%d", os.Getpid(), time.Now().UnixNano())
+	tf, err := root.OpenFile(tmpName, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, newMode)
 	if err != nil {
 		return diff, err
 	}
 	if _, err := tf.Write(content); err != nil {
 		_ = tf.Close()
-		_ = os.Remove(tmpName)
+		_ = root.Remove(tmpName)
 		return diff, err
+	}
+	if err := tf.Chmod(newMode); err != nil {
+		_ = tf.Close()
+		_ = root.Remove(tmpName)
+		return diff, fmt.Errorf("set target permissions: %w", err)
 	}
 	if err := tf.Sync(); err != nil {
 		_ = tf.Close()
-		_ = os.Remove(tmpName)
+		_ = root.Remove(tmpName)
 		return diff, err
 	}
 	if err := tf.Close(); err != nil {
-		_ = os.Remove(tmpName)
+		_ = root.Remove(tmpName)
 		return diff, err
 	}
-	if err := os.Rename(tmpName, resolved); err != nil {
-		_ = os.Remove(tmpName)
+	if err := root.Rename(tmpName, base); err != nil {
+		_ = root.Remove(tmpName)
 		return diff, err
+	}
+	diff.Status = "INCOMPLETE"
+	if err := parentFD.Sync(); err != nil {
+		return diff, fmt.Errorf("sync target parent: %w", err)
+	}
+	verify, err := root.OpenFile(base, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return diff, fmt.Errorf("verify written target: %w", err)
+	}
+	written, err := io.ReadAll(verify)
+	_ = verify.Close()
+	if err != nil {
+		return diff, fmt.Errorf("read back written target: %w", err)
+	}
+	writtenHash := sha256.Sum256(written)
+	if hex.EncodeToString(writtenHash[:]) != diff.NewSHA256 {
+		return diff, fmt.Errorf("written target verification failed: content hash mismatch")
 	}
 	diff.Mode = newMode
+	diff.Status = "COMMITTED"
 
 	audit.Log("fs.scoped_write", "", map[string]string{
 		"path":    resolved,
@@ -478,13 +683,23 @@ func ScopedWriteFile(runID string, targetPath string, content []byte, allowedGlo
 // would be written without persisting any change. A non-existent target is
 // reported with Created: true.
 func PreviewScopedWrite(targetPath string, content []byte, allowedGlobs []string) (FileDiff, error) {
+	return PreviewScopedWriteMode(targetPath, content, 0o644, allowedGlobs)
+}
+
+// PreviewScopedWriteMode previews the permission mode that the atomic writer
+// will apply to a newly created file.
+func PreviewScopedWriteMode(targetPath string, content []byte, requestedMode os.FileMode, allowedGlobs []string) (FileDiff, error) {
 	var diff FileDiff
 	diff.TargetPath = targetPath
+	if err := CheckDiffLimits(nil, content); err != nil {
+		return diff, err
+	}
 
 	resolved, err := resolveTarget(targetPath)
 	if err != nil {
 		return diff, err
 	}
+	diff.TargetPath = resolved
 
 	if !pathAllowed(resolved, allowedGlobs) {
 		return diff, &ScopeViolationError{
@@ -494,8 +709,11 @@ func PreviewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 		}
 	}
 
-	fi, statErr := os.Stat(resolved)
+	fi, statErr := os.Lstat(resolved)
 	exists := statErr == nil
+	if exists && fi.Mode()&os.ModeSymlink != 0 {
+		return diff, fmt.Errorf("target %q is a symlink; refusing to preview", resolved)
+	}
 	var oldContent []byte
 	var oldMode os.FileMode = 0o644
 
@@ -505,6 +723,9 @@ func PreviewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 		}
 		oldContent, err = os.ReadFile(resolved)
 		if err != nil {
+			return diff, err
+		}
+		if err := CheckDiffLimits(oldContent, content); err != nil {
 			return diff, err
 		}
 		oldMode = fi.Mode().Perm()
@@ -522,9 +743,12 @@ func PreviewScopedWrite(targetPath string, content []byte, allowedGlobs []string
 	diff.Diff = unifiedDiff(resolved, resolved, oldContent, content)
 
 	// Mode reporting only; no write occurs.
-	newMode := oldMode
-	if !exists || newMode == 0 {
-		newMode = 0o644
+	newMode := oldMode.Perm()
+	if !exists {
+		newMode = requestedMode.Perm()
+		if newMode == 0 {
+			newMode = 0o644
+		}
 	}
 	diff.Mode = newMode
 	return diff, nil
@@ -626,21 +850,34 @@ func rollbackLocalManifest(snapRoot *os.Root, runID string) error {
 		}
 
 		if e.Created {
-			// Newly created file: delete it (confined to targetRoot).
-			// M5: check if file was modified concurrently after run
-			if e.PostSHA256 != "" {
-				curBytes, rerr := readRootFile(targetRoot, e.Path)
-				if rerr == nil {
-					curSum := sha256.Sum256(curBytes)
-					if hex.EncodeToString(curSum[:]) != e.PostSHA256 {
-						targetRoot.Close()
-						return fmt.Errorf("concurrent modification detected on %q: content changed since run %s", e.Path, runID)
-					}
-				}
+			// A missing file means a previous rollback or interrupted operation
+			// already removed it. Any other content change is a conflict.
+			curBytes, rerr := readRootFile(targetRoot, e.Path)
+			if os.IsNotExist(rerr) {
+				targetRoot.Close()
+				continue
+			}
+			if rerr != nil {
+				targetRoot.Close()
+				return fmt.Errorf("read created target %q: %w", e.Path, rerr)
+			}
+			curSum := sha256.Sum256(curBytes)
+			if e.PostSHA256 != "" && hex.EncodeToString(curSum[:]) != e.PostSHA256 {
+				targetRoot.Close()
+				return fmt.Errorf("concurrent modification detected on %q: content changed since run %s", e.Path, runID)
+			}
+			fi, lerr := targetRoot.Lstat(e.Path)
+			if lerr != nil || !fi.Mode().IsRegular() {
+				targetRoot.Close()
+				return fmt.Errorf("refusing to remove non-regular created target %q", e.Path)
 			}
 			if err := targetRoot.Remove(e.Path); err != nil && !os.IsNotExist(err) {
 				targetRoot.Close()
 				return fmt.Errorf("remove created file %q: %w", e.Path, err)
+			}
+			if _, err := targetRoot.Lstat(e.Path); !os.IsNotExist(err) {
+				targetRoot.Close()
+				return fmt.Errorf("verify removed created file %q: %v", e.Path, err)
 			}
 			targetRoot.Close()
 			continue
@@ -651,15 +888,22 @@ func rollbackLocalManifest(snapRoot *os.Root, runID string) error {
 			continue
 		}
 		// M5: check if file was modified concurrently after run
-		if e.PostSHA256 != "" {
-			curBytes, rerr := readRootFile(targetRoot, e.Path)
-			if rerr == nil {
-				curSum := sha256.Sum256(curBytes)
-				if hex.EncodeToString(curSum[:]) != e.PostSHA256 {
-					targetRoot.Close()
-					return fmt.Errorf("concurrent modification detected on %q: content changed since run %s", e.Path, runID)
-				}
-			}
+		curBytes, rerr := readRootFile(targetRoot, e.Path)
+		if rerr != nil {
+			targetRoot.Close()
+			return fmt.Errorf("cannot verify current target %q before rollback: %w", e.Path, rerr)
+		}
+		curSum := sha256.Sum256(curBytes)
+		curHash := hex.EncodeToString(curSum[:])
+		if e.SHA256 != "" && curHash == e.SHA256 {
+			// Already restored, or the write-ahead entry was persisted before
+			// the original write reached its atomic rename.
+			targetRoot.Close()
+			continue
+		}
+		if e.PostSHA256 != "" && curHash != e.PostSHA256 {
+			targetRoot.Close()
+			return fmt.Errorf("concurrent modification detected on %q: content changed since run %s", e.Path, runID)
 		}
 		// Read the backup through the opened snapshot root (no path escape).
 		blob, rerr := readRootFile(snapRoot, e.Backup)
@@ -682,7 +926,7 @@ func rollbackLocalManifest(snapRoot *os.Root, runID string) error {
 		// Write temp file in the same directory, then rename (atomic within root).
 		dir := filepath.Dir(e.Path)
 		tmp := filepath.Join(dir, fmt.Sprintf(".lnta-rollback-%d-%d", os.Getpid(), time.Now().UnixNano()))
-		tf, werr := targetRoot.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+		tf, werr := targetRoot.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode)
 		if werr != nil {
 			targetRoot.Close()
 			return fmt.Errorf("write restore temp for %q: %w", e.Path, werr)
@@ -691,6 +935,11 @@ func rollbackLocalManifest(snapRoot *os.Root, runID string) error {
 			tf.Close()
 			targetRoot.Close()
 			return fmt.Errorf("write restore temp for %q: %w", e.Path, werr)
+		}
+		if werr := tf.Chmod(mode.Perm()); werr != nil {
+			tf.Close()
+			targetRoot.Close()
+			return fmt.Errorf("set restored permissions for %q: %w", e.Path, werr)
 		}
 		if werr := tf.Sync(); werr != nil {
 			tf.Close()
@@ -702,6 +951,21 @@ func rollbackLocalManifest(snapRoot *os.Root, runID string) error {
 			_ = targetRoot.Remove(tmp)
 			targetRoot.Close()
 			return fmt.Errorf("restore %q: %w", e.Path, rerr)
+		}
+		restored, verr := readRootFile(targetRoot, e.Path)
+		if verr != nil {
+			targetRoot.Close()
+			return fmt.Errorf("verify restored target %q: %w", e.Path, verr)
+		}
+		restoredHash := sha256.Sum256(restored)
+		if e.SHA256 != "" && hex.EncodeToString(restoredHash[:]) != e.SHA256 {
+			targetRoot.Close()
+			return fmt.Errorf("verify restored target %q: hash mismatch", e.Path)
+		}
+		restoredInfo, verr := targetRoot.Stat(e.Path)
+		if verr != nil || restoredInfo.Mode().Perm() != mode.Perm() {
+			targetRoot.Close()
+			return fmt.Errorf("verify restored target %q: permission mode mismatch", e.Path)
 		}
 		targetRoot.Close()
 	}
@@ -829,7 +1093,7 @@ func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin 
 		"-o", "ControlMaster=no",
 		"-o", fmt.Sprintf("ControlPath=%s/ssh-%%r@%%h:%%p", controlDir),
 		"-p", strconv.Itoa(portInt),
-		"--", user + "@" + host,
+		"--", user+"@"+host,
 		cmd,
 	)
 	sshCmd.Stdin = stdin
@@ -847,8 +1111,8 @@ func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin 
 
 // remoteManifest represents the undo log for remote files.
 type remoteManifest struct {
-	RunID      string                  `json:"run_id"`
-	RemoteHost string                  `json:"remote_host"`
+	RunID      string                `json:"run_id"`
+	RemoteHost string                `json:"remote_host"`
 	Entries    []remoteManifestEntry `json:"entries"`
 }
 

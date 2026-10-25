@@ -4,7 +4,7 @@
   <a href="https://github.com/sm-me-dev/lnta/actions/workflows/ci.yml"><img src="https://github.com/sm-me-dev/lnta/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI Build"></a>
   <a href="https://github.com/sm-me-dev/lnta/releases/latest"><img src="https://img.shields.io/github/v/release/sm-me-dev/lnta?color=blue&label=release&logo=github" alt="Latest Release"></a>
   <a href="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu"><img src="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu" alt="Ubuntu 24.04/26.04 AppArmor Ready"></a>
-  <a href="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
+  <a href="https://img.shields.io/badge/Go-1.27.2+-00ADD8?logo=go&logoColor=white"><img src="https://img.shields.io/badge/Go-1.27.2+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
 </p>
 
@@ -263,13 +263,15 @@ brew install lnta
 
 ### Option 3: Universal Standalone Installer (All Linux Distributions)
 
-Auto-detects your distribution, fetches the latest package or static binary, verifies SHA-256 signatures, and installs:
+Auto-detects your distribution, authenticates the signed release checksum file against LNTA's pinned signing-key fingerprint, verifies the downloaded package or static binary hash, and installs. The universal installer requires `gpg`/`gpgv` plus `curl` or `wget`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sm-me-dev/lnta/main/scripts/install.sh | sudo bash
 ```
 
 #### Direct Package Downloads
+
+Direct asset downloads alone do not authenticate a release. Verify the detached signature on `checksums.txt` with the LNTA key (fingerprint `45BFE7B566C24F984EF00F6AEE0178A118050BDB`) and then verify the asset hash before installing. The APT repository verifies signed metadata through APT automatically.
 
 | Distribution | Architecture | Installation Command |
 |---|---|---|
