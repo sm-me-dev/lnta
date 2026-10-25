@@ -386,7 +386,7 @@ func TestLandlockRequiresCompleteNetworkConfinementABI(t *testing.T) {
 
 func TestLandlockFallbackDoesNotExposeHostProcfs(t *testing.T) {
 	cwd := t.TempDir()
-	cfg, err := buildLandlockConfig(cwd, t.TempDir(), t.TempDir(), "true", nil)
+	cfg, err := buildLandlockConfig(cwd, cwd, t.TempDir(), t.TempDir(), "true", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

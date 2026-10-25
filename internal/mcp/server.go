@@ -80,13 +80,22 @@ type toolContent struct {
 
 // Server holds the MCP server state.
 type Server struct {
-	stdin  *bufio.Reader
-	stdout *bufio.Writer
-	router *packs.Router
+	stdin       *bufio.Reader
+	stdout      *bufio.Writer
+	router      *packs.Router
+	projectRoot string
 }
 
 // NewServer creates a new MCP server.
 func NewServer(userConfigDir string, embeddedPacks embed.FS) (*Server, error) {
+	launchDir, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("get launch directory: %w", err)
+	}
+	projectRoot, err := sandbox.ResolveProjectRoot(launchDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project root: %w", err)
+	}
 	router, err := packs.NewRouter(embeddedPacks, "packs/*.md", userConfigDir)
 	if err != nil {
 		return nil, fmt.Errorf("load packs: %w", err)
@@ -94,9 +103,10 @@ func NewServer(userConfigDir string, embeddedPacks embed.FS) (*Server, error) {
 	packs.SetDefaultRouter(router)
 
 	return &Server{
-		stdin:  bufio.NewReader(os.Stdin),
-		stdout: bufio.NewWriter(os.Stdout),
-		router: router,
+		stdin:       bufio.NewReader(os.Stdin),
+		stdout:      bufio.NewWriter(os.Stdout),
+		router:      router,
+		projectRoot: projectRoot,
 	}, nil
 }
 
@@ -281,7 +291,7 @@ func (s *Server) toolInspectSandboxed(ctx context.Context, args map[string]inter
 		return toolCallResult{}, fmt.Errorf("missing required arguments: command, cwd, reason")
 	}
 
-	res, err := sandbox.RunReadOnly(ctx, command, cwd, 0)
+	res, err := sandbox.RunReadOnlyProjectEnv(ctx, command, s.projectRoot, cwd, 0, nil)
 	if err != nil {
 		return toolCallResult{}, fmt.Errorf("sandbox execution failed: %w", err)
 	}
@@ -358,7 +368,7 @@ func (s *Server) toolVerifyTask(ctx context.Context, args map[string]interface{}
 	}
 
 	cwd := "."
-	res, err := sandbox.RunReadOnlyEnv(ctx, pack.VerifyCmd, cwd, 2*time.Minute, verifyEnv)
+	res, err := sandbox.RunReadOnlyProjectEnv(ctx, pack.VerifyCmd, s.projectRoot, cwd, 2*time.Minute, verifyEnv)
 	if err != nil {
 		return toolCallResult{}, fmt.Errorf("verify_cmd execution failed: %w", err)
 	}

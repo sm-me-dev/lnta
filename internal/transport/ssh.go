@@ -148,11 +148,12 @@ func (e *SSHExecutor) Preflight(ctx context.Context) error {
 }
 
 // RunReadOnly executes a read-only command on the remote host.
-func (e *SSHExecutor) RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (sandbox.CommandResult, error) {
-	return e.RunReadOnlyEnv(ctx, cmdStr, cwd, timeout, nil)
+func (e *SSHExecutor) RunReadOnly(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration) (sandbox.CommandResult, error) {
+	return e.RunReadOnlyEnv(ctx, cmdStr, projectRoot, cwd, timeout, nil)
 }
 
-func (e *SSHExecutor) RunReadOnlyEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error) {
+func (e *SSHExecutor) RunReadOnlyEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error) {
+	_ = projectRoot // project paths are local; remote execution is rooted by its remote CWD.
 	if e.fingerprint == nil || !e.fingerprint.HasBwrap {
 		return sandbox.CommandResult{}, fmt.Errorf("remote sandbox unavailable: run successful Preflight first")
 	}

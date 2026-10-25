@@ -265,6 +265,81 @@ func TestRunDoctorChecksExitSemantics(t *testing.T) {
 	}
 }
 
+func TestDoctorCLIExitHelper(t *testing.T) {
+	if os.Getenv("LNTA_DOCTOR_CHILD") != "1" {
+		return
+	}
+	mode := os.Getenv("LNTA_DOCTOR_CASE")
+	checks := fakeDoctorChecks(nil, nil, nil, nil, nil)
+	switch mode {
+	case "required":
+		checks = fakeDoctorChecks(errors.New("injected config failure"), nil, nil, nil, nil)
+	case "sandbox":
+		checks = fakeDoctorChecks(nil, nil, errors.New("injected sandbox failure"), nil, nil)
+	case "optional":
+		checks = fakeDoctorChecks(nil, nil, nil, nil, errors.New("injected optional warning"))
+	}
+	doctorChecksOverride = checks
+	args := []string{"doctor"}
+	if os.Getenv("LNTA_DOCTOR_VERBOSE") == "1" {
+		args = append(args, "--verbose")
+	}
+	rootCmd.SetArgs(args)
+	main() // exercises Cobra and the real process exit-code handler
+}
+
+func TestDoctorCLIUsesExactProcessExitCodes(t *testing.T) {
+	tests := []struct {
+		name       string
+		want       int
+		diagnostic string
+		summary    string
+	}{
+		{name: "required", want: 1, diagnostic: "injected config failure", summary: "1 required check(s) failed"},
+		{name: "sandbox", want: 4, diagnostic: "injected sandbox failure", summary: "1 required check(s) failed"},
+		{name: "optional", want: 0, diagnostic: "injected optional warning", summary: "All required checks passed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			outputs := make([]string, 2)
+			for i, verbose := range []bool{false, true} {
+				cmd := exec.Command(os.Args[0], "-test.run=^TestDoctorCLIExitHelper$")
+				cmd.Env = append(os.Environ(), "LNTA_DOCTOR_CHILD=1", "LNTA_DOCTOR_CASE="+tc.name)
+				if verbose {
+					cmd.Env = append(cmd.Env, "LNTA_DOCTOR_VERBOSE=1")
+				}
+				out, err := cmd.CombinedOutput()
+				outputs[i] = string(out)
+				code := 0
+				if err != nil {
+					var exitErr *exec.ExitError
+					if !errors.As(err, &exitErr) {
+						t.Fatalf("child process error: %v\n%s", err, out)
+					}
+					code = exitErr.ExitCode()
+				}
+				if code != tc.want {
+					t.Errorf("verbose=%v exit=%d want %d; output:\n%s", verbose, code, tc.want, out)
+				}
+				if !strings.Contains(string(out), tc.summary) {
+					t.Errorf("verbose=%v missing summary %q:\n%s", verbose, tc.summary, out)
+				}
+				if (tc.name != "optional" || verbose) && !strings.Contains(string(out), tc.diagnostic) {
+					t.Errorf("verbose=%v missing diagnostic %q:\n%s", verbose, tc.diagnostic, out)
+				}
+			}
+			for _, phrase := range []string{"injected config failure", "injected sandbox failure"} {
+				if strings.Contains(outputs[0], phrase) != strings.Contains(outputs[1], phrase) {
+					t.Errorf("verbose mode changed diagnostic presence for %q", phrase)
+				}
+			}
+			if tc.name == "optional" && strings.Contains(outputs[0], tc.diagnostic) {
+				t.Fatal("terse optional warning unexpectedly exposed its detail")
+			}
+		})
+	}
+}
+
 func TestDoctorFailureErrorsKeepCauses(t *testing.T) {
 	cause := errors.New("underlying cause")
 	err := runDoctorChecks(&bytes.Buffer{}, fakeDoctorChecks(nil, nil, cause, nil, nil), false)

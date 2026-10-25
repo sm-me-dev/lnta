@@ -14,7 +14,11 @@ import (
 
 func TestBwrapProbeArgsMatchProductionSandboxArgs(t *testing.T) {
 	cwd, _ := os.Getwd()
-	base, err := bwrapArgs(homeDir(), cwd, nil)
+	root, err := ResolveProjectRoot(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := bwrapArgs(homeDir(), root, cwd, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

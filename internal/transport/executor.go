@@ -14,9 +14,10 @@ import (
 // over a local or remote target.
 type TargetExecutor interface {
 	// RunReadOnly executes a read-only command on the target.
-	// Mirrors sandbox.RunReadOnly signature.
-	RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (sandbox.CommandResult, error)
-	RunReadOnlyEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error)
+	// projectRoot is the immutable launch-time boundary; cwd is the selected
+	// command directory and must remain inside it for local execution.
+	RunReadOnly(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration) (sandbox.CommandResult, error)
+	RunReadOnlyEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error)
 
 	// ReadFile reads a file from the target and returns its content.
 	ReadFile(ctx context.Context, path string) ([]byte, os.FileInfo, error)

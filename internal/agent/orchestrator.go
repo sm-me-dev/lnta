@@ -61,11 +61,12 @@ type Orchestrator struct {
 	tools  map[string]Tool
 	config *Config
 
-	runID    string
-	cwd      string
-	approve  ApproveFunc
-	maxTurns int
-	dryRun   bool
+	runID       string
+	cwd         string
+	projectRoot string
+	approve     ApproveFunc
+	maxTurns    int
+	dryRun      bool
 
 	sysCtx fingerprint.SystemContext
 
@@ -92,6 +93,12 @@ func WithRunID(id string) Option {
 // WithCWD sets the working directory for sandboxed commands.
 func WithCWD(dir string) Option {
 	return func(o *Orchestrator) { o.cwd = dir }
+}
+
+// WithProjectRoot sets the immutable local project boundary used for
+// credential scanning and working-directory validation.
+func WithProjectRoot(dir string) Option {
+	return func(o *Orchestrator) { o.projectRoot = dir }
 }
 
 // WithApprove sets the mutate_system approval callback.
@@ -199,7 +206,7 @@ func New(client LLMClient, router *packs.Router, opts ...Option) *Orchestrator {
 	// empty list fails closed: direct executor writes are denied unless a
 	// caller configures allowed paths. WithExecutor is always used in practice.
 	if o.executor == nil {
-		o.executor = transport.NewLocalExecutor(o.runID, o.cwd, nil)
+		o.executor = transport.NewLocalExecutor(o.runID, o.cwd, nil, o.projectRoot)
 	}
 	return o
 }
@@ -249,7 +256,7 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string, pipeContext strin
 	// Turn 1 already knowing the ground truth.
 	var contextOutput string
 	if pack.ContextCmd != "" && pack.ContextCmd != "true" {
-		res, rerr := o.executor.RunReadOnly(ctx, pack.ContextCmd, o.cwd, 0)
+		res, rerr := o.executor.RunReadOnly(ctx, pack.ContextCmd, o.projectRoot, o.cwd, 0)
 		if rerr != nil || res.ExitCode != 0 {
 			contextOutput = fmt.Sprintf("[context_cmd produced no output: %v] %s", rerr, res.Stderr)
 		} else {
@@ -463,6 +470,7 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				Pack:         &pack,
 				Approve:      o.approve,
 				CWD:          o.cwd,
+				ProjectRoot:  o.projectRoot,
 				DryRun:       o.dryRun,
 				RunCollector: o.runCollector,
 				Executor:     o.executor,

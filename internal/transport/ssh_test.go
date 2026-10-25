@@ -47,7 +47,7 @@ func TestSSHPreflightFailsWhenBubblewrapMissing(t *testing.T) {
 	if err := e.Preflight(context.Background()); err == nil || !strings.Contains(err.Error(), "not installed") {
 		t.Fatalf("Preflight error = %v, want missing bwrap", err)
 	}
-	if _, err := e.RunReadOnly(context.Background(), "id", "", time.Second); err == nil {
+	if _, err := e.RunReadOnly(context.Background(), "id", "", "", time.Second); err == nil {
 		t.Fatal("protected command ran without remote sandbox")
 	}
 }

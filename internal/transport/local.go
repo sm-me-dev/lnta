@@ -16,31 +16,47 @@ import (
 // `allowed` is the pack's allowed_paths; it is owned by the caller/pack, never
 // derived from the target path. An empty list denies all writes (fail closed).
 type LocalExecutor struct {
-	runID   string
-	cwd     string
-	allowed []string
+	runID       string
+	cwd         string
+	projectRoot string
+	allowed     []string
 }
 
 // NewLocalExecutor creates a new LocalExecutor for the given run ID, working
 // directory, and allowed paths. Pass an empty/nil slice to deny all writes.
-func NewLocalExecutor(runID, cwd string, allowed []string) *LocalExecutor {
+func NewLocalExecutor(runID, cwd string, allowed []string, projectRoot ...string) *LocalExecutor {
+	root := ""
+	if len(projectRoot) > 0 {
+		root = projectRoot[0]
+	}
+	if root == "" {
+		if resolved, err := sandbox.ResolveProjectRoot(cwd); err == nil {
+			root = resolved
+		} else {
+			root = cwd
+		}
+	}
 	return &LocalExecutor{
-		runID:   runID,
-		cwd:     cwd,
-		allowed: allowed,
+		runID:       runID,
+		cwd:         cwd,
+		projectRoot: root,
+		allowed:     allowed,
 	}
 }
 
 // RunReadOnly executes a read-only command locally using the sandbox.
-func (e *LocalExecutor) RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (sandbox.CommandResult, error) {
-	return e.RunReadOnlyEnv(ctx, cmdStr, cwd, timeout, nil)
+func (e *LocalExecutor) RunReadOnly(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration) (sandbox.CommandResult, error) {
+	return e.RunReadOnlyEnv(ctx, cmdStr, projectRoot, cwd, timeout, nil)
 }
 
-func (e *LocalExecutor) RunReadOnlyEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error) {
+func (e *LocalExecutor) RunReadOnlyEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error) {
+	if projectRoot != "" && projectRoot != e.projectRoot {
+		return sandbox.CommandResult{}, fmt.Errorf("requested project root %q does not match launch-time root %q", projectRoot, e.projectRoot)
+	}
 	if cwd == "" {
 		cwd = e.cwd
 	}
-	return sandbox.RunReadOnlyEnv(ctx, cmdStr, cwd, timeout, extraEnv)
+	return sandbox.RunReadOnlyProjectEnv(ctx, cmdStr, e.projectRoot, cwd, timeout, extraEnv)
 }
 
 // ReadFile reads a file from the local filesystem.

@@ -116,7 +116,11 @@ func ProbeBwrap(timeout time.Duration) (BwrapProbe, error) {
 }
 
 func bwrapProbeArgs(home, cwd string) ([]string, error) {
-	args, err := bwrapArgs(home, cwd, nil)
+	root, err := ResolveProjectRoot(cwd)
+	if err != nil {
+		return nil, err
+	}
+	args, err := bwrapArgs(home, root, cwd, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -284,11 +288,47 @@ func resolveCWD(cwd string) (string, error) {
 	return abs, nil
 }
 
+// ResolveProjectRoot selects the nearest Git worktree/repository root above
+// launchDir. A launch outside a repository is its own project root.
+func ResolveProjectRoot(launchDir string) (string, error) {
+	launch, err := resolveCWD(launchDir)
+	if err != nil {
+		return "", err
+	}
+	for dir := launch; ; dir = filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("inspect git root %q: %w", dir, err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return launch, nil
+		}
+	}
+}
+
+func resolveProjectAndCWD(projectRoot, cwd string) (string, string, error) {
+	root, err := resolveCWD(projectRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve project root: %w", err)
+	}
+	work, err := resolveCWD(cwd)
+	if err != nil {
+		return "", "", err
+	}
+	rel, err := filepath.Rel(root, work)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("working directory %q is outside project root %q", work, root)
+	}
+	return root, work, nil
+}
+
 // bwrapArgs builds the bubblewrap argument vector (without the executable and
-// without the trailing command). Pure function of (home, cwd, extraEnv) plus
-// the on-disk existence of the paths to mask.
-func bwrapArgs(home, cwd string, extraEnv []string) ([]string, error) {
-	projectSecrets, err := maskProjectSecrets(cwd)
+// without the trailing command). Project credential masking is rooted at
+// projectRoot; cwd remains the command's working directory.
+func bwrapArgs(home, projectRoot, cwd string, extraEnv []string) ([]string, error) {
+	projectSecrets, err := maskProjectSecrets(projectRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +412,7 @@ func exitCodeOf(err error) int {
 
 // runBwrapEnv is runBwrap with extra KEY=VALUE environment entries (used to
 // pass verify_cmd arguments as data, never as shell text).
-func runBwrapEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
+func runBwrapEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
 	var res CommandResult
 	start := time.Now()
 
@@ -386,13 +426,13 @@ func runBwrapEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 	if err != nil {
 		return res, ErrBwrapNotFound
 	}
-	absCwd, err := resolveCWD(cwd)
+	absRoot, absCwd, err := resolveProjectAndCWD(projectRoot, cwd)
 	if err != nil {
 		return res, err
 	}
 	home := homeDir()
 
-	baseArgs, err := bwrapArgs(home, absCwd, extraEnv)
+	baseArgs, err := bwrapArgs(home, absRoot, absCwd, extraEnv)
 	if err != nil {
 		return res, err
 	}
@@ -458,19 +498,29 @@ func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 // The sandbox:
 //   - read-only root; private tmpfs /tmp, /var/tmp, /run (no host sockets)
 //   - masks credential directories and files (bwrap) / omits them (Landlock)
-//   - masks .env* and similar credential files under the working directory
+//   - masks .env* and similar credential files under the project root
 //   - no network, no inherited environment (explicit allowlist only)
 //   - runs in its own process group; timeout and output caps kill the group
 //   - output truncated at 16KB with a marker; 8MB hard cap kills the command
 func RunReadOnlyEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
+	root, err := ResolveProjectRoot(cwd)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	return RunReadOnlyProjectEnv(ctx, cmdStr, root, cwd, timeout, extraEnv)
+}
+
+// RunReadOnlyProjectEnv runs with a fixed project boundary independent of the
+// requested working directory. Credential scanning always covers projectRoot.
+func RunReadOnlyProjectEnv(ctx context.Context, cmdStr, projectRoot, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
 	probeErr := probeBwrap()
 	if probeErr == nil {
-		return runBwrapEnv(ctx, cmdStr, cwd, timeout, extraEnv)
+		return runBwrapEnv(ctx, cmdStr, projectRoot, cwd, timeout, extraEnv)
 	}
 
 	landlockErr := LandlockProbe()
 	if landlockErr == nil {
-		return runLandlockEnv(ctx, cmdStr, cwd, timeout, extraEnv)
+		return runLandlockProjectEnv(ctx, cmdStr, projectRoot, cwd, timeout, extraEnv)
 	}
 
 	if errors.Is(probeErr, ErrBwrapNotFound) {

@@ -182,7 +182,7 @@ func grantTree(cfg *landlockConfig, dir string, deny map[string]bool, ancestors 
 
 // buildLandlockConfig computes the allow-list for a run. Credential paths are
 // never granted (Landlock is allow-list based, so "masked" means "absent").
-func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) (landlockConfig, error) {
+func buildLandlockConfig(projectRoot, cwd, home, tmp, cmdStr string, extraEnv []string) (landlockConfig, error) {
 	cfg := landlockConfig{
 		Cwd: cwd,
 		Cmd: cmdStr,
@@ -217,7 +217,7 @@ func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) (land
 			deny[f] = true
 		}
 	}
-	projectSecrets, err := maskProjectSecrets(cwd)
+	projectSecrets, err := maskProjectSecrets(projectRoot)
 	if err != nil {
 		return cfg, err
 	}
@@ -235,16 +235,16 @@ func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) (land
 	if home != "" {
 		roots = append(roots, home)
 	}
-	if cwd != "" {
+	if projectRoot != "" {
 		covered := false
 		for _, root := range roots {
-			if pathWithin(cwd, root) {
+			if pathWithin(projectRoot, root) {
 				covered = true
 				break
 			}
 		}
 		if !covered {
-			roots = append(roots, cwd)
+			roots = append(roots, projectRoot)
 		}
 	}
 	seenRoots := make(map[string]bool, len(roots))
@@ -292,6 +292,14 @@ func runLandlock(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 
 // runLandlockEnv is runLandlock with extra KEY=VALUE entries for the command.
 func runLandlockEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
+	root, err := ResolveProjectRoot(cwd)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	return runLandlockProjectEnv(ctx, cmdStr, root, cwd, timeout, extraEnv)
+}
+
+func runLandlockProjectEnv(ctx context.Context, cmdStr, projectRoot, cwd string, timeout time.Duration, extraEnv []string) (CommandResult, error) {
 	var res CommandResult
 	start := time.Now()
 
@@ -314,7 +322,7 @@ func runLandlockEnv(ctx context.Context, cmdStr string, cwd string, timeout time
 		}
 	}
 
-	absCwd, err := resolveCWD(cwd)
+	absRoot, absCwd, err := resolveProjectAndCWD(projectRoot, cwd)
 	if err != nil {
 		return res, err
 	}
@@ -330,7 +338,7 @@ func runLandlockEnv(ctx context.Context, cmdStr string, cwd string, timeout time
 		return res, err
 	}
 
-	cfg, err := buildLandlockConfig(absCwd, home, tmp, cmdStr, extraEnv)
+	cfg, err := buildLandlockConfig(absRoot, absCwd, home, tmp, cmdStr, extraEnv)
 	if err != nil {
 		return res, err
 	}

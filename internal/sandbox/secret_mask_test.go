@@ -30,7 +30,7 @@ func TestProjectSecretScanCoversIgnoredDirectoriesAndBothBackends(t *testing.T) 
 	if len(got) != len(secrets) {
 		t.Fatalf("found %d secrets, want %d: %v", len(got), len(secrets), got)
 	}
-	args, err := bwrapArgs(home, project, nil)
+	args, err := bwrapArgs(home, project, project, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestProjectSecretScanCoversIgnoredDirectoriesAndBothBackends(t *testing.T) 
 			t.Errorf("Bubblewrap args do not mask %q", secret)
 		}
 	}
-	cfg, err := buildLandlockConfig(project, home, t.TempDir(), "true", nil)
+	cfg, err := buildLandlockConfig(project, project, home, t.TempDir(), "true", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,6 +47,102 @@ func TestProjectSecretScanCoversIgnoredDirectoriesAndBothBackends(t *testing.T) 
 		if containsPath(cfg.ROFiles, secret) || containsPath(cfg.RODirs, secret) {
 			t.Errorf("Landlock grants credential path %q", secret)
 		}
+	}
+}
+
+func TestNestedCWDScansParentProjectSecretsForBothBackends(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "packages", "app", "src")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(root, ".env.production")
+	if err := os.WriteFile(secret, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, resolvedCWD, err := resolveProjectAndCWD(root, nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := bwrapArgs(t.TempDir(), resolvedRoot, resolvedCWD, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasArgSequence(args, "--ro-bind", "/dev/null", secret) {
+		t.Fatalf("bwrap did not mask parent secret %q", secret)
+	}
+	cfg, err := buildLandlockConfig(resolvedRoot, resolvedCWD, t.TempDir(), t.TempDir(), "true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsPath(cfg.ROFiles, secret) || containsPath(cfg.RODirs, secret) {
+		t.Fatalf("Landlock grants parent secret %q", secret)
+	}
+	if !containsPath(cfg.RWFiles, "/dev/null") {
+		t.Fatal("expected standard null device grant")
+	}
+}
+
+func TestResolveProjectRootFindsGitDirectoryAndWorktreeFile(t *testing.T) {
+	for _, marker := range []string{"directory", "file"} {
+		t.Run(marker, func(t *testing.T) {
+			root := t.TempDir()
+			child := filepath.Join(root, "nested", "src")
+			if err := os.MkdirAll(child, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			git := filepath.Join(root, ".git")
+			if marker == "directory" {
+				if err := os.Mkdir(git, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(git, []byte("gitdir: ../.git/worktrees/x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := ResolveProjectRoot(child)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != root {
+				t.Fatalf("ResolveProjectRoot() = %q, want %q", got, root)
+			}
+		})
+	}
+}
+
+func TestResolveProjectAndCWDRejectsOutsideAndSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "inside")
+	if err := os.Mkdir(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if _, _, err := resolveProjectAndCWD(root, outside); err == nil || !strings.Contains(err.Error(), "outside project root") {
+		t.Fatalf("outside cwd accepted: %v", err)
+	}
+	link := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveProjectAndCWD(root, link); err == nil || !strings.Contains(err.Error(), "outside project root") {
+		t.Fatalf("symlink escape accepted: %v", err)
+	}
+	if _, _, err := resolveProjectAndCWD(root, inside); err != nil {
+		t.Fatalf("nested cwd rejected: %v", err)
+	}
+	odd := filepath.Join(root, "space [and] unicode-λ")
+	if err := os.Mkdir(odd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, got, err := resolveProjectAndCWD(root, odd); err != nil || got != odd {
+		t.Fatalf("unusual in-root path rejected: cwd=%q err=%v", got, err)
+	}
+	sibling := root + "-sibling"
+	if err := os.Mkdir(sibling, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveProjectAndCWD(root, sibling); err == nil {
+		t.Fatal("sibling with matching string prefix accepted as inside root")
 	}
 }
 
@@ -113,10 +209,10 @@ func TestProjectSecretScanFailsClosedOnSymlinks(t *testing.T) {
 			if _, err := maskProjectSecrets(root); err == nil || !strings.Contains(err.Error(), "symlink") {
 				t.Fatalf("symlink scan did not fail closed: %v", err)
 			}
-			if _, err := bwrapArgs(t.TempDir(), root, nil); err == nil {
+			if _, err := bwrapArgs(t.TempDir(), root, root, nil); err == nil {
 				t.Fatal("Bubblewrap args accepted incomplete symlink scan")
 			}
-			if _, err := buildLandlockConfig(root, t.TempDir(), t.TempDir(), "true", nil); err == nil {
+			if _, err := buildLandlockConfig(root, root, t.TempDir(), t.TempDir(), "true", nil); err == nil {
 				t.Fatal("Landlock config accepted incomplete symlink scan")
 			}
 		})

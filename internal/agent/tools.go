@@ -50,6 +50,7 @@ type ToolDeps struct {
 	Pack         *packs.Pack                // active instruction pack (may be nil)
 	Approve      ApproveFunc                // mutate_system approval callback
 	CWD          string                     // working directory for sandboxed commands
+	ProjectRoot  string                     // immutable project boundary for local sandboxing
 	DryRun       bool                       // when true, writes are diff-only previews and mutations are blocked
 	RunCollector *audit.RunSummaryCollector // for recording run metadata
 	Executor     transport.TargetExecutor   // for command execution (local or SSH)
@@ -177,7 +178,7 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 	if in.CWD == "" {
 		in.CWD = deps.CWD
 	}
-	res, err := deps.Executor.RunReadOnly(ctx, in.Command, in.CWD, 0)
+	res, err := deps.Executor.RunReadOnly(ctx, in.Command, deps.ProjectRoot, in.CWD, 0)
 	if err != nil || res.ExitCode != 0 {
 		errMsg := ""
 		if err != nil {
@@ -553,7 +554,7 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	if deps.Executor == nil {
 		return "HARNESS_VERIFICATION_FAILED: no target executor is configured", nil
 	}
-	res, err := deps.Executor.RunReadOnlyEnv(ctx, verifyCmd, cwd, 2*time.Minute, verifyEnv)
+	res, err := deps.Executor.RunReadOnlyEnv(ctx, verifyCmd, deps.ProjectRoot, cwd, 2*time.Minute, verifyEnv)
 	var processExit *exec.ExitError
 	if err != nil && (ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || res.ExitCode == 0 || !errors.As(err, &processExit) || res.ExitCode == 127) {
 		// Record failed verification

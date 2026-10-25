@@ -220,11 +220,16 @@ func runLocalOllama(prompt string, commandOnly bool) error {
 	}
 
 	runID := nextRunID()
-	exec := transport.NewLocalExecutor(runID, ".", pack.AllowedPaths)
+	projectRoot, err := sandbox.ResolveProjectRoot(".")
+	if err != nil {
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("resolve project root: %w", err))
+	}
+	exec := transport.NewLocalExecutor(runID, ".", pack.AllowedPaths, projectRoot)
 
 	opts := []agent.Option{
 		agent.WithRunID(runID),
 		agent.WithCWD("."),
+		agent.WithProjectRoot(projectRoot),
 		agent.WithApprove(approveMutation("local")),
 		agent.WithConfig(&agent.Config{Model: selected, BaseURL: ollamaBaseURL}),
 		agent.WithDryRun(dryRunMode),
@@ -674,6 +679,10 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	}
 
 	runID := nextRunID()
+	projectRoot, err := sandbox.ResolveProjectRoot(".")
+	if err != nil {
+		return agent.NewExitError(agent.ExitCodeGeneralError, fmt.Errorf("resolve project root: %w", err))
+	}
 
 	// Set up executor (local or SSH)
 	var executor transport.TargetExecutor
@@ -696,7 +705,7 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 			fmt.Println()
 		}
 	} else {
-		executor = transport.NewLocalExecutor(runID, ".", pack.AllowedPaths)
+		executor = transport.NewLocalExecutor(runID, ".", pack.AllowedPaths, projectRoot)
 	}
 
 	// One approval function for every path (piped or interactive stdin).
@@ -705,6 +714,7 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	opts := []agent.Option{
 		agent.WithRunID(runID),
 		agent.WithCWD("."),
+		agent.WithProjectRoot(projectRoot),
 		agent.WithApprove(approveFn),
 		agent.WithConfig(cfg),
 		agent.WithDryRun(dryRunMode),
@@ -1028,7 +1038,12 @@ type doctorResult struct {
 	err   error
 }
 
+var doctorChecksOverride []doctorCheck
+
 func doctorChecks() []doctorCheck {
+	if doctorChecksOverride != nil {
+		return doctorChecksOverride
+	}
 	return []doctorCheck{
 		{name: "LLM Configuration", class: doctorRequired, fn: checkLLMConfig},
 		{name: "LLM Connectivity", class: doctorRequired, fn: checkLLMConnectivity},
