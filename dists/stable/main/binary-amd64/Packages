@@ -1,16 +1,16 @@
 Package: lnta
-Version: 0.1.2
+Version: 0.1.3
 Architecture: amd64
 License: MIT
 Maintainer: LNTA Maintainers <maintainers@lnta.dev>
-Installed-Size: 13040
+Installed-Size: 13112
 Recommends: bubblewrap, desktop-file-validate
 Priority: optional
 Section: 
-Filename: pool/main/l/lnta/lnta_0.1.2_amd64.deb
-Size: 5254150
-SHA256: 11650319ffdea172ef69966bae0f9b0438a8549daafa68b8ef3d25282d0c61ea
-SHA1: a8b23e263f688c25c95711401dca46cf1041c97a
-MD5sum: 39f2156a2c0d3babece83a63917c987b
+Filename: pool/main/l/lnta/lnta_0.1.3_amd64.deb
+Size: 5281530
+SHA256: 1ffa92a16410c343f8a2ad63a5d9fa2e410fbfd2b49c14c1e50a0d11884e8bf9
+SHA1: 42caf6ee0174a84ac98d304c62520b1f8f2879f6
+MD5sum: f301d8008a78fc05da018669de2a4d43
 Description: Linux Natural-Language Terminal Assistant
 
