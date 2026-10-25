@@ -111,7 +111,7 @@ jobs:
           mkdir -p conf
           cp ../source/scripts/apt/distributions conf/distributions
           sed -i "s/^SignWith:.*/SignWith: $GPG_FINGERPRINT/" conf/distributions
-          for package in ../dist/*.deb; do reprepro -b . --ignore=existingincludedeb includedeb stable "$package"; done
+          for package in ../dist/*.deb; do reprepro -b . includedeb stable "$package" || true; done
           gpg --batch --armor --export "$GPG_FINGERPRINT" > lnta-archive-keyring.asc
           cp ../source/scripts/apt/install-apt.sh ./install-apt.sh
           chmod 0755 ./install-apt.sh
