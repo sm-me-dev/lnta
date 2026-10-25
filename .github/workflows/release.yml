@@ -99,7 +99,7 @@ jobs:
         run: |
           mapfile -d '' artifacts < <(find ../dist -maxdepth 1 -type f -print0)
           test "${#artifacts[@]}" -gt 0
-          gh release create "$GITHUB_REF_NAME" "${artifacts[@]}" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-from-tag
+          gh release create "$GITHUB_REF_NAME" "${artifacts[@]}" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-from-tag
       - name: Publish APT repository with fast-forward update
         env:
           GH_TOKEN: ${{ github.token }}
