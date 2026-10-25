@@ -20,9 +20,8 @@
   - [Tier 2: Elevated Mutation (`ELEVATED_MUTATION`)](#tier-2-elevated-mutation-elevated_mutation)
   - [Tier 3: Critical Destructive (`CRITICAL_DESTRUCTIVE`)](#tier-3-critical-destructive-critical_destructive)
   - [Anti-Fatigue Challenge Gate](#anti-fatigue-challenge-gate)
-- [Ubuntu 24.04 & 26.04 AppArmor User Namespace Restrictions](#ubuntu-2404--2604-apparmor-user-namespace-restrictions)
-  - [Diagnosing the Restriction](#diagnosing-the-restriction)
-  - [Applying the Remediation Profile](#applying-the-remediation-profile)
+- [Ubuntu AppArmor User Namespace Restrictions](#ubuntu-apparmor-user-namespace-restrictions)
+  - [Inspecting Ubuntu's Policy](#inspecting-ubuntus-policy)
 - [Summary Security Architecture Diagram](#summary-security-architecture-diagram)
 
 ---
@@ -275,58 +274,22 @@ Type challenge code [9xQ2] to execute, or press Ctrl+C to cancel:
 
 ---
 
-## Ubuntu 24.04 & 26.04 AppArmor User Namespace Restrictions
+## Ubuntu AppArmor User Namespace Restrictions
 
-Starting with Ubuntu 24.04 LTS (Noble Numbat) and Ubuntu 26.04 LTS, Ubuntu enabled the restricted unprivileged user namespace feature in the Linux kernel:
+Ubuntu enables restricted unprivileged user namespaces through AppArmor on supported releases:
 `kernel.apparmor_restrict_unprivileged_userns = 1`
 
-This setting prevents unprivileged binaries (such as `bwrap`) from creating new user namespaces without an explicit AppArmor profile, causing:
-```text
-bwrap: setting up uid map: Permission denied
-```
+This can affect Bubblewrap's ability to create a user namespace. The sysctl value alone does not establish why a specific probe failed. LNTA doctor reports the production-equivalent probe stderr, exit status, duration, and sandbox AppArmor label when available.
 
-### Diagnosing the Restriction
-Run `lnta doctor` to inspect kernel sandboxing status:
+### Inspecting Ubuntu's Policy
 
 ```bash
-lnta doctor
+lnta doctor --verbose
+sudo aa-status
+sudo journalctl -k --since today | grep -i apparmor
 ```
 
-```text
-## LNTA Doctor Diagnostics
-- LLM API Config:        OK
-- LLM API Connectivity:  OK
-- bwrap binary:          /usr/bin/bwrap
-- AppArmor userns:       RESTRICTED (kernel.apparmor_restrict_unprivileged_userns = 1)
-- Landlock LSM:          available
-```
-
-### Applying the Remediation Profile
-Generate and install the official AppArmor profile using LNTA's built-in generator:
-
-```bash
-lnta doctor --generate-apparmor | sudo tee /etc/apparmor.d/bwrap
-sudo apparmor_parser -r /etc/apparmor.d/bwrap
-```
-
-#### Generated Profile Reference:
-```apparmor
-# Allow unprivileged user namespaces for bwrap
-# Install to: /etc/apparmor.d/bwrap
-# Then run: sudo apparmor_parser -r /etc/apparmor.d/bwrap
-
-abi <abi/4.0>,
-include <tunables/global>
-
-profile bwrap flags=(unconfined) {
-  userns,
-
-  # Site-specific additions and overrides. See local/README for details.
-  include if exists <local/bwrap>
-}
-```
-
-Once loaded, `bwrap` operates cleanly without requiring `sudo` privileges or disabling system-wide AppArmor security.
+The `doctor --generate-apparmor` option remains available for compatibility and prints only non-mutating guidance. It does not emit an AppArmor policy. LNTA packages do not load, replace, or remove system AppArmor profiles.
 
 ---
 

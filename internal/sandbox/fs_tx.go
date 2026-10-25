@@ -1104,9 +1104,11 @@ func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin 
 	sshCmd.Stderr = errOut
 	sshCmd.WaitDelay = 5 * time.Second
 
-	RegisterChild(sshCmd)
-	defer UnregisterChild(sshCmd)
-	return sshCmd.Run()
+	started, err := StartChild("ssh_rollback", sshCmd)
+	if err != nil {
+		return err
+	}
+	return WaitChild("ssh_rollback", sshCmd, started, ctx, out, errOut)
 }
 
 // remoteManifest represents the undo log for remote files.

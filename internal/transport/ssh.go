@@ -320,10 +320,11 @@ func runSystemSSH(ctx context.Context, user, host, port, cmdStr string, stdin io
 	cmd.Stderr = errOut
 	cmd.WaitDelay = 5 * time.Second
 
-	sandbox.RegisterChild(cmd)
-	defer sandbox.UnregisterChild(cmd)
-	start := time.Now()
-	err = cmd.Run()
+	start, startErr := sandbox.StartChild("ssh", cmd)
+	if startErr != nil {
+		return sshResult{}, fmt.Errorf("start ssh: %w", startErr)
+	}
+	err = sandbox.WaitChild("ssh", cmd, start, ctx, out, errOut)
 	duration := time.Since(start)
 
 	if ctx.Err() == context.DeadlineExceeded {

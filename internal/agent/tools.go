@@ -433,11 +433,10 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	cmd.Stderr = errOut
 	cmd.WaitDelay = 5 * time.Second
 
-	if err := cmd.Start(); err != nil {
+	childStarted, err := sandbox.StartChild("mutate_system", cmd)
+	if err != nil {
 		return fmt.Sprintf("mutate_system failed to start: %v", err), nil
 	}
-	sandbox.RegisterChild(cmd)
-	defer sandbox.UnregisterChild(cmd)
 
 	defer func() {
 		if cmd.Process != nil {
@@ -445,7 +444,7 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		}
 	}()
 
-	err = cmd.Wait()
+	err = sandbox.WaitChild("mutate_system", cmd, childStarted, mctx, out, errOut)
 	var exitCode int
 	if ex, ok := err.(*exec.ExitError); ok {
 		exitCode = ex.ExitCode()
@@ -761,14 +760,16 @@ func nativeDesktopEntryVerify(ctx context.Context, target string) error {
 	stderr := sandbox.NewCappedBuffer(8*1024, 64*1024, cancel)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.WaitDelay = 2 * time.Second
-	sandbox.RegisterChild(cmd)
-	defer sandbox.UnregisterChild(cmd)
+	childStarted, startErr := sandbox.StartChild("desktop_file_validate", cmd)
+	if startErr != nil {
+		return &verificationUnavailableError{err: fmt.Errorf("start desktop-file-validate: %w", startErr)}
+	}
 	defer func() {
 		if cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 	}()
-	if err := cmd.Run(); err != nil {
+	if err := sandbox.WaitChild("desktop_file_validate", cmd, childStarted, ctx, stdout, stderr); err != nil {
 		if ctx.Err() != nil {
 			return &verificationUnavailableError{err: fmt.Errorf("desktop-file-validate timed out or was cancelled: %w", ctx.Err())}
 		}

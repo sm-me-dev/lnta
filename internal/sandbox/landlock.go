@@ -255,9 +255,11 @@ func runLandlockEnv(ctx context.Context, cmdStr string, cwd string, timeout time
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
-	RegisterChild(cmd)
-	defer UnregisterChild(cmd)
-	runErr := cmd.Run()
+	childStarted, startErr := StartChild("landlock", cmd)
+	if startErr != nil {
+		return res, fmt.Errorf("start Landlock sandbox: %w", startErr)
+	}
+	runErr := WaitChild("landlock", cmd, childStarted, ctx, stdout, stderr)
 	res.Duration = time.Since(start)
 	res.Stdout = stdout.Render()
 	res.Stderr = stderr.Render()

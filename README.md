@@ -313,7 +313,7 @@ lnta self-update
 
 ---
 
-## Diagnostics & AppArmor Setup
+## Diagnostics & Ubuntu AppArmor
 
 Verify your installation and kernel sandboxing capabilities with `lnta doctor`:
 
@@ -322,25 +322,27 @@ lnta doctor
 ```
 
 ```text
-## LNTA Doctor Diagnostics
-- LLM API Config:        OK
-- LLM API Connectivity:  OK
-- bwrap binary:          /usr/bin/bwrap
-- AppArmor userns:       OK
-- Landlock LSM:          available
-- System Validators:     desktop-file-validate ✓, systemctl ✓, ss ✓, ufw ✓
+## LNTA Doctor
+  ▶ LLM Configuration... OK
+  ▶ LLM Connectivity... OK
+  ▶ Kernel Sandbox... OK
+  ▶ Validator Binaries... OK
+
 All checks passed
 ```
 
-### Ubuntu 24.04 / 26.04 AppArmor Note
-On Ubuntu 24.04 and 26.04 LTS, unprivileged user namespaces are restricted by default. If `lnta doctor` reports that `bwrap` is blocked, generate and load the AppArmor profile:
+### Ubuntu AppArmor Note
+LNTA does not ship or install a custom AppArmor profile. On systems that use Ubuntu's Bubblewrap user namespace policy, inspect the distribution-owned policy and kernel audit messages:
 
 ```bash
-lnta doctor --generate-apparmor | sudo tee /etc/apparmor.d/bwrap
-sudo apparmor_parser -r /etc/apparmor.d/bwrap
+lnta doctor --verbose
+sudo aa-status
+sudo journalctl -k --since today | grep -i apparmor
 ```
 
-*(Note: The official `.deb` package installs this profile automatically during package setup).*
+The doctor command uses LNTA's production Bubblewrap arguments and shows the probe error. A sysctl value by itself does not establish that AppArmor caused the failure. Do not replace the distribution-owned `bwrap-userns-restrict` policy.
+
+For read-only steps to collect terminal, kernel, coredump, session, process, AppArmor, and LNTA lifecycle evidence after an incident, see [Incident Evidence Collection](docs/INCIDENT_EVIDENCE.md).
 
 ---
 

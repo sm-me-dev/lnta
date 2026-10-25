@@ -3,13 +3,17 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/sm-me-dev/lnta/internal/audit"
 )
 
 // childRegistry tracks live process groups so they can be killed on shutdown
@@ -65,6 +69,67 @@ func UnregisterChild(cmd *exec.Cmd) {
 	childRegistry.mu.Lock()
 	defer childRegistry.mu.Unlock()
 	delete(childRegistry.pgid, cmd.Process.Pid)
+}
+
+// StartChild starts a child, registers its process group, and writes a
+// privacy-safe lifecycle event. Role is a fixed internal label, never a
+// command, prompt, environment value, or child output.
+func StartChild(role string, cmd *exec.Cmd) (time.Time, error) {
+	started := time.Now()
+	if err := cmd.Start(); err != nil {
+		return started, err
+	}
+	RegisterChild(cmd)
+	audit.Log("process.start", "", processStartDetails(role, cmd.Process.Pid))
+	return started, nil
+}
+
+// WaitChild waits for a previously started child, unregisters it, and records
+// bounded lifecycle metadata. Output content and command details are omitted.
+func WaitChild(role string, cmd *exec.Cmd, started time.Time, ctx context.Context, stdout, stderr *CappedBuffer) error {
+	err := cmd.Wait()
+	UnregisterChild(cmd)
+	var stdoutBytes, stderrBytes int64
+	if stdout != nil {
+		stdoutBytes = stdout.Total()
+	}
+	if stderr != nil {
+		stderrBytes = stderr.Total()
+	}
+	exitStatus := -1
+	if cmd.ProcessState != nil {
+		exitStatus = cmd.ProcessState.ExitCode()
+	}
+	audit.Log("process.complete", "", processCompletionDetails(role, processID(cmd), started, ctx, exitStatus, stdoutBytes, stderrBytes))
+	return err
+}
+
+func processStartDetails(role string, pid int) map[string]string {
+	id := strconv.Itoa(pid)
+	return map[string]string{"role": role, "pid": id, "pgid": id}
+}
+
+func processCompletionDetails(role, id string, started time.Time, ctx context.Context, exitStatus int, stdoutBytes, stderrBytes int64) map[string]string {
+	canceled := ctx != nil && ctx.Err() != nil
+	timedOut := ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
+	return map[string]string{
+		"role":         role,
+		"pid":          id,
+		"pgid":         id,
+		"elapsed_ms":   strconv.FormatInt(time.Since(started).Milliseconds(), 10),
+		"exit_status":  strconv.Itoa(exitStatus),
+		"canceled":     strconv.FormatBool(canceled),
+		"timed_out":    strconv.FormatBool(timedOut),
+		"stdout_bytes": strconv.FormatInt(stdoutBytes, 10),
+		"stderr_bytes": strconv.FormatInt(stderrBytes, 10),
+	}
+}
+
+func processID(cmd *exec.Cmd) string {
+	if cmd == nil || cmd.Process == nil {
+		return ""
+	}
+	return strconv.Itoa(cmd.Process.Pid)
 }
 
 // KillAllChildren sends SIGKILL to every registered process group. Safe to call

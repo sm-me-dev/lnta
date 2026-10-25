@@ -1,4 +1,3 @@
 #!/bin/sh
 set -e
-
-rm -f /etc/apparmor.d/bwrap
+# LNTA does not remove system AppArmor policy.

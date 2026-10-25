@@ -5,7 +5,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -30,9 +29,9 @@ const maxOutputBytes = 16 * 1024
 // ErrBwrapNotFound is returned when bwrap is not installed on the host.
 var ErrBwrapNotFound = errors.New("bwrap not found on host; cannot run sandboxed command")
 
-// ErrBwrapBlocked is returned when bwrap exists but cannot create its
-// namespaces (AppArmor userns restriction, EPERM, missing userns support...).
-var ErrBwrapBlocked = errors.New("bwrap blocked by AppArmor userns restriction; try 'lnta doctor --generate-apparmor'")
+// ErrBwrapBlocked is returned when bwrap exists but cannot create the
+// namespaces and mounts required by LNTA.
+var ErrBwrapBlocked = errors.New("bwrap cannot create LNTA's required sandbox")
 
 // CommandResult captures the outcome of a sandboxed command execution.
 type CommandResult struct {
@@ -51,38 +50,75 @@ const (
 	BackendLandlock SandboxBackend = "landlock"
 )
 
-// probeBwrap runs a fast pre-flight check to see if bwrap can create the same
-// namespaces the real run needs. It FAILS CLOSED: any failure (not just exit
-// codes 126/127, which bwrap never uses for EPERM) is reported as
-// ErrBwrapBlocked together with bwrap's stderr, so the caller falls back to
-// Landlock instead of "trying anyway".
-func probeBwrap() error {
+// BwrapProbe contains bounded, non-sensitive results from an actual sandbox
+// initialization attempt.
+type BwrapProbe struct {
+	Path       string
+	ExitStatus int
+	Stderr     string
+	Duration   time.Duration
+	AppArmor   string
+	TimedOut   bool
+}
+
+// ProbeBwrap runs the same namespace and mount setup as LNTA's read-only
+// executor. It captures bounded stderr and the AppArmor label observed by a
+// process inside the sandbox. Failures remain closed to the caller.
+func ProbeBwrap(timeout time.Duration) (BwrapProbe, error) {
+	result := BwrapProbe{ExitStatus: -1}
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
-		return ErrBwrapNotFound
+		return result, ErrBwrapNotFound
 	}
+	result.Path = bwrap
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if timeout <= 0 || timeout > 5*time.Second {
+		timeout = 3 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, bwrap,
-		"--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-net",
-		"--unshare-uts", "--unshare-cgroup-try", "--new-session", "--die-with-parent",
-		"--cap-drop", "ALL", "--clearenv", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-		"--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run", "--", "true")
+	cwd, err := os.Getwd()
+	if err != nil {
+		return result, fmt.Errorf("get current directory: %w", err)
+	}
+	home := homeDir()
+	args := bwrapProbeArgs(home, cwd)
+	cmd := exec.CommandContext(ctx, bwrap, args...)
 	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = &stderr
+	stdout := NewCappedBuffer(1024, 0, nil)
+	stderr := NewCappedBuffer(4096, 0, nil)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"}
 	ConfigureProcessGroup(cmd)
-	RegisterChild(cmd)
-	defer UnregisterChild(cmd)
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%w: %v: %s", ErrBwrapBlocked, err, strings.TrimSpace(stderr.String()))
+	start, err := StartChild("bwrap_probe", cmd)
+	if err != nil {
+		result.Duration = time.Since(start)
+		result.Stderr = strings.TrimSpace(stderr.String())
+		return result, fmt.Errorf("start bwrap probe: %w", err)
 	}
-	return nil
+	err = WaitChild("bwrap_probe", cmd, start, ctx, stdout, stderr)
+	result.Duration = time.Since(start)
+	result.Stderr = strings.TrimSpace(stderr.String())
+	if state := cmd.ProcessState; state != nil {
+		result.ExitStatus = state.ExitCode()
+	}
+	result.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+	result.AppArmor = strings.TrimSpace(stdout.String())
+	if err != nil {
+		return result, fmt.Errorf("%w: %v: %s", ErrBwrapBlocked, err, result.Stderr)
+	}
+	return result, nil
+}
+
+func bwrapProbeArgs(home, cwd string) []string {
+	return append(bwrapArgs(home, cwd, nil), "sh", "-c", "cat /proc/self/attr/current")
+}
+
+func probeBwrap() error {
+	_, err := ProbeBwrap(3 * time.Second)
+	return err
 }
 
 // SandboxAvailable checks if bwrap sandboxing is available and working.
@@ -324,9 +360,11 @@ func runBwrapEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
-	RegisterChild(cmd)
-	defer UnregisterChild(cmd)
-	err = cmd.Run()
+	childStarted, startErr := StartChild("bwrap", cmd)
+	if startErr != nil {
+		return res, fmt.Errorf("start sandbox: %w", startErr)
+	}
+	err = WaitChild("bwrap", cmd, childStarted, ctx, stdout, stderr)
 	res.Duration = time.Since(start)
 	res.Stdout = stdout.Render()
 	res.Stderr = stderr.Render()

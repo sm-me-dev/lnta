@@ -414,7 +414,7 @@ var doctorFix bool
 
 func init() {
 	doctorCmd.Flags().BoolVar(&doctorVerbose, "verbose", false, "Verbose output")
-	doctorCmd.Flags().BoolVar(&doctorFix, "generate-apparmor", false, "Generate AppArmor profile for bwrap")
+	doctorCmd.Flags().BoolVar(&doctorFix, "generate-apparmor", false, "Show safe guidance for Ubuntu's AppArmor bwrap policy")
 }
 
 var sandboxExecCmd = &cobra.Command{
@@ -1100,33 +1100,55 @@ func checkLLMConnectivity() error {
 }
 
 func checkKernelSandbox() error {
-	// Check bwrap binary
-	bwrapPath, err := exec.LookPath("bwrap")
-	if err != nil {
-		return fmt.Errorf("bwrap not found in PATH")
-	}
+	probe, probeErr := sandbox.ProbeBwrap(3 * time.Second)
 	if doctorVerbose {
-		fmt.Printf("    bwrap: %s\n", bwrapPath)
+		if probe.Path == "" {
+			fmt.Println("    bwrap: not found in PATH")
+		} else {
+			fmt.Printf("    bwrap: %s\n", probe.Path)
+		}
+		fmt.Printf("    bwrap probe duration: %s\n", probe.Duration.Round(time.Millisecond))
+		if probe.ExitStatus >= 0 {
+			fmt.Printf("    bwrap probe exit status: %d\n", probe.ExitStatus)
+		}
+		if probe.TimedOut {
+			fmt.Println("    bwrap probe: timed out")
+		}
+		if probe.Stderr != "" {
+			fmt.Printf("    bwrap stderr: %s\n", probe.Stderr)
+		}
+		if probe.AppArmor != "" {
+			fmt.Printf("    AppArmor label inside sandbox: %s\n", probe.AppArmor)
+		}
 	}
 
-	// Check AppArmor userns restriction status (informative)
 	apparmorRestrict, err := readSysctl("kernel.apparmor_restrict_unprivileged_userns")
 	if err == nil && doctorVerbose {
 		fmt.Printf("    kernel.apparmor_restrict_unprivileged_userns: %s\n", apparmorRestrict)
 	}
-
-	// Test bwrap probe - this verifies if bwrap can run (succeeds when AppArmor profile is loaded)
-	if err := sandboxProbeBwrap(); err != nil {
-		if errors.Is(err, sandbox.ErrBwrapBlocked) || strings.TrimSpace(apparmorRestrict) == "1" {
-			return fmt.Errorf("bwrap blocked by AppArmor userns restriction. Run 'lnta doctor --generate-apparmor | sudo tee /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap'")
+	usernsClone, usernsErr := readSysctl("kernel.unprivileged_userns_clone")
+	usernsMax, usernsMaxErr := readSysctl("user.max_user_namespaces")
+	profiles, profileErr := readAppArmorProfiles()
+	if doctorVerbose {
+		if usernsErr == nil {
+			fmt.Printf("    kernel.unprivileged_userns_clone: %s\n", usernsClone)
 		}
-		if errors.Is(err, sandbox.ErrBwrapNotFound) {
-			return fmt.Errorf("bwrap not found: %w", err)
+		if usernsMaxErr == nil {
+			fmt.Printf("    user.max_user_namespaces: %s\n", usernsMax)
 		}
-		return fmt.Errorf("bwrap probe failed: %w", err)
+		if profileErr != nil {
+			fmt.Printf("    AppArmor profile list: unavailable (%v)\n", profileErr)
+		} else {
+			fmt.Printf("    loaded bwrap-related profiles: %s\n", strings.Join(profiles, ", "))
+		}
+	}
+	if probeErr != nil {
+		return diagnoseBwrapProbe(probe, probeErr, apparmorRestrict, usernsClone, usernsErr, usernsMax, usernsMaxErr, profiles, profileErr)
 	}
 	if doctorVerbose {
-		fmt.Printf("    bwrap probe: OK (user namespaces operational)\n")
+		if probe.AppArmor != "" {
+			fmt.Printf("    Bubblewrap AppArmor attachment: %s\n", bwrapAttachmentStatus(probe.AppArmor))
+		}
 	}
 
 	// Check Landlock availability
@@ -1143,27 +1165,59 @@ func checkKernelSandbox() error {
 	return nil
 }
 
-func sandboxProbeBwrap() error {
-	bwrapPath, err := exec.LookPath("bwrap")
+func bwrapAttachmentStatus(label string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "not observed"
+	}
+	if strings.HasPrefix(label, "unconfined") {
+		return "no confined label observed (" + label + ")"
+	}
+	return "confined label observed (" + label + ")"
+}
+
+func readAppArmorProfiles() ([]string, error) {
+	data, err := os.ReadFile("/sys/kernel/security/apparmor/profiles")
 	if err != nil {
-		return sandbox.ErrBwrapNotFound
+		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	c := exec.CommandContext(ctx, bwrapPath, "--ro-bind", "/", "/", "--", "true")
-	c.Stdin = nil
-	c.Stdout = nil
-	c.Stderr = nil
-	if err := c.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if exitErr.ExitCode() == 126 || exitErr.ExitCode() == 127 {
-				return sandbox.ErrBwrapBlocked
-			}
+	var profiles []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && strings.Contains(strings.ToLower(line), "bwrap") {
+			profiles = append(profiles, line)
 		}
-		return err
 	}
-	return nil
+	return profiles, nil
+}
+
+func diagnoseBwrapProbe(probe sandbox.BwrapProbe, probeErr error, apparmorRestrict, usernsClone string, usernsErr error, usernsMax string, usernsMaxErr error, profiles []string, profileErr error) error {
+	switch {
+	case errors.Is(probeErr, sandbox.ErrBwrapNotFound):
+		return fmt.Errorf("bwrap is missing from PATH; install the distribution's bubblewrap package: %w", probeErr)
+	case probe.TimedOut:
+		return fmt.Errorf("bwrap probe timed out after %s; check system load and kernel logs: %w", probe.Duration.Round(time.Millisecond), probeErr)
+	case usernsErr == nil && strings.TrimSpace(usernsClone) == "0":
+		return fmt.Errorf("unprivileged user namespaces are disabled by kernel.unprivileged_userns_clone=0; probe stderr: %q: %w", probe.Stderr, probeErr)
+	case usernsMaxErr == nil && strings.TrimSpace(usernsMax) == "0":
+		return fmt.Errorf("user namespaces are disabled by user.max_user_namespaces=0; probe stderr: %q: %w", probe.Stderr, probeErr)
+	default:
+		detail := fmt.Sprintf("bwrap sandbox initialization failed (exit %d)", probe.ExitStatus)
+		if probe.Stderr != "" {
+			detail += fmt.Sprintf("; stderr: %q", probe.Stderr)
+		}
+		if strings.TrimSpace(apparmorRestrict) == "1" {
+			detail += "; AppArmor restricts unprivileged user namespaces, but that sysctl alone does not identify this failure"
+		}
+		if profileErr != nil {
+			detail += "; loaded AppArmor profile state is not readable here; inspect with sudo aa-status and sudo journalctl -k --since today | grep -i apparmor"
+		} else if len(profiles) == 0 {
+			detail += "; no bwrap-related profile appears in the readable kernel profile list; this alone does not prove AppArmor caused the failure"
+		} else {
+			detail += fmt.Sprintf("; loaded bwrap-related profiles: %s", strings.Join(profiles, ", "))
+		}
+		return fmt.Errorf("%s: %w", detail, probeErr)
+	}
 }
 
 func checkValidators() error {
@@ -1211,20 +1265,14 @@ func readSysctl(key string) (string, error) {
 }
 
 func generateAppArmorProfile() string {
-	return `# Allow unprivileged user namespaces for bwrap
-# Install to: /etc/apparmor.d/bwrap
-# Then run: sudo apparmor_parser -r /etc/apparmor.d/bwrap
-
-abi <abi/4.0>,
-include <tunables/global>
-
-profile bwrap flags=(unconfined) {
-  userns,
-
-  # Site-specific additions and overrides. See local/README for details.
-  include if exists <local/bwrap>
-}
-`
+	return "LNTA does not generate or install an AppArmor profile.\n\n" +
+		"On Ubuntu, inspect the distribution-owned Bubblewrap policy and its loaded state with:\n" +
+		"  sudo aa-status\n" +
+		"  sudo journalctl -k --since today | grep -i apparmor\n\n" +
+		"Check LNTA's production-equivalent Bubblewrap probe and captured stderr with:\n" +
+		"  lnta doctor --verbose\n\n" +
+		"Do not write this output to /etc/apparmor.d/bwrap or replace Ubuntu's " +
+		"bwrap-userns-restrict policy. The sysctl value alone does not establish why a probe failed.\n"
 }
 
 func min(a, b int) int {
