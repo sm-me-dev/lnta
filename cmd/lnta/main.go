@@ -1012,6 +1012,7 @@ func runDoctor(cmd *cobra.Command) error {
 	}
 
 	allPassed := true
+	sandboxErr := error(nil)
 	for _, c := range checks {
 		fmt.Printf("  %s %s... ", labelStyle.Render("▶"), c.name)
 		err := c.fn()
@@ -1021,6 +1022,9 @@ func runDoctor(cmd *cobra.Command) error {
 				fmt.Printf("    %s\n", mutedStyle.Render(err.Error()))
 			}
 			allPassed = false
+			if c.name == "Kernel Sandbox" {
+				sandboxErr = err
+			}
 		} else {
 			fmt.Println(labelStyle.Render("OK"))
 		}
@@ -1033,7 +1037,14 @@ func runDoctor(cmd *cobra.Command) error {
 		fmt.Println(mutedStyle.Render("Some checks failed — run with --verbose for details"))
 	}
 
-	return nil
+	return doctorSandboxExitError(sandboxErr)
+}
+
+func doctorSandboxExitError(sandboxErr error) error {
+	if sandboxErr == nil {
+		return nil
+	}
+	return fmt.Errorf("required confined sandbox capability unavailable: %w", sandboxErr)
 }
 
 func checkLLMConfig() error {
@@ -1049,15 +1060,18 @@ func checkLLMConfig() error {
 		return errors.New("LNTA_BASE_URL not set")
 	}
 	if doctorVerbose {
-		keyDisplay := "(none/local)"
-		if cfg.APIKey != "" {
-			keyDisplay = fmt.Sprintf("%s... (len=%d)", cfg.APIKey[:min(8, len(cfg.APIKey))], len(cfg.APIKey))
-		}
-		fmt.Printf("    API Key: %s\n", keyDisplay)
+		fmt.Printf("    API Key: %s\n", doctorKeyDisplay(cfg.APIKey))
 		fmt.Printf("    Base URL: %s\n", cfg.BaseURL)
 		fmt.Printf("    Model: %s\n", cfg.Model)
 	}
 	return nil
+}
+
+func doctorKeyDisplay(apiKey string) string {
+	if apiKey == "" {
+		return "(none/local)"
+	}
+	return "configured"
 }
 
 func checkLLMConnectivity() error {
@@ -1142,27 +1156,47 @@ func checkKernelSandbox() error {
 			fmt.Printf("    loaded bwrap-related profiles: %s\n", strings.Join(profiles, ", "))
 		}
 	}
-	if probeErr != nil {
-		return diagnoseBwrapProbe(probe, probeErr, apparmorRestrict, usernsClone, usernsErr, usernsMax, usernsMaxErr, profiles, profileErr)
-	}
+	landlockErr := sandbox.ProbeLandlockExecution(3 * time.Second)
 	if doctorVerbose {
-		if probe.AppArmor != "" {
+		if landlockErr != nil {
+			fmt.Printf("    Landlock execution probe: unavailable (%v)\n", landlockErr)
+		} else {
+			fmt.Printf("    Landlock execution probe: operational\n")
+		}
+		if probeErr == nil && probe.AppArmor != "" {
 			fmt.Printf("    Bubblewrap AppArmor attachment: %s\n", bwrapAttachmentStatus(probe.AppArmor))
 		}
 	}
-
-	// Check Landlock availability
-	if err := sandbox.LandlockProbe(); err != nil {
-		if doctorVerbose {
-			fmt.Printf("    Landlock: unavailable (%v)\n", err)
+	_, status, backendErr := selectSandboxBackend(probe, probeErr, landlockErr)
+	if backendErr != nil {
+		bwrapDiagnosis := "operational"
+		if probeErr != nil {
+			bwrapDiagnosis = diagnoseBwrapProbe(probe, probeErr, apparmorRestrict, usernsClone, usernsErr, usernsMax, usernsMaxErr, profiles, profileErr).Error()
 		}
-		return fmt.Errorf("landlock unavailable: %w", err)
+		if strings.Contains(status, "cannot be determined") {
+			return fmt.Errorf("%s (Bubblewrap: %v; Landlock: %v)", status, probeErr, landlockErr)
+		}
+		return fmt.Errorf("%s (Bubblewrap: %s; Landlock: %v)", status, bwrapDiagnosis, landlockErr)
 	}
 	if doctorVerbose {
-		fmt.Printf("    Landlock: available\n")
+		fmt.Printf("    %s\n", status)
 	}
-
 	return nil
+}
+
+func selectSandboxBackend(probe sandbox.BwrapProbe, bwrapErr, landlockErr error) (backend, status string, err error) {
+	if bwrapErr == nil {
+		return string(sandbox.BackendBwrap), "Bubblewrap available and operational", nil
+	}
+	if landlockErr == nil {
+		return string(sandbox.BackendLandlock), "Bubblewrap unavailable; Landlock fallback operational", nil
+	}
+	knownBwrapFailure := errors.Is(bwrapErr, sandbox.ErrBwrapNotFound) || errors.Is(bwrapErr, sandbox.ErrBwrapBlocked) || errors.Is(bwrapErr, sandbox.ErrSecretScanIncomplete) || probe.TimedOut || probe.ExitStatus >= 0
+	knownLandlockFailure := errors.Is(landlockErr, sandbox.ErrLandlockUnavailable) || errors.Is(landlockErr, sandbox.ErrLandlockExecutionProbe)
+	if knownBwrapFailure && knownLandlockFailure {
+		return "", "neither supported confined backend is operational", fmt.Errorf("sandbox unavailable")
+	}
+	return "", "sandbox backend availability cannot be determined reliably", fmt.Errorf("probe result is indeterminate")
 }
 
 func bwrapAttachmentStatus(label string) string {
@@ -1195,12 +1229,16 @@ func diagnoseBwrapProbe(probe sandbox.BwrapProbe, probeErr error, apparmorRestri
 	switch {
 	case errors.Is(probeErr, sandbox.ErrBwrapNotFound):
 		return fmt.Errorf("bwrap is missing from PATH; install the distribution's bubblewrap package: %w", probeErr)
+	case errors.Is(probeErr, sandbox.ErrSecretScanIncomplete):
+		return fmt.Errorf("project credential masking could not be established; sandbox execution is refused: %w", probeErr)
 	case probe.TimedOut:
 		return fmt.Errorf("bwrap probe timed out after %s; check system load and kernel logs: %w", probe.Duration.Round(time.Millisecond), probeErr)
 	case usernsErr == nil && strings.TrimSpace(usernsClone) == "0":
 		return fmt.Errorf("unprivileged user namespaces are disabled by kernel.unprivileged_userns_clone=0; probe stderr: %q: %w", probe.Stderr, probeErr)
 	case usernsMaxErr == nil && strings.TrimSpace(usernsMax) == "0":
 		return fmt.Errorf("user namespaces are disabled by user.max_user_namespaces=0; probe stderr: %q: %w", probe.Stderr, probeErr)
+	case hasAppArmorDenial(probe.Stderr):
+		return fmt.Errorf("bubblewrap probe stderr contains an explicit AppArmor denial: %q: %w", probe.Stderr, probeErr)
 	default:
 		detail := fmt.Sprintf("bwrap sandbox initialization failed (exit %d)", probe.ExitStatus)
 		if probe.Stderr != "" {
@@ -1218,6 +1256,11 @@ func diagnoseBwrapProbe(probe sandbox.BwrapProbe, probeErr error, apparmorRestri
 		}
 		return fmt.Errorf("%s: %w", detail, probeErr)
 	}
+}
+
+func hasAppArmorDenial(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	return strings.Contains(lower, `apparmor="denied"`) || strings.Contains(lower, "apparmor denied")
 }
 
 func checkValidators() error {
@@ -1273,11 +1316,4 @@ func generateAppArmorProfile() string {
 		"  lnta doctor --verbose\n\n" +
 		"Do not write this output to /etc/apparmor.d/bwrap or replace Ubuntu's " +
 		"bwrap-userns-restrict policy. The sysctl value alone does not establish why a probe failed.\n"
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

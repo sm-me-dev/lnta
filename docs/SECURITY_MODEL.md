@@ -182,13 +182,13 @@ LNTA neutralizes CVE-2026-25725 through a 3-layer mask strategy:
 │    ──► Masked with empty tmpfs mounts                                  │
 │                                                                        │
 │ 3. Project Tree Secrets (.env*, .netrc, credentials.json...)           │
-│    ──► Traversed recursively up to 4 levels and bound to /dev/null     │
+│    ──► Scanned within explicit depth/entry bounds and excluded         │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
 1. **Direct Home Dotfiles**: `~/.bashrc`, `~/.zshrc`, `~/.profile`, `~/.bash_profile`, `~/.bash_login`, and `~/.bash_logout` are bound over with `/dev/null`. Even if the file does not exist on disk, bwrap creates a read-only node bound to `/dev/null`. Writes fail immediately with `EPERM` or `EROFS`.
 2. **Secret Directories**: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/lnta`, and `~/.config/claude` are mounted over with empty `tmpfs`. Even if a sandboxed command writes inside `~/.ssh/authorized_keys`, the file is written to ephemeral RAM and vanishes the millisecond the process terminates.
-3. **Symlink Resolution**: All masked paths are evaluated with `os.Lstat` and `filepath.EvalSymlinks`. If a dotfile or secret directory is a symlink pointing elsewhere on the filesystem, both the symlink and the canonical destination are masked.
+3. **Project Credential Scan**: The project tree is scanned in bounded directory batches through ignored directories as well as ordinary source directories, with a maximum depth of 32 and 5,000 entries. Bubblewrap masks discovered credential files; Landlock omits them from its allowlist. Landlock's separate allowlist walk is capped at depth 32 and 20,000 entries. Neither scan follows project symlinks. If a symlink, traversal error, depth boundary, or entry limit makes coverage incomplete, the sandbox refuses to run. These bounds are deliberate resource limits and are never reported as complete masking when the scan stops early.
 
 ---
 

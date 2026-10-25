@@ -438,12 +438,6 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 		return fmt.Sprintf("mutate_system failed to start: %v", err), nil
 	}
 
-	defer func() {
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // negative PID = whole process group
-		}
-	}()
-
 	err = sandbox.WaitChild("mutate_system", cmd, childStarted, mctx, out, errOut)
 	var exitCode int
 	if ex, ok := err.(*exec.ExitError); ok {
@@ -764,11 +758,6 @@ func nativeDesktopEntryVerify(ctx context.Context, target string) error {
 	if startErr != nil {
 		return &verificationUnavailableError{err: fmt.Errorf("start desktop-file-validate: %w", startErr)}
 	}
-	defer func() {
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-	}()
 	if err := sandbox.WaitChild("desktop_file_validate", cmd, childStarted, ctx, stdout, stderr); err != nil {
 		if ctx.Err() != nil {
 			return &verificationUnavailableError{err: fmt.Errorf("desktop-file-validate timed out or was cancelled: %w", ctx.Err())}

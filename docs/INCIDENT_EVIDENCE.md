@@ -1,9 +1,10 @@
 # Collecting evidence after a terminal incident
 
-LNTA has not been established as the cause of any terminal or desktop crash.
-Capture host evidence before restarting the session when practical. These
-commands only read system state. Use a time window that includes the incident
-and preserve the host's timezone and clock information.
+Do not assume LNTA caused a terminal or desktop crash. Correlate incident-time
+host logs with LNTA lifecycle events before drawing a conclusion. Capture host
+evidence before restarting the session when practical. These commands only
+read system state. Use a time window that includes the incident and preserve
+the host's timezone and clock information.
 
 ```bash
 date --iso-8601=seconds

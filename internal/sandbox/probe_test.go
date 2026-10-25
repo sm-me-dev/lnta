@@ -13,12 +13,17 @@ import (
 )
 
 func TestBwrapProbeArgsMatchProductionSandboxArgs(t *testing.T) {
-	cwd, err := os.Getwd()
+	cwd, _ := os.Getwd()
+	base, err := bwrapArgs(homeDir(), cwd, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := append(bwrapArgs(homeDir(), cwd, nil), "sh", "-c", "cat /proc/self/attr/current")
-	if got := bwrapProbeArgs(homeDir(), cwd); !reflect.DeepEqual(got, want) {
+	want := append(base, "sh", "-c", "cat /proc/self/attr/current")
+	got, err := bwrapProbeArgs(homeDir(), cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("probe args do not match production bwrap args\ngot:  %#v\nwant: %#v", got, want)
 	}
 }
@@ -55,7 +60,10 @@ func TestProbeBwrapCapturesLabelAndBoundsStderr(t *testing.T) {
 	}
 	gotArgs := strings.Split(strings.TrimSuffix(string(args), "\x00"), "\x00")
 	cwd, _ := os.Getwd()
-	wantArgs := bwrapProbeArgs(homeDir(), cwd)
+	wantArgs, err := bwrapProbeArgs(homeDir(), cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Fatalf("probe invocation differs from production args\ngot:  %#v\nwant: %#v", gotArgs, wantArgs)
 	}

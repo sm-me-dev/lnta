@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -84,7 +85,7 @@ func TestVerifyReleaseChecksumsRejectsUnsignedOrInvalidData(t *testing.T) {
 	if _, err := exec.LookPath("gpgv"); err != nil {
 		t.Skip("gpgv is not installed")
 	}
-	err := verifyReleaseChecksums([]byte("checksums"), []byte("not a signature"))
+	err := verifyReleaseChecksums(context.Background(), []byte("checksums"), []byte("not a signature"))
 	if err == nil {
 		t.Fatal("invalid checksum signature was accepted")
 	}
@@ -159,7 +160,7 @@ func TestExtractBinaryFromTarGz(t *testing.T) {
 }
 
 func TestDetectPackageManagerNonExistent(t *testing.T) {
-	managed, pkgManager := detectPackageManager("/nonexistent/dummy/path/to/lnta")
+	managed, pkgManager := detectPackageManager(context.Background(), "/nonexistent/dummy/path/to/lnta")
 	if managed {
 		t.Errorf("expected nonexistent path to not be package-managed, got managed by %s", pkgManager)
 	}

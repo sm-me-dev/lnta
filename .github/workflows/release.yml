@@ -85,13 +85,26 @@ jobs:
           echo "GPG_FINGERPRINT=$GPG_FINGERPRINT" >> "$GITHUB_ENV"
       - name: Sign and validate artifacts
         run: |
+          set -euo pipefail
           test -s dist/checksums.txt
           gpg --batch --yes --local-user "$GPG_FINGERPRINT" --output dist/checksums.txt.sig --detach-sign dist/checksums.txt
           gpg --batch --export "$GPG_FINGERPRINT" > /tmp/lnta-release-key.gpg
           gpgv --keyring /tmp/lnta-release-key.gpg dist/checksums.txt.sig dist/checksums.txt
           (cd dist && sha256sum --check checksums.txt)
-          test -n "$(find dist -maxdepth 1 -name '*.deb' -type f -print -quit)"
+          mapfile -t packages < <(find dist -maxdepth 1 -name '*.deb' -type f -print | sort)
+          test "${#packages[@]}" -eq 2
+          declare -A package_arches=()
           for package in dist/*.deb; do dpkg-deb --info "$package" >/dev/null; done
+          for package in "${packages[@]}"; do
+            test "$(dpkg-deb -f "$package" Package)" = lnta
+            test "$(dpkg-deb -f "$package" Version)" = "${GITHUB_REF_NAME#v}"
+            arch="$(dpkg-deb -f "$package" Architecture)"
+            case "$arch" in amd64|arm64) ;; *) echo "unexpected Debian architecture: $arch" >&2; exit 1 ;; esac
+            test -z "${package_arches[$arch]:-}"
+            package_arches[$arch]=1
+          done
+          test -n "${package_arches[amd64]:-}"
+          test -n "${package_arches[arm64]:-}"
       - name: Create draft release
         working-directory: source
         env:
@@ -111,21 +124,21 @@ jobs:
           mkdir -p conf
           cp ../source/scripts/apt/distributions conf/distributions
           sed -i "s/^SignWith:.*/SignWith: $GPG_FINGERPRINT/" conf/distributions
-          for package in ../dist/*.deb; do reprepro -b . includedeb stable "$package" || true; done
+          mapfile -t packages < <(find ../dist -maxdepth 1 -name '*.deb' -type f -print | sort)
+          test "${#packages[@]}" -eq 2
+          for package in "${packages[@]}"; do reprepro -b . includedeb stable "$package"; done
           gpg --batch --armor --export "$GPG_FINGERPRINT" > lnta-archive-keyring.asc
           cp ../source/scripts/apt/install-apt.sh ./install-apt.sh
           chmod 0755 ./install-apt.sh
           touch .nojekyll
           ../source/scripts/apt/generate-index.sh "${GITHUB_REF_NAME#v}" .
           gpg --batch --export "$GPG_FINGERPRINT" > /tmp/lnta-apt-key.gpg
+          python3 ../source/scripts/apt/verify_repository.py . "${GITHUB_REF_NAME#v}"
           gpgv --keyring /tmp/lnta-apt-key.gpg dists/stable/InRelease
           git add -A
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Publish $GITHUB_REF_NAME APT repository"
           git push origin HEAD:gh-pages
-          apt_commit="$(git rev-parse HEAD)"
           if ! gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false; then
-            echo "::error::Release publication failed after APT publication; attempting to revert the APT commit."
-            git revert --no-edit "$apt_commit"
-            git push origin HEAD:gh-pages || { echo "::error::APT rollback push failed; gh-pages needs manual recovery."; exit 1; }
+            echo "::error::Release finalization failed after APT publication. The APT repository remains published and the GitHub release remains a draft; retry finalization or follow the repository recovery procedure. No automatic rollback was attempted."
             exit 1
           fi

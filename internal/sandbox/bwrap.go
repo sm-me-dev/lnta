@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,7 +83,10 @@ func ProbeBwrap(timeout time.Duration) (BwrapProbe, error) {
 		return result, fmt.Errorf("get current directory: %w", err)
 	}
 	home := homeDir()
-	args := bwrapProbeArgs(home, cwd)
+	args, err := bwrapProbeArgs(home, cwd)
+	if err != nil {
+		return result, err
+	}
 	cmd := exec.CommandContext(ctx, bwrap, args...)
 	cmd.Stdin = nil
 	stdout := NewCappedBuffer(1024, 0, nil)
@@ -112,8 +115,12 @@ func ProbeBwrap(timeout time.Duration) (BwrapProbe, error) {
 	return result, nil
 }
 
-func bwrapProbeArgs(home, cwd string) []string {
-	return append(bwrapArgs(home, cwd, nil), "sh", "-c", "cat /proc/self/attr/current")
+func bwrapProbeArgs(home, cwd string) ([]string, error) {
+	args, err := bwrapArgs(home, cwd, nil)
+	if err != nil {
+		return nil, err
+	}
+	return append(args, "sh", "-c", "cat /proc/self/attr/current"), nil
 }
 
 func probeBwrap() error {
@@ -191,38 +198,67 @@ func projectSecretFile(name string) bool {
 
 // maskProjectSecrets walks cwd (bounded) and returns the credential files to
 // mask. Depth and entry count are capped so a huge tree cannot stall startup.
-func maskProjectSecrets(cwd string) []string {
-	const maxDepth, maxEntries = 4, 5000
+var ErrSecretScanIncomplete = errors.New("project credential scan incomplete; sandbox refused")
+
+func maskProjectSecrets(cwd string) ([]string, error) {
+	const maxDepth, maxEntries = 32, 5000
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project root: %w", err)
+	}
+	cwd, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project root %q: %w", abs, err)
+	}
 	var out []string
 	seen := 0
-	base := strings.Count(filepath.Clean(cwd), string(filepath.Separator))
-	_ = filepath.WalkDir(cwd, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if seen++; seen > maxEntries {
-			return filepath.SkipAll
-		}
-		if d.IsDir() {
-			if p != cwd && (d.Name() == ".git" || d.Name() == "node_modules" || d.Name() == "vendor") {
-				return filepath.SkipDir
-			}
-			if strings.Count(p, string(filepath.Separator))-base >= maxDepth {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.Type().IsRegular() && projectSecretFile(d.Name()) {
-			out = append(out, p)
-		}
-		return nil
-	})
-	return out
+	err = scanProjectSecretDir(cwd, 0, maxDepth, maxEntries, &seen, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-func under(path, dir string) bool {
-	path, dir = filepath.Clean(path), filepath.Clean(dir)
-	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
+func scanProjectSecretDir(dir string, depth, maxDepth, maxEntries int, seen *int, secrets *[]string) error {
+	file, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("walk %q: %w", dir, err)
+	}
+	defer file.Close()
+	for {
+		entries, readErr := file.ReadDir(256)
+		for _, entry := range entries {
+			*seen++
+			if *seen > maxEntries {
+				return fmt.Errorf("%w: entry limit %d exceeded", ErrSecretScanIncomplete, maxEntries)
+			}
+			path := filepath.Join(dir, entry.Name())
+			if entry.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("%w: symlink in project tree at %q", ErrSecretScanIncomplete, path)
+			}
+			if entry.IsDir() {
+				if projectSecretFile(entry.Name()) {
+					return fmt.Errorf("%w: credential-named directory at %q", ErrSecretScanIncomplete, path)
+				}
+				if depth+1 >= maxDepth {
+					return fmt.Errorf("%w: depth limit %d reached at %q", ErrSecretScanIncomplete, maxDepth, path)
+				}
+				if err := scanProjectSecretDir(path, depth+1, maxDepth, maxEntries, seen, secrets); err != nil {
+					return err
+				}
+				continue
+			}
+			if entry.Type().IsRegular() && projectSecretFile(entry.Name()) {
+				*secrets = append(*secrets, path)
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("read project directory %q: %w", dir, readErr)
+		}
+	}
 }
 
 // resolveCWD returns an absolute, existing directory for the sandbox cwd.
@@ -233,6 +269,10 @@ func resolveCWD(cwd string) (string, error) {
 	abs, err := filepath.Abs(cwd)
 	if err != nil {
 		return "", err
+	}
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve cwd symlinks: %w", err)
 	}
 	st, err := os.Stat(abs)
 	if err != nil {
@@ -247,7 +287,11 @@ func resolveCWD(cwd string) (string, error) {
 // bwrapArgs builds the bubblewrap argument vector (without the executable and
 // without the trailing command). Pure function of (home, cwd, extraEnv) plus
 // the on-disk existence of the paths to mask.
-func bwrapArgs(home, cwd string, extraEnv []string) []string {
+func bwrapArgs(home, cwd string, extraEnv []string) ([]string, error) {
+	projectSecrets, err := maskProjectSecrets(cwd)
+	if err != nil {
+		return nil, err
+	}
 	args := []string{
 		"--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-net",
 		"--unshare-uts", "--unshare-cgroup-try",
@@ -300,7 +344,7 @@ func bwrapArgs(home, cwd string, extraEnv []string) []string {
 		}
 	}
 	// Credential files inside the project tree (.env, .netrc, ...), recursive and bounded.
-	for _, f := range maskProjectSecrets(cwd) {
+	for _, f := range projectSecrets {
 		args = append(args, "--ro-bind", "/dev/null", f)
 	}
 
@@ -308,7 +352,7 @@ func bwrapArgs(home, cwd string, extraEnv []string) []string {
 		i := strings.IndexByte(kv, '=')
 		args = append(args, "--setenv", kv[:i], kv[i+1:])
 	}
-	return append(args, "--chdir", cwd, "--")
+	return append(args, "--chdir", cwd, "--"), nil
 }
 
 // exitCodeOf converts a Wait error into a shell-style exit code.
@@ -348,7 +392,11 @@ func runBwrapEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 	}
 	home := homeDir()
 
-	args := append(bwrapArgs(home, absCwd, extraEnv), "sh", "-c", cmdStr)
+	baseArgs, err := bwrapArgs(home, absCwd, extraEnv)
+	if err != nil {
+		return res, err
+	}
+	args := append(baseArgs, "sh", "-c", cmdStr)
 
 	cmd := exec.CommandContext(ctx, bwrap, args...)
 	cmd.Stdin = nil                                         // /dev/null

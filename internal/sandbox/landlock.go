@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -40,6 +41,10 @@ const minLandlockABI = 10
 // ErrLandlockUnavailable is returned when Landlock is not supported (or is too
 // old to provide the confinement lnta promises) on this kernel.
 var ErrLandlockUnavailable = errors.New("landlock LSM not available on this kernel")
+
+// ErrLandlockExecutionProbe identifies a failure while testing the complete
+// self-reexec and confinement path, beyond the ABI-only capability query.
+var ErrLandlockExecutionProbe = errors.New("landlock execution probe failed")
 
 // ErrLandlockNotRootless is returned when Landlock rules cannot be applied
 // because the process lacks the necessary ambient capabilities.
@@ -87,6 +92,26 @@ func LandlockProbe() error {
 	return checkLandlockABI(abi)
 }
 
+// ProbeLandlockExecution verifies the complete fallback path by running a
+// bounded no-op through the same self-reexec and confinement setup as normal
+// execution. ABI-only checks remain available through LandlockProbe.
+func ProbeLandlockExecution(timeout time.Duration) error {
+	if timeout <= 0 || timeout > 5*time.Second {
+		timeout = 3 * time.Second
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get current directory: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err = runLandlockEnv(ctx, "true", cwd, timeout, nil)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrLandlockExecutionProbe, err)
+	}
+	return nil
+}
+
 func checkLandlockABI(abi int) error {
 	if abi < minLandlockABI {
 		return fmt.Errorf("%w: ABI v%d < v%d (complete network confinement unavailable)", ErrLandlockUnavailable, abi, minLandlockABI)
@@ -99,38 +124,65 @@ func checkLandlockABI(abi int) error {
 // directory and cannot be subtracted, so a directory that contains a denied
 // path is not granted wholesale: it is listable, and each of its children is
 // granted (or recursed into) individually. Symlinks are skipped.
-func grantTree(cfg *landlockConfig, dir string, deny map[string]bool, ancestors map[string]bool) {
+const (
+	maxLandlockTreeEntries = 20000
+	maxLandlockTreeDepth   = 32
+)
+
+type landlockTreeScan struct{ entries int }
+
+func grantTree(cfg *landlockConfig, dir string, deny map[string]bool, ancestors map[string]bool, scan *landlockTreeScan, depth int) error {
 	if deny[dir] {
-		return
+		return nil
 	}
 	if !ancestors[dir] {
 		cfg.RODirs = append(cfg.RODirs, dir)
-		return
+		return nil
+	}
+	if depth >= maxLandlockTreeDepth {
+		return fmt.Errorf("landlock allowlist scan incomplete: depth limit %d reached at %q", maxLandlockTreeDepth, dir)
 	}
 	cfg.ReadDirOnly = append(cfg.ReadDirOnly, dir)
-	entries, err := os.ReadDir(dir)
+	file, err := os.Open(dir)
 	if err != nil {
-		return
+		return fmt.Errorf("read sandbox allowlist directory %q: %w", dir, err)
 	}
-	for _, e := range entries {
-		p := filepath.Join(dir, e.Name())
-		if deny[p] {
-			continue
+	defer file.Close()
+	for {
+		entries, readErr := file.ReadDir(256)
+		scan.entries += len(entries)
+		if scan.entries > maxLandlockTreeEntries {
+			return fmt.Errorf("landlock allowlist scan incomplete: entry limit %d exceeded", maxLandlockTreeEntries)
 		}
-		switch {
-		case e.Type()&os.ModeSymlink != 0:
-			continue
-		case e.IsDir():
-			grantTree(cfg, p, deny, ancestors)
-		case e.Type().IsRegular():
-			cfg.ROFiles = append(cfg.ROFiles, p)
+		for _, e := range entries {
+			p := filepath.Join(dir, e.Name())
+			if deny[p] {
+				continue
+			}
+			switch {
+			case e.Type()&os.ModeSymlink != 0:
+				continue
+			case e.IsDir():
+				if err := grantTree(cfg, p, deny, ancestors, scan, depth+1); err != nil {
+					return err
+				}
+			case e.Type().IsRegular():
+				cfg.ROFiles = append(cfg.ROFiles, p)
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return fmt.Errorf("read sandbox allowlist directory %q: %w", dir, readErr)
 		}
 	}
+	return nil
 }
 
 // buildLandlockConfig computes the allow-list for a run. Credential paths are
 // never granted (Landlock is allow-list based, so "masked" means "absent").
-func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) landlockConfig {
+func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) (landlockConfig, error) {
 	cfg := landlockConfig{
 		Cwd: cwd,
 		Cmd: cmdStr,
@@ -139,7 +191,7 @@ func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) landl
 	// Landlock has no PID namespace. Do not grant /proc: same-user process
 	// environments and descriptors can otherwise expose the parent agent's
 	// credentials. The fallback intentionally cannot inspect host processes.
-	cfg.RODirs = append(cfg.RODirs, "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/sys", "/opt", "/var/log")
+	baseRODirs := []string{"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/sys", "/opt", "/var/log"}
 	cfg.RWDirs = []string{tmp}
 	cfg.RWFiles = []string{"/dev/null"}
 	cfg.ROFiles = []string{"/dev/zero", "/dev/urandom", "/dev/random"}
@@ -165,7 +217,11 @@ func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) landl
 			deny[f] = true
 		}
 	}
-	for _, f := range maskProjectSecrets(cwd) {
+	projectSecrets, err := maskProjectSecrets(cwd)
+	if err != nil {
+		return cfg, err
+	}
+	for _, f := range projectSecrets {
 		deny[f] = true
 	}
 	ancestors := map[string]bool{}
@@ -175,20 +231,57 @@ func buildLandlockConfig(cwd, home, tmp, cmdStr string, extraEnv []string) landl
 		}
 	}
 
-	roots := []string{"/etc"}
+	roots := append([]string{"/etc"}, baseRODirs...)
 	if home != "" {
 		roots = append(roots, home)
 	}
-	if cwd != "" && (home == "" || !under(cwd, home)) {
-		roots = append(roots, cwd)
+	if cwd != "" {
+		covered := false
+		for _, root := range roots {
+			if pathWithin(cwd, root) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			roots = append(roots, cwd)
+		}
 	}
+	seenRoots := make(map[string]bool, len(roots))
+	treeScan := &landlockTreeScan{}
 	for _, r := range roots {
-		if st, err := os.Stat(r); err == nil && st.IsDir() {
-			grantTree(&cfg, r, deny, ancestors)
+		if seenRoots[r] {
+			continue
+		}
+		seenRoots[r] = true
+		st, statErr := os.Stat(r)
+		if statErr != nil {
+			if !errors.Is(statErr, os.ErrNotExist) {
+				return cfg, fmt.Errorf("inspect sandbox root %q: %w", r, statErr)
+			}
+			continue
+		}
+		if st.IsDir() {
+			if err := grantLandlockRoot(&cfg, r, deny, ancestors, treeScan); err != nil {
+				return cfg, err
+			}
 		}
 	}
 	sort.Strings(cfg.RODirs)
-	return cfg
+	return cfg, nil
+}
+
+func pathWithin(path, root string) bool {
+	path, root = filepath.Clean(path), filepath.Clean(root)
+	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+func grantLandlockRoot(cfg *landlockConfig, root string, deny map[string]bool, ancestors map[string]bool, scan *landlockTreeScan) error {
+	if deny[root] || ancestors[root] {
+		return grantTree(cfg, root, deny, ancestors, scan, 0)
+	}
+	cfg.RODirs = append(cfg.RODirs, root)
+	return nil
 }
 
 // runLandlock executes a command under Landlock LSM restrictions by
@@ -237,7 +330,10 @@ func runLandlockEnv(ctx context.Context, cmdStr string, cwd string, timeout time
 		return res, err
 	}
 
-	cfg := buildLandlockConfig(absCwd, home, tmp, cmdStr, extraEnv)
+	cfg, err := buildLandlockConfig(absCwd, home, tmp, cmdStr, extraEnv)
+	if err != nil {
+		return res, err
+	}
 	cfgJSON, err := json.Marshal(cfg)
 	if err != nil {
 		return res, err
@@ -407,17 +503,18 @@ func LandlockExecMain() int {
 	if cwd == "" {
 		cwd = "."
 	}
-	cmd := exec.Command("sh", "-c", cfg.Cmd)
-	cmd.Dir = cwd
-	cmd.Stdin = nil
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = cfg.Env
-	RegisterChild(cmd)
-	if err := cmd.Run(); err != nil {
-		return exitCodeOf(err)
+	if err := os.Chdir(cwd); err != nil {
+		fmt.Fprintln(os.Stderr, "change to sandbox cwd:", err)
+		return 126
 	}
-	return 0
+	// Replace the launcher process instead of starting an untracked grandchild.
+	// The outer lifecycle wrapper then observes the actual command's status and
+	// owns cleanup of its complete process group.
+	if err := syscall.Exec("/bin/sh", []string{"sh", "-c", cfg.Cmd}, cfg.Env); err != nil {
+		fmt.Fprintln(os.Stderr, "exec sandboxed command:", err)
+		return 126
+	}
+	return 126 // syscall.Exec only returns on failure.
 }
 
 // LandlockExecCommand is LandlockExecMain adapted to an error return for

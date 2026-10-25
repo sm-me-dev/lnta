@@ -44,6 +44,8 @@ jobs:
           go-version: ${{ matrix.go-version }}
           cache: true
       - run: go test ./...
+      - name: Test APT metadata validation
+        run: python3 scripts/apt/test_verify_repository.py
 
   # golangci-lint - comprehensive linting
   lint:
@@ -102,52 +104,7 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y bubblewrap desktop-file-utils shellcheck apparmor-utils
-
-      - name: Configure unprivileged userns
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-
-      - name: Install AppArmor profile for bwrap (fixes uid map permission denied on Ubuntu 24.04+)
-        run: |
-          sudo mkdir -p /etc/apparmor.d
-          sudo tee /etc/apparmor.d/bwrap > /dev/null <<'EOF'
-          # bwrap AppArmor Profile
-          # Allows unprivileged user namespaces for bubblewrap sandboxing
-          abi <abi/4.0>,
-          include <tunables/global>
-
-          profile bwrap flags=(unconfined) {
-            userns,
-
-            # Read-only system mounts
-            / r,
-            /usr/** r,
-            /bin/** r,
-            /lib/** r,
-            /lib64/** r,
-            /etc/** r,
-            /proc/** r,
-            /sys/** r,
-            /dev/** r,
-            /run/** r,
-
-            # Read-write tmpfs
-            /tmp/** rw,
-            /var/tmp/** rw,
-
-            # Mask secret directories (read access only; they appear empty inside sandbox anyway)
-            @{HOME}/.ssh/** r,
-            @{HOME}/.gnupg/** r,
-            @{HOME}/.aws/** r,
-            @{HOME}/.kube/** r,
-            @{HOME}/.config/lnta/** r,
-
-            # Site-specific additions
-            include if exists <local/bwrap>
-          }
-          EOF
-          sudo apparmor_parser -r /etc/apparmor.d/bwrap || true
+          sudo apt-get update && sudo apt-get install -y bubblewrap desktop-file-utils shellcheck
 
       - name: Run tests with race detector
         run: go test -race -v ./...
@@ -180,11 +137,77 @@ jobs:
           fi
           echo "Binary size OK (< 15MB)"
 
+  deb-packaging:
+    name: Debian package contents and controls
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          version: v2.11.2
+          args: release --snapshot --clean --skip=sign,publish
+      - name: Inspect Debian package artifacts
+        run: |
+          shopt -s nullglob
+          packages=(dist/*.deb)
+          test "${#packages[@]}" -gt 0
+          for package in "${packages[@]}"; do scripts/deb/verify-package.sh "$package"; done
+      - name: Verify missing package inputs fail visibly
+        run: sh scripts/deb/test-missing-input.sh
+
+  security-bwrap-integration:
+    name: Restricted Bubblewrap integration (host gated)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Check the runner's existing security policy
+        id: policy
+        run: |
+          if ! command -v bwrap >/dev/null || ! test -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns || \
+             ! grep -qx 1 /proc/sys/kernel/apparmor_restrict_unprivileged_userns || \
+             ! sudo aa-status 2>/dev/null | grep -q 'bwrap-userns-restrict'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::SKIPPED restricted Bubblewrap integration: runner does not expose the expected distro-owned AppArmor policy and restriction. No security setting or profile was changed."
+            echo "Restricted Bubblewrap integration skipped: runner lacks the expected distro-owned policy/restriction; no host policy was changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Run restricted Bubblewrap to Landlock fallback check
+        if: steps.policy.outputs.skip != 'true'
+        run: |
+          go build -o /tmp/lnta ./cmd/lnta
+          test_home="$(mktemp -d)"
+          trap 'rm -rf "$test_home"' EXIT
+          set +e
+          output="$(HOME="$test_home" /tmp/lnta doctor --verbose 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "restricted runner could not establish any supported sandbox backend" >&2
+            exit "$status"
+          fi
+          if printf '%s\n' "$output" | grep -q 'Bubblewrap unavailable; Landlock fallback operational'; then
+            echo "Restricted Bubblewrap fallback was exercised successfully." >> "$GITHUB_STEP_SUMMARY"
+          elif printf '%s\n' "$output" | grep -q 'Bubblewrap available and operational'; then
+            echo "::notice::SKIPPED fallback assertion: distro policy is loaded but this runner's Bubblewrap probe is operational, so restriction did not block the backend."
+            echo "Fallback assertion skipped: Bubblewrap remained operational under the runner's loaded distro policy." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "doctor did not report an expected operational sandbox backend" >&2
+            exit 1
+          fi
+
   # Summary job - ensure all checks pass
   summary:
     name: Summary
     runs-on: ubuntu-24.04
-    needs: [vet, lint, packs-validate, test-race, test-min-and-stable, build]
+    needs: [vet, lint, packs-validate, test-race, test-min-and-stable, build, deb-packaging, security-bwrap-integration]
     if: always()
     steps:
       - name: Check all jobs passed
@@ -194,7 +217,9 @@ jobs:
              [ "${{ needs.packs-validate.result }}" != "success" ] || \
              [ "${{ needs.test-race.result }}" != "success" ] || \
              [ "${{ needs.test-min-and-stable.result }}" != "success" ] || \
-             [ "${{ needs.build.result }}" != "success" ]; then
+             [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.deb-packaging.result }}" != "success" ] || \
+             [ "${{ needs.security-bwrap-integration.result }}" != "success" ]; then
             echo "Some CI jobs failed"
             exit 1
           fi

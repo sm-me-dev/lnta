@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
@@ -22,6 +23,7 @@ import (
 	"github.com/spf13/cobra"
 
 	lnta "github.com/sm-me-dev/lnta"
+	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
 var (
@@ -48,7 +50,7 @@ If LNTA was installed via a system package manager (e.g. APT on Ubuntu/Debian),
 this command detects the package ownership and instructs you to use your
 system's native package manager to prevent state conflicts.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runSelfUpdate(selfUpdateCheckOnly, selfUpdateForce)
+		return runSelfUpdate(cmd.Context(), selfUpdateCheckOnly, selfUpdateForce)
 	},
 }
 
@@ -60,36 +62,53 @@ func init() {
 }
 
 // detectPackageManager checks whether the binary at binaryPath is managed by APT, RPM, or Pacman.
-func detectPackageManager(binaryPath string) (bool, string) {
+func detectPackageManager(ctx context.Context, binaryPath string) (bool, string) {
 	if _, err := os.Stat(binaryPath); err != nil {
 		return false, ""
 	}
 
 	// 1. Check dpkg (APT)
 	if _, err := exec.LookPath("dpkg"); err == nil {
-		cmd := exec.Command("dpkg", "-S", binaryPath)
-		if err := cmd.Run(); err == nil {
+		if _, _, err := runUpdateCommand(ctx, "package_owner_check", "dpkg", []string{"-S", binaryPath}, nil); err == nil {
 			return true, "APT"
 		}
 	}
 
 	// 2. Check rpm (Fedora/RHEL/openSUSE)
 	if _, err := exec.LookPath("rpm"); err == nil {
-		cmd := exec.Command("rpm", "-qf", binaryPath)
-		if err := cmd.Run(); err == nil {
+		if _, _, err := runUpdateCommand(ctx, "package_owner_check", "rpm", []string{"-qf", binaryPath}, nil); err == nil {
 			return true, "RPM/DNF"
 		}
 	}
 
 	// 3. Check pacman (Arch Linux)
 	if _, err := exec.LookPath("pacman"); err == nil {
-		cmd := exec.Command("pacman", "-Qo", binaryPath)
-		if err := cmd.Run(); err == nil {
+		if _, _, err := runUpdateCommand(ctx, "package_owner_check", "pacman", []string{"-Qo", binaryPath}, nil); err == nil {
 			return true, "Pacman"
 		}
 	}
 
 	return false, ""
+}
+
+func runUpdateCommand(parent context.Context, role, executable string, args []string, stdin io.Reader) (string, string, error) {
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, args...)
+	cmd.Stdin = stdin
+	sandbox.ConfigureProcessGroup(cmd)
+	stdout := sandbox.NewCappedBuffer(16*1024, 256*1024, cancel)
+	stderr := sandbox.NewCappedBuffer(16*1024, 256*1024, cancel)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	started, err := sandbox.StartChild(role, cmd)
+	if err != nil {
+		return "", "", err
+	}
+	err = sandbox.WaitChild(role, cmd, started, ctx, stdout, stderr)
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return stdout.Render(), stderr.Render(), err
 }
 
 // compareSemVer compares two semantic version strings.
@@ -306,7 +325,7 @@ func downloadURLToBytesLimit(url string, limit int64) ([]byte, error) {
 	return data, nil
 }
 
-func verifyReleaseChecksums(checksums, signature []byte) error {
+func verifyReleaseChecksums(ctx context.Context, checksums, signature []byte) error {
 	gpgPath, err := exec.LookPath("gpg")
 	if err != nil {
 		return fmt.Errorf("gpg is required to verify release signature: %w", err)
@@ -319,9 +338,7 @@ func verifyReleaseChecksums(checksums, signature []byte) error {
 	if err != nil {
 		return fmt.Errorf("read embedded release key: %w", err)
 	}
-	fingerprintCmd := exec.Command(gpgPath, "--batch", "--show-keys", "--with-colons")
-	fingerprintCmd.Stdin = strings.NewReader(string(key))
-	fingerprintOutput, err := fingerprintCmd.Output()
+	fingerprintOutput, _, err := runUpdateCommand(ctx, "update_gpg_fingerprint", gpgPath, []string{"--batch", "--show-keys", "--with-colons"}, strings.NewReader(string(key)))
 	if err != nil {
 		return fmt.Errorf("inspect embedded release key: %w", err)
 	}
@@ -342,9 +359,7 @@ func verifyReleaseChecksums(checksums, signature []byte) error {
 	}
 	defer os.RemoveAll(tmpDir)
 	keyPath := filepath.Join(tmpDir, "release-key.gpg")
-	dearmor := exec.Command(gpgPath, "--batch", "--dearmor", "--output", keyPath)
-	dearmor.Stdin = strings.NewReader(string(key))
-	if output, err := dearmor.CombinedOutput(); err != nil {
+	if _, output, err := runUpdateCommand(ctx, "update_gpg_dearmor", gpgPath, []string{"--batch", "--dearmor", "--output", keyPath}, strings.NewReader(string(key))); err != nil {
 		return fmt.Errorf("prepare embedded release key: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	checksumsPath := filepath.Join(tmpDir, "checksums.txt")
@@ -355,14 +370,13 @@ func verifyReleaseChecksums(checksums, signature []byte) error {
 	if err := os.WriteFile(signaturePath, signature, 0o600); err != nil {
 		return err
 	}
-	verify := exec.Command(gpgvPath, "--keyring", keyPath, signaturePath, checksumsPath)
-	if output, err := verify.CombinedOutput(); err != nil {
+	if _, output, err := runUpdateCommand(ctx, "update_gpg_verify", gpgvPath, []string{"--keyring", keyPath, signaturePath, checksumsPath}, nil); err != nil {
 		return fmt.Errorf("release checksum signature verification failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
 
-func runSelfUpdate(checkOnly, force bool) error {
+func runSelfUpdate(ctx context.Context, checkOnly, force bool) error {
 	// 1. Locate current running binary
 	execPath, err := os.Executable()
 	if err != nil {
@@ -374,7 +388,7 @@ func runSelfUpdate(checkOnly, force bool) error {
 	}
 
 	// 2. Package manager ownership check
-	if isManaged, pkgManager := detectPackageManager(evalPath); isManaged {
+	if isManaged, pkgManager := detectPackageManager(ctx, evalPath); isManaged {
 		switch pkgManager {
 		case "APT":
 			fmt.Println("lnta is managed by APT.")
@@ -469,7 +483,7 @@ func runSelfUpdate(checkOnly, force bool) error {
 	if err != nil {
 		return fmt.Errorf("download checksum signature: %w", err)
 	}
-	if err := verifyReleaseChecksums(checksumsBytes, signatureBytes); err != nil {
+	if err := verifyReleaseChecksums(ctx, checksumsBytes, signatureBytes); err != nil {
 		return err
 	}
 

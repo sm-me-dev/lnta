@@ -20,15 +20,15 @@ import (
 // (Ctrl-C / cancellation), preventing orphans from bwrap/ssh/mutate children.
 var childRegistry struct {
 	mu   sync.Mutex
-	pgid map[int]struct{}
+	pgid map[int]int // process PID -> process group ID
 }
 
 func init() {
-	childRegistry.pgid = make(map[int]struct{})
+	childRegistry.pgid = make(map[int]int)
 }
 
-// ConfigureProcessGroup puts cmd into its own process group and registers it
-// in the child registry so KillAllChildren can terminate it on shutdown.
+// ConfigureProcessGroup puts cmd into its own process group so lifecycle
+// helpers can terminate it on shutdown.
 // Must be called after exec.CommandContext and before Start.
 func ConfigureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -43,10 +43,6 @@ func ConfigureProcessGroup(cmd *exec.Cmd) {
 		return nil
 	}
 	cmd.WaitDelay = 2 * time.Second
-
-	childRegistry.mu.Lock()
-	defer childRegistry.mu.Unlock()
-	// Register after Start; placeholder here, updated by RegisterChild.
 }
 
 // RegisterChild adds a started process's PID to the registry so its group is
@@ -57,7 +53,18 @@ func RegisterChild(cmd *exec.Cmd) {
 	}
 	childRegistry.mu.Lock()
 	defer childRegistry.mu.Unlock()
-	childRegistry.pgid[cmd.Process.Pid] = struct{}{}
+	registerChildLocked(cmd)
+}
+
+func registerChildLocked(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		pgid = cmd.Process.Pid
+	}
+	childRegistry.pgid[cmd.Process.Pid] = pgid
 }
 
 // UnregisterChild removes a finished process's PID from the registry.
@@ -76,10 +83,13 @@ func UnregisterChild(cmd *exec.Cmd) {
 // command, prompt, environment value, or child output.
 func StartChild(role string, cmd *exec.Cmd) (time.Time, error) {
 	started := time.Now()
+	childRegistry.mu.Lock()
 	if err := cmd.Start(); err != nil {
+		childRegistry.mu.Unlock()
 		return started, err
 	}
-	RegisterChild(cmd)
+	registerChildLocked(cmd)
+	childRegistry.mu.Unlock()
 	audit.Log("process.start", "", processStartDetails(role, cmd.Process.Pid))
 	return started, nil
 }
@@ -88,6 +98,16 @@ func StartChild(role string, cmd *exec.Cmd) (time.Time, error) {
 // bounded lifecycle metadata. Output content and command details are omitted.
 func WaitChild(role string, cmd *exec.Cmd, started time.Time, ctx context.Context, stdout, stderr *CappedBuffer) error {
 	err := cmd.Wait()
+	// A successful parent exit does not imply its descendants exited. Reap any
+	// remaining members when this process owns a dedicated process group. An
+	// inherited group is owned and reaped by its registered leader.
+	pgid := 0
+	if cmd != nil && cmd.Process != nil {
+		pgid = registeredProcessGroup(cmd.Process.Pid)
+		if pgid > 0 && pgid == cmd.Process.Pid {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		}
+	}
 	UnregisterChild(cmd)
 	var stdoutBytes, stderrBytes int64
 	if stdout != nil {
@@ -96,26 +116,31 @@ func WaitChild(role string, cmd *exec.Cmd, started time.Time, ctx context.Contex
 	if stderr != nil {
 		stderrBytes = stderr.Total()
 	}
-	exitStatus := -1
-	if cmd.ProcessState != nil {
-		exitStatus = cmd.ProcessState.ExitCode()
-	}
-	audit.Log("process.complete", "", processCompletionDetails(role, processID(cmd), started, ctx, exitStatus, stdoutBytes, stderrBytes))
+	exitStatus := exitCodeOf(err)
+	audit.Log("process.complete", "", processCompletionDetailsWithGroup(role, processID(cmd), strconv.Itoa(pgid), started, ctx, exitStatus, stdoutBytes, stderrBytes))
 	return err
 }
 
 func processStartDetails(role string, pid int) map[string]string {
 	id := strconv.Itoa(pid)
-	return map[string]string{"role": role, "pid": id, "pgid": id}
+	pgid := pid
+	if actual, err := syscall.Getpgid(pid); err == nil {
+		pgid = actual
+	}
+	return map[string]string{"role": role, "pid": id, "pgid": strconv.Itoa(pgid)}
 }
 
 func processCompletionDetails(role, id string, started time.Time, ctx context.Context, exitStatus int, stdoutBytes, stderrBytes int64) map[string]string {
+	return processCompletionDetailsWithGroup(role, id, id, started, ctx, exitStatus, stdoutBytes, stderrBytes)
+}
+
+func processCompletionDetailsWithGroup(role, id, pgid string, started time.Time, ctx context.Context, exitStatus int, stdoutBytes, stderrBytes int64) map[string]string {
 	canceled := ctx != nil && ctx.Err() != nil
 	timedOut := ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
 	return map[string]string{
 		"role":         role,
 		"pid":          id,
-		"pgid":         id,
+		"pgid":         pgid,
 		"elapsed_ms":   strconv.FormatInt(time.Since(started).Milliseconds(), 10),
 		"exit_status":  strconv.Itoa(exitStatus),
 		"canceled":     strconv.FormatBool(canceled),
@@ -123,6 +148,12 @@ func processCompletionDetails(role, id string, started time.Time, ctx context.Co
 		"stdout_bytes": strconv.FormatInt(stdoutBytes, 10),
 		"stderr_bytes": strconv.FormatInt(stderrBytes, 10),
 	}
+}
+
+func registeredProcessGroup(pid int) int {
+	childRegistry.mu.Lock()
+	defer childRegistry.mu.Unlock()
+	return childRegistry.pgid[pid]
 }
 
 func processID(cmd *exec.Cmd) string {
@@ -137,7 +168,12 @@ func processID(cmd *exec.Cmd) string {
 func KillAllChildren() {
 	childRegistry.mu.Lock()
 	defer childRegistry.mu.Unlock()
-	for pgid := range childRegistry.pgid {
+	seen := make(map[int]struct{}, len(childRegistry.pgid))
+	for _, pgid := range childRegistry.pgid {
+		if _, ok := seen[pgid]; ok {
+			continue
+		}
+		seen[pgid] = struct{}{}
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	}
 }

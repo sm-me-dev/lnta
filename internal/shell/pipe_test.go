@@ -1,124 +1,89 @@
 package shell
 
 import (
-	"bytes"
+	"errors"
+	"io"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-func TestReadPipeContext_UnderLimit(t *testing.T) {
-	input := "short input"
-	r := strings.NewReader(input)
-	got, truncated, err := ReadPipeContext(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+type chunkReader struct {
+	data []byte
+	step int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
 	}
-	if truncated {
-		t.Errorf("expected not truncated, got truncated")
+	n := min(len(p), min(len(r.data), r.step))
+	copy(p, r.data[:n])
+	r.data = r.data[n:]
+	return n, nil
+}
+
+type failingReader struct{ sent bool }
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.sent {
+		return 0, errors.New("read failed")
 	}
-	if got != input {
-		t.Errorf("expected %q, got %q", input, got)
+	r.sent = true
+	return copy(p, "partial"), nil
+}
+
+func TestReadPipeContextBoundaries(t *testing.T) {
+	for _, size := range []int{0, maxPipeContext - 1, maxPipeContext, maxPipeContext + 1} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			input := strings.Repeat("x", size)
+			got, truncated, err := ReadPipeContext(strings.NewReader(input))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if size <= maxPipeContext {
+				if truncated || got != input {
+					t.Fatalf("size %d changed: truncated=%v len=%d", size, truncated, len(got))
+				}
+			} else if !truncated || !strings.Contains(got, "stdin truncated: middle omitted") {
+				t.Fatalf("size %d not marked truncated: %v", size, truncated)
+			}
+		})
 	}
 }
 
-func TestReadPipeContext_AtLimit(t *testing.T) {
-	input := strings.Repeat("x", 64*1024) // exactly 64KB
-	r := strings.NewReader(input)
-	got, truncated, err := ReadPipeContext(r)
+func TestReadPipeContextKeepsTrueHeadAndTailIncrementally(t *testing.T) {
+	input := "<BEGIN>" + strings.Repeat("H", headPreserve) + strings.Repeat("M", 160*1024) + "<MIDDLE>" + strings.Repeat("T", 80*1024) + "<ACTUAL-END>"
+	got, truncated, err := ReadPipeContext(&chunkReader{data: []byte(input), step: 137})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if truncated {
-		t.Errorf("expected not truncated at exactly 64KB, got truncated")
-	}
-	if got != input {
-		t.Errorf("expected exact 64KB input unchanged")
-	}
-}
-
-func TestReadPipeContext_OverLimit(t *testing.T) {
-	input := strings.Repeat("a", 100*1024) // 100KB > 64KB
-	r := strings.NewReader(input)
-	got, truncated, err := ReadPipeContext(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
 	if !truncated {
-		t.Errorf("expected truncated for input > 64KB")
+		t.Fatal("expected truncation")
 	}
-	// Should be head(16KB) + marker + tail(48KB) = 64KB + marker
-	expectedLen := 16*1024 + len("\n...[truncated]...\n") + 48*1024
-	if len(got) != expectedLen {
-		t.Errorf("expected length %d (64KB + marker), got %d", expectedLen, len(got))
+	if !strings.HasPrefix(got, input[:headPreserve]) {
+		t.Fatal("first 16 KiB were not preserved")
 	}
-	// Verify head preserved
-	head := input[:16*1024]
-	if !strings.HasPrefix(got, head) {
-		t.Errorf("head (first 16KB) not preserved")
+	if !strings.HasSuffix(got, input[len(input)-tailPreserve:]) {
+		t.Fatal("true final 48 KiB were not preserved")
 	}
-	// Verify tail preserved
-	tail := input[len(input)-48*1024:]
-	if !strings.HasSuffix(got, tail) {
-		t.Errorf("tail (last 48KB) not preserved")
+	if strings.Contains(got, "<MIDDLE>") {
+		t.Fatal("middle marker unexpectedly survived truncation")
 	}
-	// Verify marker present
-	if !strings.Contains(got, "...[truncated]...") {
-		t.Errorf("truncation marker not found")
+	if !strings.Contains(got, "<BEGIN>") || !strings.Contains(got, "<ACTUAL-END>") {
+		t.Fatal("distinct beginning/end markers missing")
+	}
+	if len(got) != headPreserve+tailPreserve+len("\n...[stdin truncated: middle omitted]...\n") {
+		t.Fatalf("unexpected rendered length %d", len(got))
 	}
 }
 
-func TestReadPipeContext_Empty(t *testing.T) {
-	r := strings.NewReader("")
-	got, truncated, err := ReadPipeContext(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if truncated {
-		t.Errorf("expected not truncated for empty input")
-	}
-	if got != "" {
-		t.Errorf("expected empty string, got %q", got)
-	}
-}
-
-func TestReadPipeContext_Boundary(t *testing.T) {
-	// 64KB + 1 byte should trigger truncation
-	input := strings.Repeat("x", 64*1024+1)
-	r := strings.NewReader(input)
-	got, truncated, err := ReadPipeContext(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !truncated {
-		t.Errorf("expected truncated for 64KB+1 bytes")
-	}
-	// Should contain marker
-	if !strings.Contains(got, "...[truncated]...") {
-		t.Errorf("truncation marker not found at boundary")
+func TestReadPipeContextPropagatesReaderError(t *testing.T) {
+	if _, _, err := ReadPipeContext(&failingReader{}); err == nil || err.Error() != "read failed" {
+		t.Fatalf("expected reader error, got %v", err)
 	}
 }
 
 func TestIsStdinPipe(t *testing.T) {
-	// We can't easily test this without mocking os.Stdin,
-	// but we can verify the function exists and compiles.
-	// In practice, this is tested via integration tests.
 	_ = IsStdinPipe
-}
-
-func TestReadPipeContext_LargeInputNoPanic(t *testing.T) {
-	// 1MB input - should not panic, just truncate
-	input := strings.Repeat("large ", 200*1024)
-	r := strings.NewReader(input)
-	got, truncated, err := ReadPipeContext(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !truncated {
-		t.Errorf("expected truncated for 1MB input")
-	}
-	// Verify length is bounded
-	if len(got) > 64*1024+100 {
-		t.Errorf("output should be bounded to ~64KB + marker, got %d", len(got))
-	}
-	_ = bytes.NewBufferString(got) // ensure it's valid string
 }

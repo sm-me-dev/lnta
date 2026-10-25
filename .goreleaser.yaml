@@ -5,6 +5,7 @@ project_name: lnta
 version: 2
 before:
   hooks:
+    - sh scripts/deb/validate-inputs.sh
     - go mod tidy
     - go generate ./...
 builds:
@@ -42,11 +43,6 @@ nfpms:
       postinstall: scripts/deb/postinstall.sh
       preremove: scripts/deb/preremove.sh
       postremove: scripts/deb/postremove.sh
-    contents:
-      - src: scripts/apparmor-profile
-        dst: /etc/apparmor.d/bwrap
-        type: config
-        packager: deb
   - id: rpm
     package_name: lnta
     file_name_template: "{{ .PackageName }}-{{ .Version }}-1.{{ .Arch }}"

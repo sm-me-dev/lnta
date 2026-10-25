@@ -1061,6 +1061,14 @@ func runSSHDirect(ctx context.Context, user, host, port, cmd string) error {
 // streaming stdin to the remote command's stdin (binary-safe, no heredoc).
 // Validates the target to prevent option injection (C3) through manifest data.
 func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin io.Reader) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
 	if !sshUserRE.MatchString(user) || !sshHostRE.MatchString(host) || strings.HasPrefix(host, "-") {
 		return fmt.Errorf("invalid ssh target %s@%s:%s", user, host, port)
 	}
@@ -1098,8 +1106,10 @@ func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin 
 	)
 	sshCmd.Stdin = stdin
 	ConfigureProcessGroup(sshCmd)
-	out := NewCappedBuffer(16*1024, 8<<20, nil)
-	errOut := NewCappedBuffer(16*1024, 8<<20, nil)
+	_, cancel := context.WithCancel(ctx)
+	defer cancel()
+	out := NewCappedBuffer(16*1024, 8<<20, cancel)
+	errOut := NewCappedBuffer(16*1024, 8<<20, cancel)
 	sshCmd.Stdout = out
 	sshCmd.Stderr = errOut
 	sshCmd.WaitDelay = 5 * time.Second
@@ -1108,7 +1118,11 @@ func runSSHDirectStdin(ctx context.Context, user, host, port, cmd string, stdin 
 	if err != nil {
 		return err
 	}
-	return WaitChild("ssh_rollback", sshCmd, started, ctx, out, errOut)
+	err = WaitChild("ssh_rollback", sshCmd, started, ctx, out, errOut)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 // remoteManifest represents the undo log for remote files.

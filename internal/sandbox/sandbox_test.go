@@ -385,7 +385,11 @@ func TestLandlockRequiresCompleteNetworkConfinementABI(t *testing.T) {
 }
 
 func TestLandlockFallbackDoesNotExposeHostProcfs(t *testing.T) {
-	cfg := buildLandlockConfig("/tmp", "/tmp", "/tmp/lnta-private", "true", nil)
+	cwd := t.TempDir()
+	cfg, err := buildLandlockConfig(cwd, t.TempDir(), t.TempDir(), "true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, dir := range cfg.RODirs {
 		if dir == "/proc" {
 			t.Fatal("Landlock fallback exposes host procfs")
