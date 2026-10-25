@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -511,13 +512,20 @@ func main() {
 			if !jsonOutput && exitErr.Err != nil {
 				fmt.Fprintln(os.Stderr, exitErr.Err)
 			}
-			os.Exit(exitErr.Code)
-		}
-		if !jsonOutput {
+		} else if !jsonOutput {
 			fmt.Fprintln(os.Stderr, err)
 		}
-		os.Exit(agent.ExitCodeGeneralError)
+		os.Exit(exitCodeForError(err))
 	}
+}
+
+// exitCodeForError maps a command error to the process exit status.
+func exitCodeForError(err error) int {
+	var exitErr *agent.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.Code
+	}
+	return agent.ExitCodeGeneralError
 }
 
 var rootCmd = &cobra.Command{
@@ -992,59 +1000,131 @@ func runPromptArgs(prompt string) error {
 	return nil
 }
 
+// doctorClass states how a doctor check affects the process exit status.
+type doctorClass int
+
+const (
+	// doctorRequired failures make `lnta doctor` exit nonzero.
+	doctorRequired doctorClass = iota
+	// doctorOptional failures are reported as WARN and never change the exit status.
+	doctorOptional
+	// doctorInformational results are reported as INFO and never change the exit status.
+	doctorInformational
+)
+
+// doctorCheck is one diagnostic. sandbox marks the check whose failure maps to
+// the documented sandbox/environment exit code.
+type doctorCheck struct {
+	name    string
+	class   doctorClass
+	sandbox bool
+	fn      func() error
+}
+
+// doctorResult is the single record of a check outcome. The per-check output,
+// the summary line, and the exit error are all derived from a []doctorResult.
+type doctorResult struct {
+	check doctorCheck
+	err   error
+}
+
+func doctorChecks() []doctorCheck {
+	return []doctorCheck{
+		{name: "LLM Configuration", class: doctorRequired, fn: checkLLMConfig},
+		{name: "LLM Connectivity", class: doctorRequired, fn: checkLLMConnectivity},
+		{name: "Kernel Sandbox", class: doctorRequired, sandbox: true, fn: checkKernelSandbox},
+		{name: "Validator Binaries", class: doctorRequired, fn: checkValidators},
+		{name: "Recommended Validators", class: doctorOptional, fn: checkRecommendedValidators},
+	}
+}
+
 func runDoctor(cmd *cobra.Command) error {
 	if doctorFix {
 		fmt.Println(generateAppArmorProfile())
 		return nil
 	}
+	return runDoctorChecks(os.Stdout, doctorChecks(), doctorVerbose)
+}
 
-	fmt.Println(titleStyle.Render("## LNTA Doctor"))
-	fmt.Println()
+// runDoctorChecks runs checks in order, prints their status to w, and returns
+// an error carrying every required failure (nil when all required checks
+// pass). verbose only affects presentation, never the returned error.
+func runDoctorChecks(w io.Writer, checks []doctorCheck, verbose bool) error {
+	_, _ = fmt.Fprintln(w, titleStyle.Render("## LNTA Doctor"))
+	_, _ = fmt.Fprintln(w)
 
-	checks := []struct {
-		name string
-		fn   func() error
-	}{
-		{"LLM Configuration", checkLLMConfig},
-		{"LLM Connectivity", checkLLMConnectivity},
-		{"Kernel Sandbox", checkKernelSandbox},
-		{"Validator Binaries", checkValidators},
-	}
-
-	allPassed := true
-	sandboxErr := error(nil)
+	results := make([]doctorResult, 0, len(checks))
 	for _, c := range checks {
-		fmt.Printf("  %s %s... ", labelStyle.Render("▶"), c.name)
+		_, _ = fmt.Fprintf(w, "  %s %s... ", labelStyle.Render("▶"), c.name)
 		err := c.fn()
-		if err != nil {
-			fmt.Println(mutedStyle.Render("FAIL"))
-			if doctorVerbose {
-				fmt.Printf("    %s\n", mutedStyle.Render(err.Error()))
-			}
-			allPassed = false
-			if c.name == "Kernel Sandbox" {
-				sandboxErr = err
-			}
-		} else {
-			fmt.Println(labelStyle.Render("OK"))
+		results = append(results, doctorResult{check: c, err: err})
+		if err == nil {
+			_, _ = fmt.Fprintln(w, labelStyle.Render("OK"))
+			continue
+		}
+		_, _ = fmt.Fprintln(w, mutedStyle.Render(doctorStatusLabel(c.class)))
+		if verbose {
+			_, _ = fmt.Fprintf(w, "    %s\n", mutedStyle.Render(err.Error()))
 		}
 	}
 
-	fmt.Println()
-	if allPassed {
-		fmt.Println(labelStyle.Render("All checks passed"))
-	} else {
-		fmt.Println(mutedStyle.Render("Some checks failed — run with --verbose for details"))
-	}
-
-	return doctorSandboxExitError(sandboxErr)
+	summary, exitErr := summarizeDoctor(results, verbose)
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, summary)
+	return exitErr
 }
 
-func doctorSandboxExitError(sandboxErr error) error {
-	if sandboxErr == nil {
-		return nil
+func doctorStatusLabel(class doctorClass) string {
+	switch class {
+	case doctorOptional:
+		return "WARN"
+	case doctorInformational:
+		return "INFO"
+	default:
+		return "FAIL"
 	}
-	return fmt.Errorf("required confined sandbox capability unavailable: %w", sandboxErr)
+}
+
+// summarizeDoctor derives the user-facing summary and the exit error from the
+// recorded results. It is the only place that decides pass/fail.
+func summarizeDoctor(results []doctorResult, verbose bool) (string, error) {
+	var requiredErrs []error
+	sandboxFailed := false
+	notices := 0
+	for _, r := range results {
+		if r.err == nil {
+			continue
+		}
+		if r.check.class != doctorRequired {
+			notices++
+			continue
+		}
+		if r.check.sandbox {
+			sandboxFailed = true
+			requiredErrs = append(requiredErrs, fmt.Errorf("%s: required confined sandbox capability unavailable: %w", r.check.name, r.err))
+			continue
+		}
+		requiredErrs = append(requiredErrs, fmt.Errorf("%s: %w", r.check.name, r.err))
+	}
+
+	if len(requiredErrs) == 0 {
+		if notices == 0 {
+			return labelStyle.Render("All checks passed"), nil
+		}
+		return labelStyle.Render("All required checks passed") +
+			mutedStyle.Render(fmt.Sprintf(" (%d optional check(s) reported warnings)", notices)), nil
+	}
+
+	hint := ""
+	if !verbose {
+		hint = " — run with --verbose for details"
+	}
+	summary := mutedStyle.Render(fmt.Sprintf("%d required check(s) failed%s", len(requiredErrs), hint))
+	code := agent.ExitCodeGeneralError
+	if sandboxFailed {
+		code = agent.ExitCodeSandboxError
+	}
+	return summary, agent.NewExitError(code, errors.Join(requiredErrs...))
 }
 
 func checkLLMConfig() error {
@@ -1269,32 +1349,37 @@ func checkValidators() error {
 		"systemd-analyze",
 		"ss",
 	}
+	var missing []string
+	for _, v := range required {
+		if _, err := exec.LookPath(v); err != nil {
+			missing = append(missing, v)
+		} else if doctorVerbose {
+			fmt.Printf("    %s: found\n", v)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required validators: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// checkRecommendedValidators reports missing optional tooling. It is classified
+// doctorOptional, so a failure here never changes the exit status.
+func checkRecommendedValidators() error {
 	recommended := []string{
 		"ufw",
 		"shellcheck",
 	}
-	var missingRequired []string
-	var missingRecommended []string
-
-	for _, v := range required {
-		if _, err := exec.LookPath(v); err != nil {
-			missingRequired = append(missingRequired, v)
-		} else if doctorVerbose {
-			fmt.Printf("    %s: found\n", v)
-		}
-	}
+	var missing []string
 	for _, v := range recommended {
 		if _, err := exec.LookPath(v); err != nil {
-			missingRecommended = append(missingRecommended, v)
+			missing = append(missing, v)
 		} else if doctorVerbose {
 			fmt.Printf("    %s: found\n", v)
 		}
 	}
-	if len(missingRequired) > 0 {
-		return fmt.Errorf("missing required validators: %s", strings.Join(missingRequired, ", "))
-	}
-	if len(missingRecommended) > 0 && doctorVerbose {
-		fmt.Printf("    recommended validators not found: %s\n", strings.Join(missingRecommended, ", "))
+	if len(missing) > 0 {
+		return fmt.Errorf("recommended validators not found: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }

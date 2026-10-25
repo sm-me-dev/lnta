@@ -327,9 +327,12 @@ lnta doctor
   ▶ LLM Connectivity... OK
   ▶ Kernel Sandbox... OK
   ▶ Validator Binaries... OK
+  ▶ Recommended Validators... OK
 
 All checks passed
 ```
+
+Exit status: `0` when every required check passes; `4` when the Kernel Sandbox check fails; `1` when any other required check fails (LLM Configuration, LLM Connectivity, or Validator Binaries). Recommended Validators (`ufw`, `shellcheck`) is optional: a missing tool prints `WARN` and does not change the exit status. Every failed required check is listed on stderr, with or without `--verbose`.
 
 ### Ubuntu AppArmor Note
 LNTA does not ship or install a custom AppArmor profile. On systems that use Ubuntu's Bubblewrap user namespace policy, inspect the distribution-owned policy and kernel audit messages:

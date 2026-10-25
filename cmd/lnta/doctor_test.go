@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sm-me-dev/lnta/internal/agent"
 	"github.com/sm-me-dev/lnta/internal/sandbox"
 )
 
@@ -81,13 +83,196 @@ func TestSelectSandboxBackend(t *testing.T) {
 	}
 }
 
-func TestDoctorExitStatusTracksRequiredSandboxCapability(t *testing.T) {
-	if err := doctorSandboxExitError(nil); err != nil {
-		t.Fatalf("operational supported backend should allow doctor success: %v", err)
+func TestDoctorChecksClassification(t *testing.T) {
+	want := map[string]struct {
+		class   doctorClass
+		sandbox bool
+	}{
+		"LLM Configuration":      {doctorRequired, false},
+		"LLM Connectivity":       {doctorRequired, false},
+		"Kernel Sandbox":         {doctorRequired, true},
+		"Validator Binaries":     {doctorRequired, false},
+		"Recommended Validators": {doctorOptional, false},
 	}
-	want := errors.New("no supported sandbox backend")
-	if err := doctorSandboxExitError(want); !errors.Is(err, want) {
-		t.Fatalf("unavailable sandbox did not produce doctor failure: %v", err)
+	got := doctorChecks()
+	if len(got) != len(want) {
+		t.Fatalf("doctorChecks() returned %d checks, want %d", len(got), len(want))
+	}
+	for _, c := range got {
+		w, ok := want[c.name]
+		if !ok {
+			t.Fatalf("unclassified doctor check %q", c.name)
+		}
+		if c.class != w.class || c.sandbox != w.sandbox {
+			t.Errorf("check %q: class=%v sandbox=%v, want class=%v sandbox=%v", c.name, c.class, c.sandbox, w.class, w.sandbox)
+		}
+		if c.fn == nil {
+			t.Errorf("check %q has no implementation", c.name)
+		}
+	}
+}
+
+func fakeDoctorChecks(config, connectivity, sandboxErr, validators, recommended error) []doctorCheck {
+	fn := func(err error) func() error { return func() error { return err } }
+	return []doctorCheck{
+		{name: "LLM Configuration", class: doctorRequired, fn: fn(config)},
+		{name: "LLM Connectivity", class: doctorRequired, fn: fn(connectivity)},
+		{name: "Kernel Sandbox", class: doctorRequired, sandbox: true, fn: fn(sandboxErr)},
+		{name: "Validator Binaries", class: doctorRequired, fn: fn(validators)},
+		{name: "Recommended Validators", class: doctorOptional, fn: fn(recommended)},
+	}
+}
+
+func TestRunDoctorChecksExitSemantics(t *testing.T) {
+	errConfig := errors.New("LNTA_API_KEY not set")
+	errConn := errors.New("connect to https://llm.invalid: dial failed")
+	errSandbox := errors.New("neither supported confined backend is operational")
+	errValidators := errors.New("missing required validators: ss")
+	errRecommended := errors.New("recommended validators not found: ufw")
+
+	tests := []struct {
+		name        string
+		checks      []doctorCheck
+		wantCode    int
+		wantInErr   []string
+		notInErr    []string
+		wantOutput  []string
+		notInOutput []string
+	}{
+		{
+			name:        "all required pass",
+			checks:      fakeDoctorChecks(nil, nil, nil, nil, nil),
+			wantCode:    agent.ExitCodeSuccess,
+			wantOutput:  []string{"All checks passed"},
+			notInOutput: []string{"FAIL", "WARN"},
+		},
+		{
+			name:       "sandbox failure",
+			checks:     fakeDoctorChecks(nil, nil, errSandbox, nil, nil),
+			wantCode:   agent.ExitCodeSandboxError,
+			wantInErr:  []string{"Kernel Sandbox", errSandbox.Error(), "required confined sandbox capability unavailable"},
+			wantOutput: []string{"FAIL", "1 required check(s) failed"},
+		},
+		{
+			name:       "LLM configuration failure",
+			checks:     fakeDoctorChecks(errConfig, nil, nil, nil, nil),
+			wantCode:   agent.ExitCodeGeneralError,
+			wantInErr:  []string{"LLM Configuration", errConfig.Error()},
+			notInErr:   []string{"Kernel Sandbox"},
+			wantOutput: []string{"FAIL"},
+		},
+		{
+			name:      "required connectivity failure",
+			checks:    fakeDoctorChecks(nil, errConn, nil, nil, nil),
+			wantCode:  agent.ExitCodeGeneralError,
+			wantInErr: []string{"LLM Connectivity", errConn.Error()},
+		},
+		{
+			name:      "missing required validator binaries",
+			checks:    fakeDoctorChecks(nil, nil, nil, errValidators, nil),
+			wantCode:  agent.ExitCodeGeneralError,
+			wantInErr: []string{"Validator Binaries", errValidators.Error()},
+		},
+		{
+			name:        "optional failure only",
+			checks:      fakeDoctorChecks(nil, nil, nil, nil, errRecommended),
+			wantCode:    agent.ExitCodeSuccess,
+			wantOutput:  []string{"WARN", "All required checks passed", "1 optional check(s)"},
+			notInOutput: []string{"FAIL", "required check(s) failed"},
+		},
+		{
+			name:       "multiple required failures keep every diagnostic",
+			checks:     fakeDoctorChecks(errConfig, errConn, nil, errValidators, nil),
+			wantCode:   agent.ExitCodeGeneralError,
+			wantInErr:  []string{errConfig.Error(), errConn.Error(), errValidators.Error()},
+			wantOutput: []string{"3 required check(s) failed"},
+		},
+		{
+			name:      "sandbox plus another required failure reports sandbox code",
+			checks:    fakeDoctorChecks(errConfig, nil, errSandbox, nil, nil),
+			wantCode:  agent.ExitCodeSandboxError,
+			wantInErr: []string{errConfig.Error(), errSandbox.Error()},
+		},
+		{
+			name:       "mixed required and optional failures",
+			checks:     fakeDoctorChecks(errConfig, nil, nil, nil, errRecommended),
+			wantCode:   agent.ExitCodeGeneralError,
+			wantInErr:  []string{errConfig.Error()},
+			notInErr:   []string{errRecommended.Error()},
+			wantOutput: []string{"FAIL", "WARN", "1 required check(s) failed"},
+		},
+		{
+			name: "informational failure never affects exit status",
+			checks: []doctorCheck{
+				{name: "Required OK", class: doctorRequired, fn: func() error { return nil }},
+				{name: "Info Only", class: doctorInformational, fn: func() error { return errors.New("fyi") }},
+			},
+			wantCode:    agent.ExitCodeSuccess,
+			wantOutput:  []string{"INFO", "All required checks passed"},
+			notInOutput: []string{"FAIL"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var terse, verbose bytes.Buffer
+			terseErr := runDoctorChecks(&terse, tc.checks, false)
+			verboseErr := runDoctorChecks(&verbose, tc.checks, true)
+
+			code := 0
+			if terseErr != nil {
+				code = exitCodeForError(terseErr)
+			}
+			if code != tc.wantCode {
+				t.Fatalf("exit code = %d, want %d (err=%v)", code, tc.wantCode, terseErr)
+			}
+			if (terseErr == nil) != (verboseErr == nil) {
+				t.Fatalf("verbose and non-verbose disagree: terse=%v verbose=%v", terseErr, verboseErr)
+			}
+			if terseErr != nil {
+				if exitCodeForError(verboseErr) != code || terseErr.Error() != verboseErr.Error() {
+					t.Fatalf("verbose changed failure semantics: %v vs %v", terseErr, verboseErr)
+				}
+				for _, want := range tc.wantInErr {
+					if !strings.Contains(terseErr.Error(), want) {
+						t.Errorf("error %q does not contain %q", terseErr, want)
+					}
+				}
+				for _, bad := range tc.notInErr {
+					if strings.Contains(terseErr.Error(), bad) {
+						t.Errorf("error %q unexpectedly contains %q", terseErr, bad)
+					}
+				}
+			}
+			for _, want := range tc.wantOutput {
+				if !strings.Contains(terse.String(), want) {
+					t.Errorf("output missing %q:\n%s", want, terse.String())
+				}
+			}
+			for _, bad := range tc.notInOutput {
+				if strings.Contains(terse.String(), bad) {
+					t.Errorf("output unexpectedly contains %q:\n%s", bad, terse.String())
+				}
+			}
+			// The summary must agree with the exit status.
+			if code == 0 && strings.Contains(terse.String(), "required check(s) failed") {
+				t.Errorf("summary reports failure but exit status is success:\n%s", terse.String())
+			}
+			if code != 0 && strings.Contains(terse.String(), "All checks passed") {
+				t.Errorf("summary reports success but exit status is %d:\n%s", code, terse.String())
+			}
+		})
+	}
+}
+
+func TestDoctorFailureErrorsKeepCauses(t *testing.T) {
+	cause := errors.New("underlying cause")
+	err := runDoctorChecks(&bytes.Buffer{}, fakeDoctorChecks(nil, nil, cause, nil, nil), false)
+	if !errors.Is(err, cause) {
+		t.Fatalf("doctor error does not wrap the check's cause: %v", err)
+	}
+	if got := exitCodeForError(errors.New("plain error")); got != agent.ExitCodeGeneralError {
+		t.Fatalf("plain errors must exit %d, got %d", agent.ExitCodeGeneralError, got)
 	}
 }
 

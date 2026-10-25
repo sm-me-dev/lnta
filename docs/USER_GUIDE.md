@@ -54,7 +54,7 @@
 | `lnta --local "<prompt>"` | Force 100% offline execution via local Ollama models | Approved only |
 | `lnta setup` | 20-second interactive onboarding wizard (Ollama / Cloud providers) | **Zero** |
 | `lnta gc [--keep-last N]` | Garbage collect old run snapshots and rotate audit logs | **Zero** |
-| `lnta doctor` | Diagnose API connectivity, kernel sandboxing, and validators | **Zero** |
+| `lnta doctor` | Diagnose API connectivity, kernel sandboxing, and validators (exit `0` all required checks pass, `4` sandbox unavailable, `1` other required failure) | **Zero** |
 
 ---
 

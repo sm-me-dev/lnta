@@ -189,9 +189,13 @@ jobs:
           status=$?
           set -e
           printf '%s\n' "$output"
-          if [ "$status" -ne 0 ]; then
-            echo "restricted runner could not establish any supported sandbox backend" >&2
-            exit "$status"
+          # doctor now exits nonzero for any failed required check (including LLM
+          # checks, which cannot pass with an empty HOME). This step asserts the
+          # sandbox result specifically: exit 4 is the sandbox failure code and
+          # the Kernel Sandbox line must report OK.
+          if [ "$status" -eq 4 ] || ! printf '%s\n' "$output" | grep -q 'Kernel Sandbox\.\.\. OK'; then
+            echo "restricted runner could not establish any supported sandbox backend (doctor exit status $status)" >&2
+            exit 1
           fi
           if printf '%s\n' "$output" | grep -q 'Bubblewrap unavailable; Landlock fallback operational'; then
             echo "Restricted Bubblewrap fallback was exercised successfully." >> "$GITHUB_STEP_SUMMARY"
