@@ -4,7 +4,7 @@
 
 set -eu
 
-VERSION="${1:-0.1.2}"
+VERSION="${1:-0.1.3}"
 OUTPUT_DIR="${2:-.}"
 TARGET_FILE="${OUTPUT_DIR}/index.html"
 
