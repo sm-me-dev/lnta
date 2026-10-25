@@ -156,7 +156,15 @@ jobs:
           packages=(dist/*.deb)
           test "${#packages[@]}" -gt 0
           for package in "${packages[@]}"; do scripts/deb/verify-package.sh "$package"; done
-      - name: Verify missing package inputs fail visibly
+      - name: Install GoReleaser CLI for input regression check
+        # goreleaser-action runs GoReleaser for its own step; install the same
+        # pinned CLI separately because this regression script invokes it later.
+        run: |
+          mkdir -p "$RUNNER_TEMP/goreleaser-bin"
+          GOBIN="$RUNNER_TEMP/goreleaser-bin" go install github.com/goreleaser/goreleaser/v2@v2.11.2
+          echo "$RUNNER_TEMP/goreleaser-bin" >> "$GITHUB_PATH"
+
+      - name: Test missing package inputs fail visibly
         run: sh scripts/deb/test-missing-input.sh
 
   security-bwrap-integration:
