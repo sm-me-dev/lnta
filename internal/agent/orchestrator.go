@@ -74,6 +74,7 @@ type Orchestrator struct {
 
 	// Run summary collection for time-machine TUI.
 	runCollector *audit.RunSummaryCollector
+	commandOnly  bool
 }
 
 // Option configures an Orchestrator.
@@ -205,6 +206,7 @@ func New(client LLMClient, router *packs.Router, opts ...Option) *Orchestrator {
 // cancelled (SIGINT / Ctrl+C), it returns immediately with a cancellation
 // error.
 func (o *Orchestrator) Run(ctx context.Context, prompt string, pipeContext string, commandOnly bool) (string, error) {
+	o.commandOnly = commandOnly
 	// Step 1: Collect SystemContext (<5ms).
 	start := time.Now()
 	sysCtx, err := fingerprint.Fingerprint()
@@ -410,6 +412,21 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				argsJSON = json.RawMessage(p.args)
 			} else {
 				argsJSON = json.RawMessage("{}")
+			}
+
+			if !o.commandOnly {
+				desc := p.name
+				switch p.name {
+				case "inspect_system":
+					desc = "Inspecting system"
+				case "write_scoped_file":
+					desc = "Writing scoped file"
+				case "mutate_system":
+					desc = "Mutating system"
+				case "complete_task":
+					desc = "Verifying task"
+				}
+				fmt.Printf("  ▶ %s...\n", desc)
 			}
 
 			result, err := tool.Func(ctx, argsJSON, deps)

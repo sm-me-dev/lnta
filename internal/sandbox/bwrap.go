@@ -341,6 +341,7 @@ func runBwrapEnv(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 
 	// Best-effort audit log of the sandboxed execution.
 	audit.Log("sandbox.run", "", map[string]string{
+		"cmd":      cmdStr,
 		"cwd":      absCwd,
 		"backend":  "bwrap",
 		"exit":     fmt.Sprintf("%d", res.ExitCode),

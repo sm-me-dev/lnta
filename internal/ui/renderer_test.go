@@ -35,3 +35,32 @@ func TestEnforceColorProfileTermDumb(t *testing.T) {
 	// Reset profile
 	ResetColorProfile()
 }
+
+func TestStatusLineInFlightDoesNotShowBlocked(t *testing.T) {
+	// Planning phase must not show [Blocked ✗]
+	outPlanning := StatusLine("general-diagnostics", "Planning", "", false)
+	if strings.Contains(outPlanning, "Blocked") {
+		t.Errorf("expected StatusLine during Planning not to contain 'Blocked', got %q", outPlanning)
+	}
+	if !strings.Contains(outPlanning, "Planning") {
+		t.Errorf("expected StatusLine during Planning to contain 'Planning', got %q", outPlanning)
+	}
+
+	// Running phase must not show [Blocked ✗]
+	outRunning := StatusLine("linux-desktop-entries", "Running", "", false)
+	if strings.Contains(outRunning, "Blocked") {
+		t.Errorf("expected StatusLine during Running not to contain 'Blocked', got %q", outRunning)
+	}
+
+	// Verified must show [Verified ✓]
+	outVerified := StatusLine("linux-desktop-entries", "Writing", "~/.local/share/app.desktop", true)
+	if !strings.Contains(outVerified, "Verified") {
+		t.Errorf("expected verified StatusLine to contain 'Verified', got %q", outVerified)
+	}
+
+	// Terminal failure / blocked must show [Blocked ✗]
+	outBlocked := StatusLine("linux-desktop-entries", "Blocked", "", false)
+	if !strings.Contains(outBlocked, "Blocked") {
+		t.Errorf("expected blocked StatusLine to contain 'Blocked', got %q", outBlocked)
+	}
+}

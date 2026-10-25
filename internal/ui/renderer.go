@@ -113,9 +113,9 @@ func statusPill(verified bool) string {
 //
 //	[Pack: linux-desktop-entries] • [Inspecting...] • [Writing ~/.local/share/applications/app.desktop] • [Verified ✓]
 //
-// Any segment may be empty; empty segments are omitted. A trailing newline is
-// NOT added so callers can overwrite the line in place (e.g. carriage-return
-// progress updates).
+// Any segment may be empty; empty segments are omitted. If verified is false and
+// phase is an active in-flight phase (e.g. "Planning", "Running"), the terminal
+// [Blocked ✗] status is omitted so in-flight execution is not misrepresented.
 func StatusLine(pack, phase, path string, verified bool) string {
 	var parts []string
 	if pack != "" {
@@ -127,7 +127,11 @@ func StatusLine(pack, phase, path string, verified bool) string {
 	if path != "" {
 		parts = append(parts, pathPill(path))
 	}
-	parts = append(parts, statusPill(verified))
+	if verified {
+		parts = append(parts, statusPill(true))
+	} else if phase == "" || phase == "Failed" || phase == "Blocked" {
+		parts = append(parts, statusPill(false))
+	}
 	return strings.Join(parts, bullet)
 }
 

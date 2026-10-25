@@ -158,6 +158,7 @@ func toolByName(tools []Tool) map[string]Tool {
 
 type inspectInput struct {
 	Command string `json:"command"`
+	Cmd     string `json:"cmd"` // common alias produced by some LLMs
 	CWD     string `json:"cwd"`
 	Reason  string `json:"reason"`
 }
@@ -166,6 +167,9 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 	var in inspectInput
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", fmt.Errorf("inspect_system: invalid args: %w", err)
+	}
+	if in.Command == "" && in.Cmd != "" {
+		in.Command = in.Cmd
 	}
 	if in.CWD == "" {
 		in.CWD = deps.CWD
@@ -301,6 +305,7 @@ func writeScopedFile(ctx context.Context, args json.RawMessage, deps ToolDeps) (
 
 type mutateInput struct {
 	Command       string `json:"command"`
+	Cmd           string `json:"cmd"` // common alias produced by some LLMs
 	CWD           string `json:"cwd"`
 	RiskLevel     string `json:"risk_level"`      // Deprecated: kept for backwards compatibility
 	Reason        string `json:"reason"`
@@ -311,6 +316,9 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	var in mutateInput
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", fmt.Errorf("mutate_system: invalid args: %w", err)
+	}
+	if in.Command == "" && in.Cmd != "" {
+		in.Command = in.Cmd
 	}
 	if in.CWD == "" {
 		in.CWD = deps.CWD
@@ -433,6 +441,8 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 type completeInput struct {
 	Summary           string `json:"summary"`
 	TargetArtifacts   string `json:"target_artifacts"`
+	Targets           string `json:"targets"`           // alias
+	Artifact          string `json:"artifact"`          // alias
 	VerificationNotes string `json:"verification_notes"`
 }
 
@@ -440,6 +450,13 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	var in completeInput
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", fmt.Errorf("complete_task: invalid args: %w", err)
+	}
+	if in.TargetArtifacts == "" {
+		if in.Targets != "" {
+			in.TargetArtifacts = in.Targets
+		} else if in.Artifact != "" {
+			in.TargetArtifacts = in.Artifact
+		}
 	}
 
 	// --- Verification Gate ---
