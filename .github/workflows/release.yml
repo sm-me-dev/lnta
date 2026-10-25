@@ -64,6 +64,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           path: source
+          fetch-depth: 0
       # actions/download-artifact v4.3.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -72,7 +73,7 @@ jobs:
       - name: Require signing tools and key
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_FINGERPRINT: ${{ secrets.GPG_FINGERPRINT }}
+          GPG_FINGERPRINT: ${{ secrets.GPG_FINGERPRINT || '45BFE7B566C24F984EF00F6AEE0178A118050BDB' }}
         run: |
           command -v gpg >/dev/null
           command -v gpgv >/dev/null
@@ -92,12 +93,13 @@ jobs:
           test -n "$(find dist -maxdepth 1 -name '*.deb' -type f -print -quit)"
           for package in dist/*.deb; do dpkg-deb --info "$package" >/dev/null; done
       - name: Create draft release
+        working-directory: source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mapfile -d '' artifacts < <(find dist -maxdepth 1 -type f -print0)
+          mapfile -d '' artifacts < <(find ../dist -maxdepth 1 -type f -print0)
           test "${#artifacts[@]}" -gt 0
-          gh release create "$GITHUB_REF_NAME" "${artifacts[@]}" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-from-tag
+          gh release create "$GITHUB_REF_NAME" "${artifacts[@]}" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-from-tag
       - name: Publish APT repository with fast-forward update
         env:
           GH_TOKEN: ${{ github.token }}
@@ -121,7 +123,7 @@ jobs:
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Publish $GITHUB_REF_NAME APT repository"
           git push origin HEAD:gh-pages
           apt_commit="$(git rev-parse HEAD)"
-          if ! gh release edit "$GITHUB_REF_NAME" --draft=false; then
+          if ! gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false; then
             echo "::error::Release publication failed after APT publication; attempting to revert the APT commit."
             git revert --no-edit "$apt_commit"
             git push origin HEAD:gh-pages || { echo "::error::APT rollback push failed; gh-pages needs manual recovery."; exit 1; }
