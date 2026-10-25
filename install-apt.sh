@@ -11,6 +11,7 @@ SOURCES_DIR="/etc/apt/sources.list.d"
 SOURCES_FILE="${SOURCES_DIR}/lnta.list"
 REPO_URL="https://sm-me-dev.github.io/lnta"
 KEY_URL="${REPO_URL}/lnta-archive-keyring.asc"
+EXPECTED_KEY_FINGERPRINT="45BFE7B566C24F984EF00F6AEE0178A118050BDB"
 
 # Colors for terminal output
 RED='\033[0;31m'
@@ -78,10 +79,27 @@ install -m 0755 -d "${KEYRING_DIR}"
 # 7. Download and dearmor repository signing key
 info "Fetching official LNTA repository signing key..."
 TMP_KEY="$(mktemp "${KEYRING_DIR}/lnta.gpg.tmp.XXXXXX")"
-trap 'rm -f "${TMP_KEY}"' EXIT
+TMP_ASC="$(mktemp "${KEYRING_DIR}/lnta.asc.tmp.XXXXXX")"
+trap 'rm -f "${TMP_KEY}" "${TMP_ASC}"' EXIT
 
-if ! ${FETCH} "${KEY_URL}" | gpg --dearmor -o "${TMP_KEY}"; then
-  error "Failed to fetch or dearmor repository key from ${KEY_URL}."
+if command -v curl >/dev/null 2>&1; then
+  KEY_FETCH_STATUS=0
+  curl -fsSL "${KEY_URL}" -o "${TMP_ASC}" || KEY_FETCH_STATUS=$?
+else
+  KEY_FETCH_STATUS=0
+  wget -q "${KEY_URL}" -O "${TMP_ASC}" || KEY_FETCH_STATUS=$?
+fi
+if [ "${KEY_FETCH_STATUS}" -ne 0 ]; then
+  error "Failed to fetch repository key from ${KEY_URL}."
+  exit 1
+fi
+ACTUAL_KEY_FINGERPRINT="$(gpg --batch --show-keys --with-colons "${TMP_ASC}" | awk -F: '$1 == "fpr" { print $10; exit }')"
+if [ "${ACTUAL_KEY_FINGERPRINT}" != "${EXPECTED_KEY_FINGERPRINT}" ]; then
+  error "Downloaded repository key does not match the pinned LNTA signing key."
+  exit 1
+fi
+if ! gpg --batch --dearmor --output "${TMP_KEY}" "${TMP_ASC}"; then
+  error "Failed to dearmor repository key."
   exit 1
 fi
 

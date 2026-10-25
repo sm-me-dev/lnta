@@ -1,28 +1,28 @@
 Origin: sm-me-dev
 Label: LNTA Official APT Repository
 Codename: stable
-Date: Sat, 24 Oct 2026 18:15:43 UTC
+Date: Sun, 25 Oct 2026 07:10:49 UTC
 Architectures: amd64 arm64
 Components: main
 Description: Fast, kernel-sandboxed Linux natural-language terminal assistant
 MD5Sum:
- 469380c7f153e1d07927ddf1e74f3423 477 main/binary-amd64/Packages
- 1cf288a68a722819fe1cc1446a33f39f 367 main/binary-amd64/Packages.gz
+ 7381ed283a07b7cf46eda1009378cd5a 490 main/binary-amd64/Packages
+ 81c1b4da61e822652b9519152c4ce396 377 main/binary-amd64/Packages.gz
  69e90a4b243811cd43aa64b3284c6b4d 168 main/binary-amd64/Release
- 46101fff3cdbeeb774cbc2c61488e1d7 477 main/binary-arm64/Packages
- 68991aad4bdb68d1d56ed9937c434897 366 main/binary-arm64/Packages.gz
+ b47abbe7233e4490b44f2498cde9f621 490 main/binary-arm64/Packages
+ ae1f9b1c8ae1b9f8e665337b6a26ecfb 377 main/binary-arm64/Packages.gz
  f5b1c9bc270e9fc1eecb3dac4c605171 168 main/binary-arm64/Release
 SHA1:
- d66aa78bc40dcf65e2b8e6d815b05a42b9e72357 477 main/binary-amd64/Packages
- 498ee94528673c0c906dd3c5ae47ac6518103d62 367 main/binary-amd64/Packages.gz
+ dfe9e20185e268cb652a885f36fa84f79a177d1d 490 main/binary-amd64/Packages
+ a05fd57ca1e07ceb010e8c1ce431a5cb2d1a207b 377 main/binary-amd64/Packages.gz
  33d455b454ba11e9a1d2184b2cb5033bb7e8b650 168 main/binary-amd64/Release
- 6da18e23349773d3fa41fa7234c748019b44a9a9 477 main/binary-arm64/Packages
- 6d7db52c2b4688c8be153c0fbb5b24d6c1faba3a 366 main/binary-arm64/Packages.gz
+ 1c414edaa4104a0a1d21a3cf4c6a90639ae0627c 490 main/binary-arm64/Packages
+ d4db705ddbbdf21fd56ae25c8ebc3cc7b79c0899 377 main/binary-arm64/Packages.gz
  24b27d4764188dd1ba765c685633244c2ab0ee0a 168 main/binary-arm64/Release
 SHA256:
- 3d00eb6d3f6e60cebd302d4ddf4970b4836a2bb6f7bc879cc676af49a27b5dcb 477 main/binary-amd64/Packages
- 904cfc58417e33350cd6fd1b49359cfa14362abc52fffc9073b06c36beea6bff 367 main/binary-amd64/Packages.gz
+ 5c5998feb8c68a520c267b1fa354f482724dd5e21a83977519ca8e4840b35619 490 main/binary-amd64/Packages
+ 4b9580af996076299a194502be1aeb784461233d1fce0ac055c7f5422fa6fec4 377 main/binary-amd64/Packages.gz
  537121e202850547501376288cd719d72b27bef2dd5261aa53e2a5960b374e88 168 main/binary-amd64/Release
- 969ee6bd36bbce64845e233c29c77beb0544884d2255cbd429e1623cf42d7b93 477 main/binary-arm64/Packages
- bd203ec59178b5b2cfcf4e4c358dd31753756f03662ec6816d510aa49b3cf25a 366 main/binary-arm64/Packages.gz
+ 6444ef0a8838f80c7cb3ecb803d354393d1571293b3f06d3b245ce2e37a03dd2 490 main/binary-arm64/Packages
+ 759b5b6ebc6b54323dd378ef065866bc914fc67f7b53b604c677ca58b8ae15bb 377 main/binary-arm64/Packages.gz
  45067859409edb1fa633b7078f6d331e785e0db6e71ac329317ef664d6c43b5f 168 main/binary-arm64/Release

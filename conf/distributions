@@ -4,4 +4,4 @@ Codename: stable
 Architectures: amd64 arm64
 Components: main
 Description: Fast, kernel-sandboxed Linux natural-language terminal assistant
-SignWith: yes
+SignWith: 45BFE7B566C24F984EF00F6AEE0178A118050BDB
