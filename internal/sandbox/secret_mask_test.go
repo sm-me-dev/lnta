@@ -1,10 +1,15 @@
 package sandbox
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestProjectSecretScanCoversIgnoredDirectoriesAndBothBackends(t *testing.T) {
@@ -14,6 +19,8 @@ func TestProjectSecretScanCoversIgnoredDirectoriesAndBothBackends(t *testing.T) 
 		filepath.Join(project, "vendor", ".env.production"),
 		filepath.Join(project, "node_modules", "pkg", ".npmrc"),
 		filepath.Join(project, ".git", "credentials.json"),
+		filepath.Join(project, ".hidden", "generated", "service-account.json"),
+		filepath.Join(project, "generated", "artifacts", "terraform.tfvars"),
 	}
 	for _, p := range secrets {
 		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
@@ -163,6 +170,24 @@ func TestProjectSecretScanFailsAtDepthAndEntryLimits(t *testing.T) {
 			t.Fatalf("incomplete depth scan accepted: %v", err)
 		}
 	})
+	t.Run("maximum child depth", func(t *testing.T) {
+		root, nested := t.TempDir(), ""
+		for range maxProjectScanDepth {
+			nested = filepath.Join(nested, "a")
+		}
+		deep := filepath.Join(root, nested)
+		if err := os.MkdirAll(deep, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		secret := filepath.Join(deep, ".env")
+		if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := maskProjectSecrets(root)
+		if err != nil || len(got) != 1 || got[0] != secret {
+			t.Fatalf("maximum configured depth failed: paths=%v err=%v", got, err)
+		}
+	})
 	t.Run("credential directory", func(t *testing.T) {
 		root := t.TempDir()
 		if err := os.MkdirAll(filepath.Join(root, ".env", "nested"), 0o700); err != nil {
@@ -172,15 +197,121 @@ func TestProjectSecretScanFailsAtDepthAndEntryLimits(t *testing.T) {
 			t.Fatalf("credential-named directory was not rejected: %v", err)
 		}
 	})
-	t.Run("entries", func(t *testing.T) {
+	t.Run("more than five thousand entries", func(t *testing.T) {
 		root := t.TempDir()
-		for i := 0; i <= 5000; i++ {
-			if err := os.WriteFile(filepath.Join(root, filepath.Base(strings.Repeat("x", 1))+string(rune(0x1000+i))), nil, 0o600); err != nil {
+		for i := 0; i < 5_001; i++ {
+			if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("entry-%05d", i)), nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if _, err := maskProjectSecrets(root); err == nil || !strings.Contains(err.Error(), "entry limit") {
-			t.Fatalf("incomplete entry scan accepted: %v", err)
+		secret := filepath.Join(root, ".env")
+		if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := maskProjectSecrets(root)
+		if err != nil || len(got) != 1 || got[0] != secret {
+			t.Fatalf("large project scan failed or missed credentials: paths=%v err=%v", got, err)
+		}
+		partial, err := scanProjectSecrets(root, maxProjectScanDepth, 5_000, maxProjectSecretPaths, maxProjectSecretPathBytes)
+		if err == nil || !strings.Contains(err.Error(), "entry limit") || partial != nil {
+			t.Fatalf("budget-plus-one scan returned partial credentials: paths=%v err=%v", partial, err)
+		}
+	})
+}
+
+func TestProjectSecretScanRejectsSecretBudgetsWithoutPartialResults(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		maxSecrets   int
+		maxPathBytes int
+		want         string
+	}{
+		{name: "path count", maxSecrets: 0, maxPathBytes: maxProjectSecretPathBytes, want: "secret path limit"},
+		{name: "path bytes", maxSecrets: maxProjectSecretPaths, maxPathBytes: 1, want: "secret path byte limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := scanProjectSecrets(root, maxProjectScanDepth, maxProjectScanEntries, tc.maxSecrets, tc.maxPathBytes)
+			if err == nil || !strings.Contains(err.Error(), tc.want) || got != nil {
+				t.Fatalf("budget exhaustion returned partial results: paths=%v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestProjectSecretScanEntryBudgetRefusesConfiguredBudgetPlusOne(t *testing.T) {
+	budget := projectSecretScanBudget{entries: maxProjectScanEntries - 1, maxEntries: maxProjectScanEntries}
+	if err := budget.addEntry(); err != nil {
+		t.Fatalf("last configured entry was rejected: %v", err)
+	}
+	if err := budget.addEntry(); err == nil || !strings.Contains(err.Error(), "entry limit") {
+		t.Fatalf("configured entry budget-plus-one was accepted: %v", err)
+	}
+}
+
+func TestProjectSecretScanStopsAtConfiguredSecretPathLimit(t *testing.T) {
+	root := t.TempDir()
+	for index := 0; index <= maxProjectSecretPaths; index++ {
+		dir := filepath.Join(root, fmt.Sprintf("secret-%04d", index))
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".env"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := maskProjectSecrets(root)
+	if err == nil || !strings.Contains(err.Error(), "secret path limit") || got != nil {
+		t.Fatalf("secret path budget-plus-one was accepted: paths=%v err=%v", got, err)
+	}
+}
+
+func TestProjectSecretScanStopsAtConfiguredPathByteLimit(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, strings.Repeat("p", 220))
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < maxProjectSecretPaths; index++ {
+		dir := filepath.Join(parent, fmt.Sprintf("d%04d", index))
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".env"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := maskProjectSecrets(root)
+	if err == nil || !strings.Contains(err.Error(), "secret path byte limit") || got != nil {
+		t.Fatalf("secret path byte budget was accepted: paths=%v err=%v", got, err)
+	}
+}
+
+func TestProjectSecretScanRejectsUnknownAndUnreadableEntries(t *testing.T) {
+	t.Run("unknown special file", func(t *testing.T) {
+		root := t.TempDir()
+		if err := syscall.Mkfifo(filepath.Join(root, "pipe"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := maskProjectSecrets(root); err == nil || !strings.Contains(err.Error(), "unsupported project entry type") || got != nil {
+			t.Fatalf("special entry was accepted: paths=%v err=%v", got, err)
+		}
+	})
+	t.Run("unreadable directory", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root can bypass directory read permissions")
+		}
+		root := t.TempDir()
+		blocked := filepath.Join(root, "blocked")
+		if err := os.Mkdir(blocked, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+		if got, err := maskProjectSecrets(root); err == nil || got != nil {
+			t.Fatalf("unreadable tree was accepted: paths=%v err=%v", got, err)
 		}
 	})
 }
@@ -275,6 +406,46 @@ func TestLandlockAllowlistScanHonorsResourceBounds(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "incomplete") {
 		t.Fatalf("bounded scan failure was not explicit: %v", err)
+	}
+}
+
+func TestLandlockConfigurationBudgetsRejectBeforeAddingRules(t *testing.T) {
+	pathScan := &landlockTreeScan{pathBytes: maxLandlockPathBytes - 1}
+	var paths []string
+	if err := pathScan.addRule(&paths, "/tmp"); err == nil || len(paths) != 0 {
+		t.Fatalf("path budget accepted an over-budget rule: paths=%v err=%v", paths, err)
+	}
+	ruleScan := &landlockTreeScan{rules: maxLandlockRules}
+	if err := ruleScan.addRule(&paths, "/tmp"); err == nil || len(paths) != 0 {
+		t.Fatalf("rule budget accepted an over-budget rule: paths=%v err=%v", paths, err)
+	}
+	entryScan := &landlockTreeScan{}
+	parent := unix.Stat_t{Dev: 1, Ino: 2}
+	if err := entryScan.addEntry(parent, "entry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := entryScan.addEntry(parent, "entry"); err != nil || entryScan.entries != 1 {
+		t.Fatalf("same directory entry was counted more than once: entries=%d err=%v", entryScan.entries, err)
+	}
+}
+
+func TestLandlockConfigurationRejectsOversizedSerializedJSON(t *testing.T) {
+	encodedConfig := landlockConfig{
+		RODirs: []string{"/tmp/<λ>"},
+		Cwd:    "/tmp/\xff",
+		Cmd:    "printf '\u2028'",
+		Env:    []string{"KEY=value&more"},
+	}
+	raw, err := json.Marshal(encodedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := estimateLandlockJSONBytes(encodedConfig); got != len(raw) {
+		t.Fatalf("serialized size estimate=%d, actual=%d", got, len(raw))
+	}
+	cfg := landlockConfig{Cwd: "/", Cmd: strings.Repeat("<", maxLandlockConfigBytes/6+1)}
+	if err := validateLandlockConfigBudget(cfg); err == nil || !strings.Contains(err.Error(), "serialized JSON limit") {
+		t.Fatalf("oversized Landlock configuration was accepted: %v", err)
 	}
 }
 

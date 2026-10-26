@@ -106,14 +106,21 @@ bwrap \
 
 ### Tier 2: Linux Landlock LSM Fallback
 
-When `bwrap` is missing or blocked by kernel policies (e.g. hardened containers or restricted user namespaces), LNTA attempts the **Linux Landlock** backend. It requires ABI 10 and an additional seccomp network filter; older or restricted kernels are refused rather than run without isolation:
+When `bwrap` is missing or blocked by kernel policies (e.g. hardened containers or restricted user namespaces), LNTA attempts the **Linux Landlock** backend. It requires Landlock ABI 8 or newer and seccomp filter support; older or restricted kernels are refused rather than run without isolation:
 
 1. **Self-Re-execution**: LNTA re-executes itself via a hidden internal command: `lnta __sandbox_exec`.
 2. **Landlock Ruleset Creation**: Restricts filesystem access rights to read-only (`LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_READ_DIR`).
 3. **No-New-Privs**: Invokes `prctl(PR_SET_NO_NEW_PRIVS, 1)` before applying the ruleset.
-4. **Network Socket Restrictions**: Landlock network rules are combined with seccomp that rejects creation of IPv4, IPv6, and MPTCP sockets. This does not revoke already-open descriptors; LNTA starts children without inherited application descriptors.
-5. **Host Process Protection**: Because Landlock has no PID namespace, the fallback does not grant `/proc` and blocks process signaling, inspection, and session/process-group detachment syscalls. Host process inspection is unavailable in this backend.
-6. **Fail-Closed Guarantee**: If Landlock or the required seccomp filters are unavailable, execution fails rather than falling back to uncontained shell execution.
+4. **Network and Socket Restrictions**: ABI 8 Landlock TCP and scoped restrictions are combined with an architecture-aware seccomp filter. It denies `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept`, `accept4`, `sendto`, `sendmsg`, `sendmmsg`, `recvfrom`, `recvmsg`, `recvmmsg`, `shutdown`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, and all three `io_uring` setup/enter/register syscalls. It denies every address family, including pathname UNIX sockets and UDP, without inspecting userspace pointers. Linux x86-64 and AArch64 are supported; x32, compat (including `socketcall`), and unknown syscall architectures are killed or rejected.
+5. **Descriptor Sanitization**: The launcher accepts configuration only over its input pipe, verifies that stdout and stderr are capture pipes, replaces command stdin with `/dev/null`, then uses `close_range(CLOSE_RANGE_UNSHARE)` to close every other descriptor. Failure to verify or close descriptors refuses execution.
+6. **Host Process Protection**: Because Landlock has no PID namespace, the fallback does not grant `/proc` and blocks process signaling, inspection, and session/process-group detachment syscalls. Host process inspection is unavailable in this backend.
+7. **Fail-Closed Guarantee**: If Landlock or the required seccomp filters are unavailable, execution fails rather than falling back to uncontained shell execution. The minimum ABI is 8; kernels below it require ABI 8+ or an operational Bubblewrap backend. ABI 9 adds pathname UNIX-socket controls and ABI 10 adds UDP controls, while LNTA's seccomp policy disables socket syscalls on ABI 8 too. See the [Landlock ABI documentation](https://docs.kernel.org/userspace-api/landlock.html).
+
+### Project Scans and Descriptor Boundary
+
+Project files and model-selected commands are treated as untrusted. Credential scanning never consults ignore rules and does not skip hidden, generated, dependency, or Git directories. Each scan allows at most 500,000 directory entries, root depth 0 with child depth at most 32, 4,096 credential paths, and 1 MiB of absolute credential-path bytes. Descriptor-relative traversal rejects symlinks, special or unknown entries, unreadable directories, detected metadata changes, and any exhausted limit; it returns no partial result. Landlock configuration shares budgets of 500,000 traversed entries and submitted rules, 8 MiB of raw path bytes, and 64 MiB of serialized JSON.
+
+Bubblewrap receives the seccomp program through its dedicated `--seccomp` descriptor; the launch process passes only that extra descriptor and capture pipes. The Landlock launcher closes inherited descriptors before executing the command. Ordinary `read`, `write`, `sendfile`, and `splice` remain available, so descriptor closure is required in addition to seccomp. Socket syscall arguments are not dereferenced by the filter. Scans and allowlists are revalidated immediately before launch; host changes after that point are outside the guarantee.
 
 Approved `mutate_system` commands need host filesystem writes, so they do not use the read-only Landlock policy. They run in LNTA's managed process group with a hidden launcher that denies `setsid` and `setpgid` before executing the shell. This prevents those commands from deliberately detaching from that group; it does not provide filesystem isolation or a complete process-tree guarantee.
 
@@ -123,7 +130,7 @@ Approved `mutate_system` commands need host filesystem writes, so they do not us
 
 | Feature | Bubblewrap (`bwrap`) | Landlock LSM Fallback |
 |---|---|---|
-| **Kernel Requirements** | Linux user namespaces and required mounts | Landlock ABI 10 plus seccomp filter support |
+| **Kernel Requirements** | Linux user namespaces and required mounts | Landlock ABI 8+ plus seccomp filter support |
 | **Filesystem Isolation** | Mount namespace (`--ro-bind / /`) | Kernel LSM syscall-level filtering |
 | **Network Isolation** | Network namespace (`--unshare-net`) | Landlock network rules plus seccomp socket-family denial |
 | **Secret Masking** | Ephemeral `tmpfs` mounts over secret paths | Selective path access denial |

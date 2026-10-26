@@ -18,6 +18,8 @@ func TestMain(m *testing.M) {
 			os.Exit(RestrictedExecMain())
 		case landlockHiddenCmd:
 			os.Exit(LandlockExecMain())
+		case landlockDescriptorProbeCmd:
+			os.Exit(landlockDescriptorProbeMain())
 		}
 	}
 	os.Exit(m.Run())

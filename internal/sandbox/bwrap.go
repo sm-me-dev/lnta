@@ -8,13 +8,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/sm-me-dev/lnta/internal/audit"
 )
@@ -25,6 +27,13 @@ const defaultTimeout = 15 * time.Second
 // maxOutputBytes caps captured stdout/stderr so huge logs never blow up the
 // LLM context window. Output beyond this is replaced with a marker.
 const maxOutputBytes = 16 * 1024
+
+const (
+	maxProjectScanEntries     = 500_000
+	maxProjectScanDepth       = 32
+	maxProjectSecretPaths     = 4_096
+	maxProjectSecretPathBytes = 1 << 20
+)
 
 // ErrBwrapNotFound is returned when bwrap is not installed on the host.
 var ErrBwrapNotFound = errors.New("bwrap not found on host; cannot run sandboxed command")
@@ -200,69 +209,127 @@ func projectSecretFile(name string) bool {
 	return strings.HasPrefix(name, ".env")
 }
 
-// maskProjectSecrets walks cwd (bounded) and returns the credential files to
-// mask. Depth and entry count are capped so a huge tree cannot stall startup.
+// maskProjectSecrets walks cwd without following links and returns credential
+// files to mask. A scan that cannot prove completeness is rejected.
 var ErrSecretScanIncomplete = errors.New("project credential scan incomplete; sandbox refused")
 
 func maskProjectSecrets(cwd string) ([]string, error) {
-	const maxDepth, maxEntries = 32, 5000
+	return scanProjectSecrets(cwd, maxProjectScanDepth, maxProjectScanEntries, maxProjectSecretPaths, maxProjectSecretPathBytes)
+}
+
+func scanProjectSecrets(cwd string, maxDepth, maxEntries, maxSecrets, maxPathBytes int) ([]string, error) {
 	abs, err := filepath.Abs(cwd)
 	if err != nil {
-		return nil, fmt.Errorf("resolve project root: %w", err)
+		return nil, fmt.Errorf("%w: resolve project root: %v", ErrSecretScanIncomplete, err)
 	}
-	cwd, err = filepath.EvalSymlinks(abs)
+	fd, err := openAbsoluteDirNoFollow(abs)
 	if err != nil {
-		return nil, fmt.Errorf("resolve project root %q: %w", abs, err)
+		return nil, fmt.Errorf("%w: open project root %q without following links: %v", ErrSecretScanIncomplete, abs, err)
 	}
+	defer unix.Close(fd)
 	var out []string
-	seen := 0
-	err = scanProjectSecretDir(cwd, 0, maxDepth, maxEntries, &seen, &out)
+	budget := projectSecretScanBudget{maxDepth: maxDepth, maxEntries: maxEntries, maxSecrets: maxSecrets, maxPathBytes: maxPathBytes}
+	err = scanProjectSecretDir(fd, filepath.Clean(abs), 0, &budget, &out)
 	if err != nil {
 		return nil, err
 	}
+	sort.Strings(out)
 	return out, nil
 }
 
-func scanProjectSecretDir(dir string, depth, maxDepth, maxEntries int, seen *int, secrets *[]string) error {
-	file, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("walk %q: %w", dir, err)
+type projectSecretScanBudget struct {
+	entries      int
+	secrets      int
+	pathBytes    int
+	maxDepth     int
+	maxEntries   int
+	maxSecrets   int
+	maxPathBytes int
+}
+
+func (budget *projectSecretScanBudget) addEntry() error {
+	if budget.entries >= budget.maxEntries {
+		return fmt.Errorf("%w: entry limit %d exceeded", ErrSecretScanIncomplete, budget.maxEntries)
 	}
-	defer file.Close()
-	for {
-		entries, readErr := file.ReadDir(256)
-		for _, entry := range entries {
-			*seen++
-			if *seen > maxEntries {
-				return fmt.Errorf("%w: entry limit %d exceeded", ErrSecretScanIncomplete, maxEntries)
+	budget.entries++
+	return nil
+}
+
+func scanProjectSecretDir(dirFD int, dir string, depth int, budget *projectSecretScanBudget, secrets *[]string) error {
+	var before unix.Stat_t
+	if err := unix.Fstat(dirFD, &before); err != nil {
+		return fmt.Errorf("%w: inspect project directory %q: %v", ErrSecretScanIncomplete, dir, err)
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("%w: project path %q is not a directory", ErrSecretScanIncomplete, dir)
+	}
+	err := readDirAt(dirFD, func(entry os.DirEntry) error {
+		if err := budget.addEntry(); err != nil {
+			return err
+		}
+		name := entry.Name()
+		path := filepath.Join(dir, name)
+		stat, err := statAtNoFollow(dirFD, name)
+		if err != nil {
+			return fmt.Errorf("%w: inspect project entry %q: %v", ErrSecretScanIncomplete, path, err)
+		}
+		switch stat.Mode & unix.S_IFMT {
+		case unix.S_IFLNK:
+			return fmt.Errorf("%w: symlink in project tree at %q", ErrSecretScanIncomplete, path)
+		case unix.S_IFDIR:
+			if projectSecretFile(name) {
+				return fmt.Errorf("%w: credential-named directory at %q", ErrSecretScanIncomplete, path)
 			}
-			path := filepath.Join(dir, entry.Name())
-			if entry.Type()&os.ModeSymlink != 0 {
-				return fmt.Errorf("%w: symlink in project tree at %q", ErrSecretScanIncomplete, path)
+			if depth+1 > budget.maxDepth {
+				return fmt.Errorf("%w: depth limit %d exceeded at %q", ErrSecretScanIncomplete, budget.maxDepth, path)
 			}
-			if entry.IsDir() {
-				if projectSecretFile(entry.Name()) {
-					return fmt.Errorf("%w: credential-named directory at %q", ErrSecretScanIncomplete, path)
-				}
-				if depth+1 >= maxDepth {
-					return fmt.Errorf("%w: depth limit %d reached at %q", ErrSecretScanIncomplete, maxDepth, path)
-				}
-				if err := scanProjectSecretDir(path, depth+1, maxDepth, maxEntries, seen, secrets); err != nil {
-					return err
-				}
-				continue
+			childFD, _, err := openChildDirNoFollow(dirFD, name, &stat)
+			if err != nil {
+				return fmt.Errorf("%w: project directory changed at %q: %v", ErrSecretScanIncomplete, path, err)
 			}
-			if entry.Type().IsRegular() && projectSecretFile(entry.Name()) {
+			err = scanProjectSecretDir(childFD, path, depth+1, budget, secrets)
+			_ = unix.Close(childFD)
+			if err != nil {
+				return err
+			}
+			current, err := statAtNoFollow(dirFD, name)
+			if err != nil || !sameTreeStat(stat, current) {
+				return fmt.Errorf("%w: project directory changed during scan at %q", ErrSecretScanIncomplete, path)
+			}
+		case unix.S_IFREG:
+			fd, err := unix.Openat(dirFD, name, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+			if err != nil {
+				return fmt.Errorf("%w: open project file %q without following links: %v", ErrSecretScanIncomplete, path, err)
+			}
+			var opened unix.Stat_t
+			statErr := unix.Fstat(fd, &opened)
+			_ = unix.Close(fd)
+			if statErr != nil || !sameTreeStat(stat, opened) {
+				return fmt.Errorf("%w: project file changed during scan at %q", ErrSecretScanIncomplete, path)
+			}
+			if projectSecretFile(name) {
+				budget.secrets++
+				if budget.secrets > budget.maxSecrets {
+					return fmt.Errorf("%w: secret path limit %d exceeded", ErrSecretScanIncomplete, budget.maxSecrets)
+				}
+				budget.pathBytes += len(path)
+				if budget.pathBytes > budget.maxPathBytes {
+					return fmt.Errorf("%w: secret path byte limit %d exceeded", ErrSecretScanIncomplete, budget.maxPathBytes)
+				}
 				*secrets = append(*secrets, path)
 			}
+		default:
+			return fmt.Errorf("%w: unsupported project entry type at %q", ErrSecretScanIncomplete, path)
 		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				return nil
-			}
-			return fmt.Errorf("read project directory %q: %w", dir, readErr)
-		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w: read project directory %q: %v", ErrSecretScanIncomplete, dir, err)
 	}
+	if err := verifyDirUnchanged(dirFD, before); err != nil {
+		return fmt.Errorf("%w: project directory changed during scan at %q", ErrSecretScanIncomplete, dir)
+	}
+	return nil
 }
 
 // resolveCWD returns an absolute, existing directory for the sandbox cwd.
@@ -432,21 +499,37 @@ func runBwrapEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, ti
 	}
 	home := homeDir()
 
+	seccompFile, err := newNetworkSeccompFile()
+	if err != nil {
+		return res, fmt.Errorf("required network seccomp filter unavailable: %w", err)
+	}
+	defer seccompFile.Close()
 	baseArgs, err := bwrapArgs(home, absRoot, absCwd, extraEnv)
 	if err != nil {
 		return res, err
 	}
-	args := append(baseArgs, "sh", "-c", cmdStr)
+	args, err := bwrapCommandArgs(baseArgs, cmdStr)
+	if err != nil {
+		return res, err
+	}
 
 	cmd := exec.CommandContext(ctx, bwrap, args...)
 	cmd.Stdin = nil                                         // /dev/null
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"} // bwrap itself: nothing from the host
+	cmd.ExtraFiles = []*os.File{seccompFile}
 	ConfigureProcessGroup(cmd)
 
 	stdout := NewCappedBuffer(maxOutputBytes, hardOutputBytes, cancel)
 	stderr := NewCappedBuffer(maxOutputBytes, hardOutputBytes, cancel)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	validatedArgs, err := bwrapArgs(home, absRoot, absCwd, extraEnv)
+	if err != nil {
+		return res, err
+	}
+	if !equalStringSlices(baseArgs, validatedArgs) {
+		return res, fmt.Errorf("project or credential paths changed during pre-launch validation")
+	}
 
 	childStarted, startErr := StartChild("bwrap", cmd)
 	if startErr != nil {
@@ -478,6 +561,31 @@ func runBwrapEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, ti
 	return res, err
 }
 
+func bwrapCommandArgs(baseArgs []string, command string) ([]string, error) {
+	return bwrapCommandArgsWithSeccomp(baseArgs, command, 3)
+}
+
+func bwrapCommandArgsWithSeccomp(baseArgs []string, command string, seccompFD int) ([]string, error) {
+	if len(baseArgs) == 0 || baseArgs[len(baseArgs)-1] != "--" {
+		return nil, fmt.Errorf("bubblewrap arguments are missing the command delimiter")
+	}
+	args := append([]string(nil), baseArgs[:len(baseArgs)-1]...)
+	args = append(args, "--seccomp", fmt.Sprintf("%d", seccompFD), "--", "sh", "-c", command)
+	return args, nil
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 // RunReadOnly executes sh -c cmdStr inside a sandbox with the entire
 // root filesystem mounted read-only. See RunReadOnlyEnv.
 func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Duration) (CommandResult, error) {
@@ -492,7 +600,7 @@ func RunReadOnly(ctx context.Context, cmdStr string, cwd string, timeout time.Du
 //
 //  1. Tier 1 (bwrap): if bwrap can create its namespaces and required mounts.
 //  2. Tier 2 (Landlock): if bwrap is missing or blocked (AppArmor userns
-//     restriction), via self-re-exec; requires Landlock ABI >= 10 plus
+//     restriction), via self-re-exec; requires Landlock ABI >= 8 plus
 //     network-denying seccomp or it refuses to run (fail closed).
 //
 // The sandbox:
