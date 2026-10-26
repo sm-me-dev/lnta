@@ -4,35 +4,35 @@ Hash: SHA512
 Origin: sm-me-dev
 Label: LNTA Official APT Repository
 Codename: stable
-Date: Mon, 26 Oct 2026 09:15:29 UTC
+Date: Mon, 26 Oct 2026 10:42:41 UTC
 Architectures: amd64 arm64
 Components: main
 Description: Fast, kernel-sandboxed Linux natural-language terminal assistant
 MD5Sum:
- 6ab091ecb8030c7022395a5e443cc524 490 main/binary-amd64/Packages
- 95250523a0e6eaf876fa7d7e5eb1112e 375 main/binary-amd64/Packages.gz
+ adf84618b18d108e1b95dc9053cbe9f9 490 main/binary-amd64/Packages
+ a551258e03130bb66f2e332e3a2ccb7c 376 main/binary-amd64/Packages.gz
  69e90a4b243811cd43aa64b3284c6b4d 168 main/binary-amd64/Release
- 09db1d660b3eddf287b6495f8e754c9a 490 main/binary-arm64/Packages
- a2dc45333e7091215fc927f0a420c61d 378 main/binary-arm64/Packages.gz
+ c0c5f82704ca7eb5a6d42dfcf50ced5f 490 main/binary-arm64/Packages
+ a3d51597c188344d2ca3f708958ee14b 376 main/binary-arm64/Packages.gz
  f5b1c9bc270e9fc1eecb3dac4c605171 168 main/binary-arm64/Release
 SHA1:
- 8514d9f68788dab5290b156c1104e73a08e38723 490 main/binary-amd64/Packages
- 675c0996d0106b7349e98543ebf7a9168aabb0f7 375 main/binary-amd64/Packages.gz
+ 8543e26a4f6566b0e3ae29cc3eec5a2674be9e24 490 main/binary-amd64/Packages
+ 23689a4966189f7a46865e5f3a461ec1a4f585c4 376 main/binary-amd64/Packages.gz
  33d455b454ba11e9a1d2184b2cb5033bb7e8b650 168 main/binary-amd64/Release
- 302e63e10fd49c78cabe4e9beb2be7d5db2ccfd7 490 main/binary-arm64/Packages
- ac0f3af8a070e2d85da3e29f448c49e2c64de01c 378 main/binary-arm64/Packages.gz
+ 308508d873a22dca559f8bd14fd5782c83527524 490 main/binary-arm64/Packages
+ 12f6d6adb11d4bdc1610d75a4f0dd3d864cc00cf 376 main/binary-arm64/Packages.gz
  24b27d4764188dd1ba765c685633244c2ab0ee0a 168 main/binary-arm64/Release
 SHA256:
- 8730741548912dd7be74cf4a4b624069993fcded37feab20fb0359e734ed0d6a 490 main/binary-amd64/Packages
- 0dfdf9f0521707700ae0912580da4f81fbaa85b51d638b4f4489a7d504824ae1 375 main/binary-amd64/Packages.gz
+ ce258089402b285482669805fb11ad0bf2be8e6095edadb657342bb1f2805fc7 490 main/binary-amd64/Packages
+ 6c8a47ebcd203b1090329245a5a55533afc61455f56b7d3d0a20a0f46afd2893 376 main/binary-amd64/Packages.gz
  537121e202850547501376288cd719d72b27bef2dd5261aa53e2a5960b374e88 168 main/binary-amd64/Release
- fbe7a4952f283d83ef599c01f554f9103294a57a80e9a00be0e899df65b4d2bf 490 main/binary-arm64/Packages
- 1a423cd29c4beb4f8dbfbfdac10ef93aa1432cb7f73138a7329a3f93db496c98 378 main/binary-arm64/Packages.gz
+ e9d5dce325ae74dd511617445cb646594193c32476e82f58f7bb42eb3ba8156d 490 main/binary-arm64/Packages
+ e69579a78cd9b96a1df717d032bd877ec5abe398d7f7be20943d3c02802894e4 376 main/binary-arm64/Packages.gz
  45067859409edb1fa633b7078f6d331e785e0db6e71ac329317ef664d6c43b5f 168 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQRFv+e1ZsJPmE7wD2ruAXihGAUL2wUCat8aMQAKCRDuAXihGAUL
-2767AQC+BtXOcMviuDyOriO0lsLOFY2KPjMYdupMpQhKOsm0hAD+I/vyY9ICUrRm
-qhKxw5RnWWOPkNozU4MhCM1M0w7z1AU=
-=KH4r
+iHUEARYKAB0WIQRFv+e1ZsJPmE7wD2ruAXihGAUL2wUCat8uoQAKCRDuAXihGAUL
+27s9AQDorH1t0PBFCNrIBQZIcQqyBp5P30SfOUrEfdOJUaYLFAEAy9TSUzd/00td
+i6WCZcfFmt0yfCsU5lt44VO/mAyR4Ak=
+=7LVs
 -----END PGP SIGNATURE-----
