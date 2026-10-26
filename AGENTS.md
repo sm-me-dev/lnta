@@ -9,6 +9,14 @@
    - `complete_task`: Triggers the harness to execute the active Instruction Pack's `verify_script`. If `verify_script` fails, `complete_task` returns an error to the LLM with the validation output; the agent CANNOT exit with success until verification passes.
 3. **Zero Stubs**: Never write `// TODO` or mock implementations. Every phase must compile cleanly (`go build ./...`) and pass unit/integration tests (`go test -v ./...`).
 
+## Versioning and Releases
+
+- Use Semantic Versioning. Increment PATCH for compatible fixes, security hardening, and reliability work; MINOR for backward-compatible features; MAJOR for breaking behavior. Choose from the highest existing `vMAJOR.MINOR.PATCH` tag and do not reuse a tag.
+- Keep the fallback version in `version.go`, `Formula/lnta.rb`, the pinned download filenames in `README.md`, the default in `scripts/apt/generate-index.sh`, and the top `CHANGELOG.md` release entry aligned. GoReleaser stamps published binaries from the release tag.
+- Add dated user-facing release notes to `CHANGELOG.md`. The annotated tag message supplies GitHub release notes (`--notes-from-tag`), so keep its text aligned with the changelog entry.
+- Before tagging, run `go test ./...`, `go vet ./...`, `go build ./...`, the configured lint checks, and `goreleaser check` when GoReleaser is available.
+- Commit and push the release metadata, then create an annotated `vX.Y.Z` tag on that commit with notes matching the changelog entry. Run `goreleaser release --snapshot --clean --skip=sign,publish` locally after creating the tag; use a disposable distribution directory because `--clean` removes it. Push the tag only after the snapshot artifacts are verified and the release is ready: `.github/workflows/release.yml` builds and signs artifacts, publishes the GitHub release and APT repository, and updates `gh-pages`.
+
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.

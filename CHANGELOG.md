@@ -1,5 +1,20 @@
 # Release Notes
 
+## v0.1.4 — 2026-10-26
+
+### Security and sandboxing
+
+- Scan project trees without following symlinks; reject detected changes, unreadable entries, and scan-limit exhaustion before accepting a result.
+- Find and mask credentials across hidden, generated, dependency, and Git directories with bounded entry, depth, path-count, and byte limits.
+- Apply an architecture-aware seccomp policy to block socket and io_uring operations in Bubblewrap and Landlock execution.
+- Require Landlock ABI 8 or newer, enforce aggregate rule and configuration budgets, and close inherited descriptors before executing commands.
+- Document the sandbox limits and the pre-launch validation race boundary.
+
+### Validation
+
+- Add effective Bubblewrap and Landlock checks for credential denial, permitted reads, blocked writes and sockets, and inherited descriptor isolation.
+- Add large-project and adversarial fixture benchmarks for scanning time, memory, allocations, Landlock rules, and configuration size.
+
 ## v0.1.3 — 2026-10-25
 
 ### Security and reliability

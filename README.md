@@ -276,10 +276,10 @@ Direct asset downloads alone do not authenticate a release. Verify the detached 
 
 | Distribution | Architecture | Installation Command |
 |---|---|---|
-| **Ubuntu / Debian** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.3_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
-| **Fedora / RHEL / openSUSE** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.3-1.amd64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
-| **Arch Linux / Manjaro** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.3-1-amd64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
-| **Static Tarball (Any Linux)**| `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.3_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
+| **Ubuntu / Debian** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.4_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
+| **Fedora / RHEL / openSUSE** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.4-1.amd64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
+| **Arch Linux / Manjaro** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.4-1-amd64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
+| **Static Tarball (Any Linux)**| `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.4_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
 
 ---
 
