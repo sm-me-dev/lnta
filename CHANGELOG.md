@@ -1,5 +1,13 @@
 # Release Notes
 
+## v0.1.5 — 2026-10-26
+
+### Fixes
+
+- Correct the RPM download link on the APT repository landing page to use the published `amd64` filename.
+- Explain in `lnta doctor` that project credential masking scans the whole enclosing Git repository without following symlinks, and how to resolve a refused scan.
+- Ignore Python bytecode and drop a stale ignore entry for the tracked embedded packs file.
+
 ## v0.1.4 — 2026-10-26
 
 ### Security and sandboxing

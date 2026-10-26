@@ -5,7 +5,7 @@
 class Lnta < Formula
   desc "Fast, kernel-sandboxed Linux natural-language terminal assistant"
   homepage "https://github.com/sm-me-dev/lnta"
-  version "0.1.4"
+  version "0.1.5"
   license "MIT"
 
   on_linux do

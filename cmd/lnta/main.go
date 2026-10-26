@@ -1337,7 +1337,7 @@ func diagnoseBwrapProbe(probe sandbox.BwrapProbe, probeErr error, apparmorRestri
 	case errors.Is(probeErr, sandbox.ErrBwrapNotFound):
 		return fmt.Errorf("bwrap is missing from PATH; install the distribution's bubblewrap package: %w", probeErr)
 	case errors.Is(probeErr, sandbox.ErrSecretScanIncomplete):
-		return fmt.Errorf("project credential masking could not be established; sandbox execution is refused: %w", probeErr)
+		return fmt.Errorf("project credential masking could not be established; sandbox execution is refused. LNTA scans the whole Git repository that contains the current directory without following symlinks. Run lnta from a directory outside that repository, or remove or replace the symlinks and unreadable entries named below: %w", probeErr)
 	case probe.TimedOut:
 		return fmt.Errorf("bwrap probe timed out after %s; check system load and kernel logs: %w", probe.Duration.Round(time.Millisecond), probeErr)
 	case usernsErr == nil && strings.TrimSpace(usernsClone) == "0":

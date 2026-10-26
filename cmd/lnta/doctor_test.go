@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +31,7 @@ func TestDiagnoseBwrapProbeBranches(t *testing.T) {
 		mustNotHave  string
 	}{
 		{name: "missing", err: sandbox.ErrBwrapNotFound, want: "missing from PATH"},
+		{name: "project scan refused", err: fmt.Errorf("%w: symlink in project tree at %q", sandbox.ErrSecretScanIncomplete, "/p/link"), want: "outside that repository"},
 		{name: "user namespaces disabled", probe: sandbox.BwrapProbe{ExitStatus: 1, Stderr: "uid map denied"}, err: sandbox.ErrBwrapBlocked, userns: "0", want: "unprivileged user namespaces are disabled"},
 		{name: "user namespace limit disabled", probe: sandbox.BwrapProbe{ExitStatus: 1, Stderr: "uid map denied"}, err: sandbox.ErrBwrapBlocked, usernsErr: os.ErrNotExist, usernsMax: "0", want: "user.max_user_namespaces=0"},
 		{name: "timeout", probe: sandbox.BwrapProbe{TimedOut: true, Duration: 3 * time.Second}, err: sandbox.ErrBwrapBlocked, want: "timed out"},

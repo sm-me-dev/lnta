@@ -4,7 +4,7 @@
 
 set -eu
 
-VERSION="${1:-0.1.4}"
+VERSION="${1:-0.1.5}"
 OUTPUT_DIR="${2:-.}"
 TARGET_FILE="${OUTPUT_DIR}/index.html"
 
@@ -226,8 +226,8 @@ sudo chmod a+r /etc/apt/keyrings/lnta.gpg</code></div>
           lnta_@@VERSION@@_linux_arm64.deb
           <span>Debian / Ubuntu (ARM64)</span>
         </a>
-        <a class="dl-btn" href="https://github.com/sm-me-dev/lnta/releases/download/v@@VERSION@@/lnta-@@VERSION@@-1.x86_64.rpm">
-          lnta-@@VERSION@@-1.x86_64.rpm
+        <a class="dl-btn" href="https://github.com/sm-me-dev/lnta/releases/download/v@@VERSION@@/lnta-@@VERSION@@-1.amd64.rpm">
+          lnta-@@VERSION@@-1.amd64.rpm
           <span>Fedora / RHEL / openSUSE</span>
         </a>
         <a class="dl-btn" href="https://github.com/sm-me-dev/lnta/releases/download/v@@VERSION@@/lnta_@@VERSION@@_linux_amd64.tar.gz">

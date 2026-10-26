@@ -53,9 +53,11 @@ bin/
 specs/
 .opencode/
 
-# Embedded packs (if generated)
-embedded_packs.go
 graphify-out/
 specs/
 .superpowers/
 docs/superpowers/
+
+# Python bytecode
+__pycache__/
+*.pyc
