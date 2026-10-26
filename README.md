@@ -6,6 +6,7 @@
   <a href="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu"><img src="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu" alt="Ubuntu 24.04/26.04 AppArmor Ready"></a>
   <a href="https://img.shields.io/badge/Go-1.27.2+-00ADD8?logo=go&logoColor=white"><img src="https://img.shields.io/badge/Go-1.27.2+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
+  <a href="https://m8ven.ai/mcp/sm-me-dev-lnta-1kw54a?s=readme"><img src="https://m8ven.ai/badge/mcp/sm-me-dev-lnta-1kw54a?v=e8456d5b9e01ccdc9bb18d58ef09fd15" alt="M8ven Score"></a>
 </p>
 
 <p align="center">
@@ -59,7 +60,7 @@ eval "$(lnta init bash)"
 lnta init fish | source
 ```
 
-Set your preferred OpenAI-compatible API key or use [local Ollama](#local-offline-mode):
+Set your preferred OpenAI-compatible API key or use [local Ollama](docs/USER_GUIDE.md#8-local-offline-mode---local-with-ollama):
 
 ```bash
 export LNTA_API_KEY="sk-..."
@@ -198,7 +199,7 @@ An honest assessment of how LNTA compares to raw shell wrappers and heavyweight 
 
 Dive deeper into LNTA's architecture, security controls, and extensibility:
 
-- 📖 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)**: Detailed workflows for all 8 interaction modes, shell widgets, multi-turn chat, and full configuration templates for OpenRouter, Anthropic, OpenAI, Gemini, and Ollama.
+- 📖 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)**: Detailed workflows for all 9 interaction modes (including the MCP server), shell widgets, multi-turn chat, and full configuration templates for OpenRouter, Anthropic, OpenAI, Gemini, and Ollama.
 - 🔒 **[Security Model (`docs/SECURITY_MODEL.md`)](docs/SECURITY_MODEL.md)**: Deep dive into the 2-tier sandbox, Unix socket isolation, CVE-2026-25725 defenses, blast-radius heuristics, and AppArmor troubleshooting.
 - 📦 **[Pack Authoring Guide (`docs/PACK_AUTHORING.md`)](docs/PACK_AUTHORING.md)**: 5-minute tutorial on writing custom `.md` Instruction Packs, frontmatter reference, and static verification with `lnta packs validate`.
 - 📝 **[Release Notes (`CHANGELOG.md`)](CHANGELOG.md)**: Version history and the reliability, sandbox, and packaging changes in each release.
@@ -216,6 +217,7 @@ Dive deeper into LNTA's architecture, security controls, and extensibility:
 - **Dry-Run Preview (`--dry-run`)**: Generates unified color diffs and commands without touching the disk or executing mutations.
 - **Time Machine TUI (`lnta sessions`)**: Two-pane BubbleTea browser with fuzzy searching, run diff inspection, and single-keystroke rollbacks.
 - **100% Offline Ollama Execution (`--local`)**: Discovers local models at `127.0.0.1:11434` and runs zero-egress tasks without an API key.
+- **MCP Server (`lnta mcp`)**: Exposes sandboxed read-only inspection, pack runbooks, and `verify_cmd` verification over stdio to Claude Code, Cursor, OpenCode, and other MCP clients.
 
 ---
 
@@ -314,6 +316,33 @@ lnta self-update
 
 ---
 
+## Use LNTA from MCP Clients
+
+`lnta mcp` runs a Model Context Protocol server over stdio (JSON-RPC 2.0) so editors and coding agents can reuse LNTA's sandbox and verification gates:
+
+```bash
+# Claude Code
+claude mcp add lnta -- lnta mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "lnta": { "command": "lnta", "args": ["mcp"] }
+  }
+}
+```
+
+| MCP tool | Purpose |
+|---|---|
+| `lnta_inspect_sandboxed` | Run a read-only command inside the `bwrap` sandbox (read-only root, private `/tmp`, masked credential directories, stdin from `/dev/null`) |
+| `lnta_get_pack_runbook` | Fetch an Instruction Pack (frontmatter and body) by ID |
+| `lnta_verify_task` | Run a pack's `verify_cmd` against a target artifact |
+
+The MCP server has no mutation tool. See the [User Guide](docs/USER_GUIDE.md#9-mcp-server-mode-lnta-mcp) for details.
+
+---
+
 ## Diagnostics & Ubuntu AppArmor
 
 Verify your installation and kernel sandboxing capabilities with `lnta doctor`:
@@ -334,6 +363,9 @@ All checks passed
 ```
 
 Exit status: `0` when every required check passes; `4` when the Kernel Sandbox check fails; `1` when any other required check fails (LLM Configuration, LLM Connectivity, or Validator Binaries). Recommended Validators (`ufw`, `shellcheck`) is optional: a missing tool prints `WARN` and does not change the exit status. Every failed required check is listed on stderr, with or without `--verbose`.
+
+### Credential-Masking Refusals
+Before running a sandboxed command, LNTA scans the whole Git repository that contains the current directory (without following symlinks) so it can mask credential files. If the scan finds a symlink, an unreadable entry, a concurrent change, or exceeds its limits, sandbox execution is refused and `lnta doctor` names the offending path. Run `lnta` from a directory outside that repository, or remove or replace the listed entries. See [Project Scans and Descriptor Boundary](docs/SECURITY_MODEL.md#project-scans-and-descriptor-boundary).
 
 ### Ubuntu AppArmor Note
 LNTA does not ship or install a custom AppArmor profile. On systems that use Ubuntu's Bubblewrap user namespace policy, inspect the distribution-owned policy and kernel audit messages:

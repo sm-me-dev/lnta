@@ -17,6 +17,7 @@
   - [6. Time-Machine Rollback (`lnta undo`, `lnta sessions`)](#6-time-machine-rollback-lnta-undo-lnta-sessions)
   - [7. Remote SSH Mode (`--ssh`)](#7-remote-ssh-mode---ssh)
   - [8. Local Offline Mode (`--local` with Ollama)](#8-local-offline-mode---local-with-ollama)
+  - [9. MCP Server Mode (`lnta mcp`)](#9-mcp-server-mode-lnta-mcp)
 - [Configuration Reference (`config.yaml`)](#configuration-reference-configyaml)
   - [Config File Location](#config-file-location)
   - [Ready-to-Copy Provider Templates](#ready-to-copy-provider-templates)
@@ -54,6 +55,7 @@
 | `lnta --local "<prompt>"` | Force 100% offline execution via local Ollama models | Approved only |
 | `lnta setup` | 20-second interactive onboarding wizard (Ollama / Cloud providers) | **Zero** |
 | `lnta gc [--keep-last N]` | Garbage collect old run snapshots and rotate audit logs | **Zero** |
+| `lnta mcp` | Run the MCP server over stdio for Claude Code, Cursor, and OpenCode (read-only inspection, runbooks, verification) | **Zero** |
 | `lnta doctor` | Diagnose API connectivity, kernel sandboxing, and validators (exit `0` all required checks pass, `4` sandbox unavailable, `1` other required failure) | **Zero** |
 
 ---
@@ -305,6 +307,37 @@ Auto-discovered local Ollama models:
 - Probes `http://127.0.0.1:11434/api/tags` with a 150ms timeout.
 - Prioritizes models with proven structured tool calling (`qwen2.5-coder`, `llama3.3`, `mistral`).
 - Zero telemetry, zero external network traffic.
+
+---
+
+### 9. MCP Server Mode (`lnta mcp`)
+
+`lnta mcp` starts a Model Context Protocol server (JSON-RPC 2.0 over stdio, protocol version `2024-11-05`) so MCP clients such as Claude Code, Cursor, or OpenCode can use LNTA as a backend. It does not call an LLM itself and exposes no tool that writes to the host.
+
+Register it with your client:
+
+```bash
+# Claude Code
+claude mcp add lnta -- lnta mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "lnta": { "command": "lnta", "args": ["mcp"] }
+  }
+}
+```
+
+#### Exposed Tools
+
+| Tool | Required arguments | Description |
+|---|---|---|
+| `lnta_inspect_sandboxed` | `command`, `cwd`, `reason` | Runs a read-only command via `sh -c` inside the `bwrap` sandbox: read-only root, private `/tmp`, masked `.ssh`, `.gnupg`, `.aws`, `.kube`, and `.config/lnta`, and stdin from `/dev/null`. |
+| `lnta_get_pack_runbook` | `pack_id` | Returns the full Instruction Pack (frontmatter and Markdown body) for the given ID. |
+| `lnta_verify_task` | `pack_id`, `target` | Runs the pack's `verify_cmd`, substituting `target` for `${target}`. |
+
+Run `lnta doctor` first: `lnta_inspect_sandboxed` depends on the same kernel sandbox, and a refused project scan or unavailable sandbox fails the call instead of running unconfined.
 
 ---
 
