@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/sm-me-dev/lnta/internal/audit"
 	"github.com/sm-me-dev/lnta/internal/sandbox"
@@ -18,16 +18,16 @@ import (
 
 // TimeMachineModel is the main model for the time-machine TUI.
 type TimeMachineModel struct {
-	list       list.Model
-	viewport   viewport.Model
-	runs       []*audit.RunSummary
-	selected   *audit.RunSummary
-	width      int
-	height     int
-	status     string
-	err        error
-	quitting   bool
-	focusLeft  bool // true = left pane (list), false = right pane (viewport)
+	list      list.Model
+	viewport  viewport.Model
+	runs      []*audit.RunSummary
+	selected  *audit.RunSummary
+	width     int
+	height    int
+	status    string
+	err       error
+	quitting  bool
+	focusLeft bool // true = left pane (list), false = right pane (viewport)
 }
 
 // runItem wraps a RunSummary for the list component.
@@ -51,12 +51,14 @@ func (i runItem) FilterValue() string {
 
 func statusIcon(status audit.RunStatus) string {
 	switch status {
-	case audit.RunStatusVerified:
+	case audit.RunStatusVerified, audit.RunStatusCompleted:
 		return okStyle.Render("✓")
-	case audit.RunStatusFailed:
+	case audit.RunStatusFailed, audit.RunStatusBlocked:
 		return errStyle.Render("✗")
 	case audit.RunStatusRolledBack:
 		return warnStyle.Render("↩")
+	case audit.RunStatusCompletedUnverified:
+		return warnStyle.Render("!")
 	default:
 		return mutedStyle.Render("?")
 	}
@@ -117,9 +119,9 @@ func NewTimeMachineModel() *TimeMachineModel {
 	vp.Style = borderStyle
 
 	return &TimeMachineModel{
-		list:     l,
-		viewport: vp,
-		runs:     []*audit.RunSummary{},
+		list:      l,
+		viewport:  vp,
+		runs:      []*audit.RunSummary{},
 		focusLeft: true,
 	}
 }

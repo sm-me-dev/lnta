@@ -185,6 +185,8 @@ $ find . -type f -size +100M -mtime -7
 #### How It Works:
 The `Ctrl+G` widget invokes `lnta --command-only "$BUFFER"`. LNTA runs fingerprinting, routes to the matching pack, extracts the exact executable command, and replaces the command line buffer using your shell's native line editor (ZLE for Zsh, Readline for Bash).
 
+To diagnose the previous failed command, press `Ctrl+X`, then `Ctrl+G`. This runs the existing `lnta_fix` shell function and keeps `lnta fix`'s mutation approval prompt.
+
 ---
 
 ### 5. Explain & Dry-Run Modes (`--explain`, `--dry-run`)
@@ -509,6 +511,7 @@ eval "$(lnta init zsh)"
 
 Features activated:
 - `Ctrl+G`: In-line prompt to verified command conversion.
+- `Ctrl+X`, then `Ctrl+G`: Run `lnta_fix` for the previous command.
 - `lnta fix`: Auto-captures last failed command and exit status via `add-zsh-hook precmd`.
 </details>
 
@@ -522,6 +525,7 @@ eval "$(lnta init bash)"
 
 Features activated:
 - `Ctrl+G`: In-line Readline buffer replacement (`bind -x`).
+- `Ctrl+X`, then `Ctrl+G`: Run `lnta_fix` for the previous command.
 - `lnta fix`: Hooked into `PROMPT_COMMAND` to capture `$BASH_COMMAND` and exit codes.
 </details>
 
@@ -534,6 +538,7 @@ lnta init fish | source
 ```
 
 Features activated:
+- `Ctrl+X`, then `Ctrl+G`: Run `lnta_fix` for the previous command.
 - Event listener on `fish_prompt` capturing `$status` and `$history[1]`.
 - Native `lnta_fix` command.
 </details>

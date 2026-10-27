@@ -59,11 +59,15 @@ func (m *mockStream) Close() error {
 type mockLLM struct {
 	mu        sync.Mutex
 	scenarios [][]openai.ChatCompletionStreamResponse
+	requests  []openai.ChatCompletionRequest
 	turn      int
 }
 
 func (m *mockLLM) ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (ChatStream, error) {
 	m.mu.Lock()
+	requestCopy := req
+	requestCopy.Messages = append([]openai.ChatCompletionMessage(nil), req.Messages...)
+	m.requests = append(m.requests, requestCopy)
 	turn := m.turn
 	m.turn++
 	m.mu.Unlock()
@@ -72,6 +76,12 @@ func (m *mockLLM) ChatCompletionStream(ctx context.Context, req openai.ChatCompl
 		responses = m.scenarios[turn]
 	}
 	return &mockStream{responses: responses}, nil
+}
+
+func (m *mockLLM) requestsCopy() []openai.ChatCompletionRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]openai.ChatCompletionRequest(nil), m.requests...)
 }
 
 func (m *mockLLM) turnCount() int {
@@ -169,6 +179,7 @@ func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
 
 	// complete_task with a missing target -> verify_cmd fails -> blocked.
 	res, err := completeTask(context.Background(), mustMarshal(map[string]any{
+		"outcome":            "completed",
 		"summary":            "attempt 1",
 		"target_artifacts":   missing,
 		"verification_notes": "should fail",
@@ -182,6 +193,7 @@ func TestCompleteTaskFailingVerifyCmd(t *testing.T) {
 
 	// complete_task with an existing target -> verify_cmd passes -> TASK_COMPLETE.
 	res2, err := completeTask(context.Background(), mustMarshal(map[string]any{
+		"outcome":            "completed",
 		"summary":            "attempt 2",
 		"target_artifacts":   existing,
 		"verification_notes": "should pass",
@@ -305,7 +317,7 @@ func TestStreamedToolCallValidationRejectsMalformedAndRepeatedMutations(t *testi
 		{name: "invalid JSON", calls: map[int]*streamingToolCall{0: {index: 0, id: "call-1", typ: string(openai.ToolTypeFunction), name: "inspect_system", args: `{`}}, order: []int{0}},
 		{name: "unknown tool", calls: map[int]*streamingToolCall{0: {index: 0, id: "call-1", typ: string(openai.ToolTypeFunction), name: "shell", args: `{}`}}, order: []int{0}},
 		{name: "repeated mutation", calls: map[int]*streamingToolCall{0: valid, 1: {index: 1, id: "call-2", typ: string(openai.ToolTypeFunction), name: "mutate_system", args: `{"command":"echo safe"}`}}, order: []int{0, 1}},
-		{name: "complete with other call", calls: map[int]*streamingToolCall{0: {index: 0, id: "call-1", typ: string(openai.ToolTypeFunction), name: "complete_task", args: `{"summary":"done","target_artifacts":"x"}`}, 1: {index: 1, id: "call-2", typ: string(openai.ToolTypeFunction), name: "inspect_system", args: `{"command":"id"}`}}, order: []int{0, 1}},
+		{name: "complete with other call", calls: map[int]*streamingToolCall{0: {index: 0, id: "call-1", typ: string(openai.ToolTypeFunction), name: "complete_task", args: `{"outcome":"completed","summary":"done","target_artifacts":"x"}`}, 1: {index: 1, id: "call-2", typ: string(openai.ToolTypeFunction), name: "inspect_system", args: `{"command":"id"}`}}, order: []int{0, 1}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -356,7 +368,7 @@ func TestCompleteTaskDesktopVerificationPasses(t *testing.T) {
 		t.Fatal(err)
 	}
 	pack := &packs.Pack{ID: "linux-desktop-entries", VerifyCmd: `desktop-file-validate "${target}"`, AllowedPaths: []string{filepath.Join(dir, "*.desktop")}}
-	result, err := completeTask(context.Background(), mustMarshal(map[string]any{"summary": "checked", "target_artifacts": target}), ToolDeps{Pack: pack, CWD: dir, Executor: transport.NewLocalExecutor("test", dir, pack.AllowedPaths)})
+	result, err := completeTask(context.Background(), mustMarshal(map[string]any{"outcome": "completed", "summary": "checked", "target_artifacts": target}), ToolDeps{Pack: pack, CWD: dir, Executor: transport.NewLocalExecutor("test", dir, pack.AllowedPaths)})
 	if err != nil || !strings.Contains(result, "TASK_COMPLETE") {
 		t.Fatalf("result=%q error=%v", result, err)
 	}
@@ -372,7 +384,7 @@ func TestCompleteTaskMarksMissingVerifierUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	pack := &packs.Pack{ID: "missing-verifier", VerifyCmd: `lnta-test-verifier-that-does-not-exist "$LNTA_TARGET"`, AllowedPaths: []string{filepath.Join(dir, "*")}}
-	result, err := completeTask(context.Background(), mustMarshal(map[string]any{"summary": "check", "target_artifacts": target}), ToolDeps{Pack: pack, CWD: dir, Executor: transport.NewLocalExecutor("test", dir, pack.AllowedPaths)})
+	result, err := completeTask(context.Background(), mustMarshal(map[string]any{"outcome": "completed", "summary": "check", "target_artifacts": target}), ToolDeps{Pack: pack, CWD: dir, Executor: transport.NewLocalExecutor("test", dir, pack.AllowedPaths)})
 	if err != nil || !strings.Contains(result, "HARNESS_VERIFICATION_UNAVAILABLE") {
 		t.Fatalf("result=%q error=%v", result, err)
 	}
@@ -412,8 +424,8 @@ func TestOrchestratorSelfCorrectsAfterFailedVerify(t *testing.T) {
 	// Turn 2: complete_task with the existing target -> verify passes -> TASK_COMPLETE.
 	llm := &mockLLM{
 		scenarios: [][]openai.ChatCompletionStreamResponse{
-			{toolCallResponse("complete_task", `{"summary":"attempt 1","target_artifacts":"`+missing+`","verification_notes":"should fail"}`)},
-			{toolCallResponse("complete_task", `{"summary":"attempt 2","target_artifacts":"`+existing+`","verification_notes":"should pass"}`)},
+			{toolCallResponse("complete_task", `{"outcome":"completed","summary":"attempt 1","target_artifacts":"`+missing+`","verification_notes":"should fail"}`)},
+			{toolCallResponse("complete_task", `{"outcome":"completed","summary":"attempt 2","target_artifacts":"`+existing+`","verification_notes":"should pass"}`)},
 		},
 	}
 
@@ -488,7 +500,7 @@ Categories=Utility;
 			"path": target, "content": desktop, "reason": "create valid desktop launcher", "mode": "0644",
 		}))},
 		{toolCallResponse("complete_task", buildArgs(map[string]any{
-			"summary": "created valid .desktop launcher", "target_artifacts": target,
+			"outcome": "completed", "summary": "created valid .desktop launcher", "target_artifacts": target,
 			"verification_notes": "native Exec check + desktop-file-validate passed",
 		}))},
 	}

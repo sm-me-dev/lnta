@@ -42,6 +42,14 @@ _lnta_ctrl_g_widget() {
 }
 zle -N _lnta_ctrl_g_widget
 bindkey '^G' _lnta_ctrl_g_widget
+
+# Ctrl+X, then Ctrl+G: run the existing lnta fix workflow
+_lnta_ctrl_x_ctrl_g_fix_widget() {
+    BUFFER="lnta_fix"
+    zle accept-line
+}
+zle -N _lnta_ctrl_x_ctrl_g_fix_widget
+bindkey '^X^G' _lnta_ctrl_x_ctrl_g_fix_widget
 `
 
 const bashTemplate = `# LNTA Shell Integration for bash
@@ -83,6 +91,7 @@ _lnta_ctrl_g_widget() {
     fi
 }
 bind -x '"\C-g": _lnta_ctrl_g_widget'
+bind '"\C-x\C-g":"lnta_fix\n"'
 `
 
 const fishTemplate = `# LNTA Shell Integration for fish
@@ -116,6 +125,12 @@ function _lnta_ctrl_g_widget
     end
 end
 bind \cg _lnta_ctrl_g_widget
+
+function _lnta_ctrl_x_ctrl_g_fix
+    commandline -r lnta_fix
+    commandline -f execute
+end
+bind \cx\cg _lnta_ctrl_x_ctrl_g_fix
 `
 
 // GenerateInitScript returns the shell integration script for the given shell.

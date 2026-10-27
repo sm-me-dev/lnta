@@ -85,10 +85,12 @@ func CoreTools() []Tool {
 	return []Tool{
 		{
 			Name:        "inspect_system",
-			Description: "Execute a read-only shell command inside a bwrap sandbox. The entire root filesystem is bind-mounted read-only; /tmp is a private tmpfs; secret dirs (.ssh, .gnupg, .aws, .kube, .config/lnta) are masked. Stdin is /dev/null. Use this for system inspection only — it cannot modify the host.",
+			Description: "Read-only inspection. Use scope=project with a full shell command for project inspection, or scope=host with query=ram for typed RAM/process RSS diagnostics from /proc. Host queries never run shell commands and never read process arguments or environments. Project inspection remains sandboxed and fails closed if the project scan is incomplete.",
 			Parameters: jsonSchema(`{
 				"type": "object",
 				"properties": {
+					"scope": {"type": "string", "enum": ["project", "host"], "description": "Inspection boundary. Defaults to project for compatibility."},
+					"query": {"type": "string", "enum": ["ram"], "description": "Typed host query. Required when scope is host."},
 					"command": {"type": "string", "description": "The shell command to execute (read-only), run via sh -c inside the sandbox."},
 					"cwd": {"type": "string", "description": "Working directory for the command."},
 					"reason": {"type": "string", "description": "Why this inspection is needed."}
@@ -132,16 +134,17 @@ func CoreTools() []Tool {
 		},
 		{
 			Name:        "complete_task",
-			Description: "Signal task completion. Triggers the harness-enforced verification gate: the active pack's verify_cmd is executed inside the sandbox, and for linux-desktop-entries a native Go check confirms the desktop entry exists, desktop-file-validate passes, and the Exec= binary resolves. On failure returns HARNESS_VERIFICATION_FAILED and the loop continues.",
+			Description: "Report an explicit completed or blocked outcome. A completed outcome triggers the harness-enforced verification gate: the active pack's verify_cmd runs inside the sandbox, and linux-desktop-entries also gets a native Go check. On verification failure the loop continues; a blocked outcome stops without claiming verification.",
 			Parameters: jsonSchema(`{
 				"type": "object",
 				"properties": {
+					"outcome": {"type": "string", "enum": ["completed", "blocked"], "description": "Use completed only when the task is done and ready for harness verification. Use blocked when an unrecoverable inspection or other blocker prevents completion."},
 					"summary": {"type": "string", "description": "Human-readable summary of what was accomplished."},
 					"target_artifacts": {"type": "string", "description": "Target artifact path to verify (for example, a .desktop file path)."},
 					"verification_inputs": {"type": "object", "description": "Values for verify_cmd placeholders other than target; values are passed as environment data.", "additionalProperties": {"type": "string"}},
 					"verification_notes": {"type": "string", "description": "Notes on how verification was performed."}
 				},
-				"required": ["summary", "target_artifacts"],
+				"required": ["outcome", "summary"],
 				"additionalProperties": false
 			}`),
 			Func: completeTask,
@@ -161,6 +164,8 @@ func toolByName(tools []Tool) map[string]Tool {
 // --- Tool implementations ---------------------------------------------------
 
 type inspectInput struct {
+	Scope   string `json:"scope"`
+	Query   string `json:"query"`
 	Command string `json:"command"`
 	Cmd     string `json:"cmd"` // common alias produced by some LLMs
 	CWD     string `json:"cwd"`
@@ -175,6 +180,37 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 	if in.Command == "" && in.Cmd != "" {
 		in.Command = in.Cmd
 	}
+	if in.Scope == "" {
+		in.Scope = "project"
+	}
+	if in.Scope == "host" {
+		if in.Query != "ram" {
+			return "", fmt.Errorf("inspect_system: host scope requires query=ram")
+		}
+		if in.Command != "" || in.Cmd != "" {
+			return "", fmt.Errorf("inspect_system: host scope does not accept shell commands")
+		}
+		if deps.Executor != nil && deps.Executor.IsRemote() {
+			return "INSPECT_BLOCKED: host RAM collection is available only for the local host. No command was run. Use project scope for the remote target or reconnect locally.", nil
+		}
+		result, err := collectHostMemory("/proc")
+		if err != nil {
+			return fmt.Sprintf("INSPECT_BLOCKED: host RAM inspection could not read a complete /proc snapshot (%v). No process was changed. Resolve /proc access or use another read-only diagnostic.", err), nil
+		}
+		if deps.RunCollector != nil {
+			deps.RunCollector.RecordCommand(audit.CommandRecord{
+				Command: "host RAM query", ExitCode: 0, Stdout: result,
+				Timestamp: time.Now().UTC(), Source: "inspect_system",
+			})
+		}
+		return result, nil
+	}
+	if in.Scope != "project" {
+		return "", fmt.Errorf("inspect_system: unsupported scope %q", in.Scope)
+	}
+	if in.Command == "" {
+		return "", fmt.Errorf("inspect_system: project scope requires command")
+	}
 	if in.CWD == "" {
 		in.CWD = deps.CWD
 	}
@@ -185,6 +221,13 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 			errMsg = err.Error()
 		} else {
 			errMsg = fmt.Sprintf("exit status %d", res.ExitCode)
+		}
+		var commandExit *exec.ExitError
+		failureText := strings.ToLower(errMsg + "\n" + res.Stderr)
+		sandboxFailure := strings.Contains(failureText, "bwrap") || strings.Contains(failureText, "bubblewrap") ||
+			strings.Contains(failureText, "landlock") || strings.Contains(failureText, "sandbox refused")
+		if errors.Is(err, sandbox.ErrSecretScanIncomplete) || sandboxFailure || (err != nil && !errors.As(err, &commandExit) && ctx.Err() == nil) {
+			return fmt.Sprintf("INSPECT_BLOCKED: project inspection could not complete its fail-closed sandbox setup (%s). No command was run. Remove or resolve the unsafe project entry, or use scope=host query=ram for host memory diagnostics.", errMsg), nil
 		}
 		return fmt.Sprintf("TOOL_ERROR: inspect_system failed for command %q (%s)\nstderr: %s\nHint: 'command' must be a full executable shell command (e.g. 'ss -tulpn', 'ps aux', 'lsof -i'), not an argument.", in.Command, errMsg, res.Stderr), nil
 	}
@@ -461,6 +504,7 @@ func mutateSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 }
 
 type completeInput struct {
+	Outcome            string            `json:"outcome"`
 	Summary            string            `json:"summary"`
 	TargetArtifacts    string            `json:"target_artifacts"`
 	Targets            string            `json:"targets"`  // alias
@@ -481,7 +525,16 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 			in.TargetArtifacts = in.Artifact
 		}
 	}
-
+	if in.Outcome != "completed" && in.Outcome != "blocked" {
+		return "", fmt.Errorf("complete_task: outcome must be completed or blocked")
+	}
+	if in.Outcome == "blocked" {
+		if deps.RunCollector != nil {
+			deps.RunCollector.SetStatus(audit.RunStatusBlocked)
+			deps.RunCollector.SetError(in.Summary)
+		}
+		return fmt.Sprintf("TASK_BLOCKED: %s", in.Summary), nil
+	}
 	// --- Verification Gate ---
 	// Fail closed: no pack or no verify_cmd means we cannot certify. The
 	// target is passed out-of-band as LNTA_TARGET (single-quoted env
@@ -492,9 +545,12 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 	if !deps.Pack.RequiresVerification() {
 		if deps.RunCollector != nil {
 			deps.RunCollector.RecordVerification(audit.VerificationRecord{Timestamp: time.Now().UTC(), Passed: false, Status: audit.VerificationNotRequired})
-			deps.RunCollector.SetStatus(audit.RunStatusNotRequired)
+			deps.RunCollector.SetStatus(audit.RunStatusCompletedUnverified)
 		}
-		return fmt.Sprintf("TASK_COMPLETE: %s\nverification_status: NOT_REQUIRED", in.Summary), nil
+		return fmt.Sprintf("TASK_COMPLETE_UNVERIFIED: %s\nverification_status: NOT_REQUIRED", in.Summary), nil
+	}
+	if in.TargetArtifacts == "" {
+		return "", errors.New("complete_task: completed outcome requires target_artifacts for verification")
 	}
 	if strings.TrimSpace(deps.Pack.VerifyCmd) == "" {
 		return "", errors.New("complete_task: required verifier is missing; refusing to certify")
@@ -584,6 +640,7 @@ func completeTask(ctx context.Context, args json.RawMessage, deps ToolDeps) (str
 			Passed:    true,
 			Status:    audit.VerificationPassed,
 		})
+		deps.RunCollector.SetStatus(audit.RunStatusCompleted)
 	}
 
 	var b strings.Builder

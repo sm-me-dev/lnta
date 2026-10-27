@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -29,6 +30,8 @@ import (
 	"github.com/sm-me-dev/lnta/internal/transport"
 	"github.com/sm-me-dev/lnta/internal/ui"
 )
+
+var runIDSequence atomic.Uint64
 
 var (
 	userConfigDir  string
@@ -248,9 +251,8 @@ func runLocalOllama(prompt string, commandOnly bool) error {
 	summary := o.RunSummary()
 
 	exitCode := agent.DetermineExitCode(runErr, result, summary)
-	if summary != nil {
-		summary.ExitCode = exitCode
-	}
+	o.SetExitCode(exitCode)
+	summary = o.RunSummary()
 
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
@@ -748,9 +750,8 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 
 	// Determine deterministic exit code
 	exitCode := agent.DetermineExitCode(runErr, result, summary)
-	if summary != nil {
-		summary.ExitCode = exitCode
-	}
+	o.SetExitCode(exitCode)
+	summary = o.RunSummary()
 
 	// Trigger lightweight automatic storage garbage collection in background
 	if cfg != nil {
@@ -809,9 +810,9 @@ func extractVerifiedCommand(result string) string {
 	return ""
 }
 
-// nextRunID returns a deterministic run identifier for this invocation.
+// nextRunID returns a unique run identifier for this invocation.
 func nextRunID() string {
-	return "run-" + time.Now().UTC().Format("20060102T150405")
+	return fmt.Sprintf("run-%s-%d", time.Now().UTC().Format("20060102T150405.000000000"), runIDSequence.Add(1))
 }
 
 // renderResult renders the orchestrator outcome and a Verification Receipt.
@@ -822,7 +823,7 @@ func renderResult(result string, runID string, pack packs.Pack) string {
 	changedPaths := []string{}
 	var results []ui.VerificationResult
 
-	if strings.Contains(result, "TASK_COMPLETE") {
+	if strings.HasPrefix(result, "TASK_COMPLETE:") {
 		status = ui.ReceiptCompleted
 		for _, line := range strings.Split(result, "\n") {
 			line = strings.TrimSpace(line)
@@ -841,7 +842,11 @@ func renderResult(result string, runID string, pack packs.Pack) string {
 			ExitCode: 0,
 			Output:   "verification gate passed",
 		})
-	} else if strings.Contains(result, "HARNESS_VERIFICATION_FAILED") {
+	} else if strings.HasPrefix(result, "TASK_COMPLETE_UNVERIFIED:") {
+		status = ui.ReceiptUnverified
+	} else if strings.HasPrefix(result, "TASK_BLOCKED:") || strings.HasPrefix(result, "INSPECT_BLOCKED:") {
+		status = ui.ReceiptBlocked
+	} else if strings.Contains(result, "HARNESS_VERIFICATION_FAILED") || strings.Contains(result, "HARNESS_VERIFICATION_UNAVAILABLE") {
 		status = ui.ReceiptFailed
 		exitCode := 1
 		outputMsg := "verification gate failed"
@@ -934,18 +939,26 @@ func latestRunID() string {
 // runChat starts an interactive multi-turn REPL.
 func runChat() error {
 	fmt.Println("LNTA interactive chat. Type your prompt, or 'exit'/'quit' to leave.")
-	fmt.Println("Commands: /undo <run_id> | /packs | /exit")
+	fmt.Println("Commands: /undo <run_id> | /packs | /reset | /exit")
 	fmt.Println()
+	var promptHistory []string
+	var conversation []agent.ConversationTurn
 	for {
-		fmt.Print("lnta> ")
-		var input string
-		if _, err := fmt.Scanln(&input); err != nil {
+		input, err := ui.ReadChatPrompt(promptHistory)
+		if errors.Is(err, ui.ErrChatPromptCanceled) {
 			fmt.Println()
 			return nil
+		}
+		if err != nil {
+			return err
 		}
 		input = strings.TrimSpace(input)
 		if input == "" {
 			continue
+		}
+		promptHistory = append(promptHistory, input)
+		if len(promptHistory) > 100 {
+			promptHistory = append([]string(nil), promptHistory[len(promptHistory)-100:]...)
 		}
 		if input == "/exit" || input == "exit" || input == "quit" {
 			fmt.Println("goodbye.")
@@ -958,6 +971,11 @@ func runChat() error {
 			}
 			continue
 		}
+		if input == "/reset" {
+			conversation = nil
+			fmt.Println("conversation context reset")
+			continue
+		}
 		if strings.HasPrefix(input, "/undo ") {
 			runID := strings.TrimSpace(strings.TrimPrefix(input, "/undo"))
 			if err := sandbox.RollbackRun(runID); err != nil {
@@ -967,27 +985,31 @@ func runChat() error {
 			}
 			continue
 		}
-		if err := runPromptArgs(input); err != nil {
+		result, historyBudget, err := runPromptArgsWithHistory(input, conversation)
+		if err != nil {
 			fmt.Printf("error: %v\n", err)
+		} else if strings.HasPrefix(result, "TASK_COMPLETE:") || strings.HasPrefix(result, "TASK_COMPLETE_UNVERIFIED:") {
+			conversation = append(conversation, agent.ConversationTurn{User: input, Assistant: result})
+			conversation = agent.BoundConversationHistory(conversation, historyBudget)
 		}
 		fmt.Println()
 	}
 }
 
-// runPromptArgs runs a single prompt within the chat session.
-func runPromptArgs(prompt string) error {
+// runPromptArgsWithHistory runs one prompt with bounded session context.
+func runPromptArgsWithHistory(prompt string, history []agent.ConversationTurn) (string, int, error) {
 	sys, err := fingerprint.Fingerprint()
 	if err != nil {
-		return fmt.Errorf("fingerprint: %w", err)
+		return "", 0, fmt.Errorf("fingerprint: %w", err)
 	}
 	router, err := packs.NewRouter(lnta.EmbeddedPacks, "packs/*.md", userConfigDir)
 	if err != nil {
-		return fmt.Errorf("load packs: %w", err)
+		return "", 0, fmt.Errorf("load packs: %w", err)
 	}
 	packs.SetDefaultRouter(router)
 	selected, err := router.SelectPacks(prompt, sys)
 	if err != nil {
-		return fmt.Errorf("route: %w", err)
+		return "", 0, fmt.Errorf("route: %w", err)
 	}
 	pack := selected[0]
 
@@ -999,11 +1021,11 @@ func runPromptArgs(prompt string) error {
 	fmt.Println(ui.StatusLine(pack.ID, "Running", "", false))
 	cfg, err := agent.LoadConfig()
 	if err != nil {
-		return fmt.Errorf("config: %w", err)
+		return "", 0, fmt.Errorf("config: %w", err)
 	}
 	client, err := agent.NewOpenAIClient(cfg)
 	if err != nil {
-		return fmt.Errorf("llm client: %w", err)
+		return "", 0, fmt.Errorf("llm client: %w", err)
 	}
 	o := agent.New(client, router,
 		agent.WithRunID(nextRunID()),
@@ -1011,15 +1033,18 @@ func runPromptArgs(prompt string) error {
 		agent.WithApprove(approveMutation("local")),
 		agent.WithConfig(cfg),
 		agent.WithDryRun(dryRunMode),
+		agent.WithConversationHistory(history, cfg.MaxTokens),
 	)
 	ctx, cancel := agent.WithSignalCancellation()
 	defer cancel()
 	result, err := o.Run(ctx, prompt, "", false)
 	if err != nil {
-		return fmt.Errorf("run: %w", err)
+		return "", cfg.MaxTokens, fmt.Errorf("run: %w", err)
 	}
+	code := agent.DetermineExitCode(nil, result, o.RunSummary())
+	o.SetExitCode(code)
 	fmt.Println(renderResult(result, o.RunID(), pack))
-	return nil
+	return result, cfg.MaxTokens, nil
 }
 
 // doctorClass states how a doctor check affects the process exit status.

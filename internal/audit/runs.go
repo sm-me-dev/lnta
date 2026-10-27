@@ -17,10 +17,13 @@ import (
 type RunStatus string
 
 const (
-	RunStatusVerified    RunStatus = "VERIFIED"
-	RunStatusNotRequired RunStatus = "NOT_REQUIRED"
-	RunStatusFailed      RunStatus = "FAILED"
-	RunStatusRolledBack  RunStatus = "ROLLED_BACK"
+	RunStatusVerified            RunStatus = "VERIFIED" // legacy summaries
+	RunStatusCompleted           RunStatus = "COMPLETED"
+	RunStatusCompletedUnverified RunStatus = "COMPLETED — NOT VERIFIED"
+	RunStatusBlocked             RunStatus = "BLOCKED"
+	RunStatusNotRequired         RunStatus = "NOT_REQUIRED" // legacy summaries
+	RunStatusFailed              RunStatus = "FAILED"
+	RunStatusRolledBack          RunStatus = "ROLLED_BACK"
 )
 
 // CommandRecord represents a command executed during a run.

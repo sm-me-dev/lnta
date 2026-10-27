@@ -43,14 +43,14 @@ func init() {
 var (
 	// titleStyle renders section headings.
 	titleStyle = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("12")). // light blue
-		MarginBottom(1)
+			Bold(true).
+			Foreground(lipgloss.Color("12")). // light blue
+			MarginBottom(1)
 
 	// labelStyle renders field labels.
 	labelStyle = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("10")) // light green
+			Bold(true).
+			Foreground(lipgloss.Color("10")) // light green
 
 	// mutedStyle renders dim secondary text.
 	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")) // gray
@@ -62,13 +62,13 @@ var (
 
 	// errStyle renders failure indicators.
 	errStyle = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("9")) // light red
+			Bold(true).
+			Foreground(lipgloss.Color("9")) // light red
 
 	// warnStyle renders warning / partial indicators.
 	warnStyle = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("11")) // light yellow
+			Bold(true).
+			Foreground(lipgloss.Color("11")) // light yellow
 
 	// bullet is the separator used in the compact status line.
 	bullet = mutedStyle.Render(" • ")
@@ -141,15 +141,15 @@ func StatusLine(pack, phase, path string, verified bool) string {
 
 // diffStyle colors the leading diff marker.
 var (
-	addStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green +
-	delStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))   // red -
-	ctxStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))   // gray context
+	addStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green +
+	delStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red -
+	ctxStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))  // gray context
 	hunkStyle = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("13")) // magenta @@ hunk header
+			Bold(true).
+			Foreground(lipgloss.Color("13")) // magenta @@ hunk header
 	fileStyle = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("12")) // light blue --- / +++
+			Bold(true).
+			Foreground(lipgloss.Color("12")) // light blue --- / +++
 )
 
 // RenderDiff renders a unified diff with syntax highlighting. Added lines are
@@ -184,7 +184,7 @@ func RenderDiff(diff string) string {
 
 // VerificationResult records one verification command executed by the harness.
 type VerificationResult struct {
-	Command string
+	Command  string
 	ExitCode int
 	Output   string
 }
@@ -194,7 +194,11 @@ type ReceiptStatus string
 
 const (
 	// ReceiptCompleted means the task completed and verification passed.
-	ReceiptCompleted ReceiptStatus = "COMPLETED & VERIFIED"
+	ReceiptCompleted ReceiptStatus = "COMPLETED"
+	// ReceiptUnverified means the task completed without a passing verification.
+	ReceiptUnverified ReceiptStatus = "COMPLETED — NOT VERIFIED"
+	// ReceiptBlocked means the harness stopped because a blocker prevented completion.
+	ReceiptBlocked ReceiptStatus = "BLOCKED"
 	// ReceiptPartial means the task completed but verification only partially
 	// passed or some targets could not be verified.
 	ReceiptPartial ReceiptStatus = "PARTIAL"
@@ -207,7 +211,7 @@ const (
 //
 //	╔═══════════════════════════════════════════════════════════╗
 //	║  VERIFICATION RECEIPT                                    ║
-//	║  Status   : COMPLETED & VERIFIED                         ║
+//	║  Status   : COMPLETED                                    ║
 //	║  Run ID   : run-20261017T120000                          ║
 //	║           : Run 'lnta undo <run_id>' to revert            ║
 //	║  Changed  : ~/.local/share/applications/app.desktop      ║
@@ -221,6 +225,12 @@ func VerificationReceipt(status ReceiptStatus, runID string, changedPaths []stri
 	case ReceiptCompleted:
 		statusLabel = string(ReceiptCompleted)
 		statusSt = okStyle
+	case ReceiptUnverified:
+		statusLabel = string(ReceiptUnverified)
+		statusSt = warnStyle
+	case ReceiptBlocked:
+		statusLabel = string(ReceiptBlocked)
+		statusSt = errStyle
 	case ReceiptPartial:
 		statusLabel = string(ReceiptPartial)
 		statusSt = warnStyle

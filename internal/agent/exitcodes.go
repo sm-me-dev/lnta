@@ -16,12 +16,16 @@ import (
 //	2 = Verification Failed
 //	3 = User Cancelled / Approval Denied
 //	4 = Sandbox / Environment Error
+//	5 = Blocked before completion
+//	6 = Completed without verification
 const (
 	ExitCodeSuccess            = 0
 	ExitCodeGeneralError       = 1
 	ExitCodeVerificationFailed = 2
 	ExitCodeUserCancelled      = 3
 	ExitCodeSandboxError       = 4
+	ExitCodeBlocked            = 5
+	ExitCodeUnverified         = 6
 )
 
 // ExitCoder is implemented by errors that carry a specific process exit code.
@@ -63,6 +67,8 @@ func NewExitError(code int, err error) *ExitError {
 //	2: Verification Failed
 //	3: User Cancelled / Approval Denied
 //	4: Sandbox / Environment Error
+//	5: Blocked before completion
+//	6: Completed without verification
 func DetermineExitCode(err error, result string, summary *audit.RunSummary) int {
 	if err != nil {
 		var exitCoder ExitCoder
@@ -102,13 +108,25 @@ func DetermineExitCode(err error, result string, summary *audit.RunSummary) int 
 	if strings.Contains(result, "HARNESS_VERIFICATION_FAILED") || strings.Contains(result, "HARNESS_VERIFICATION_UNAVAILABLE") {
 		return ExitCodeVerificationFailed
 	}
+	if strings.HasPrefix(result, "INSPECT_BLOCKED:") || strings.HasPrefix(result, "TASK_BLOCKED:") {
+		return ExitCodeBlocked
+	}
+	if strings.HasPrefix(result, "TASK_COMPLETE_UNVERIFIED:") {
+		return ExitCodeUnverified
+	}
 
 	if summary != nil {
-		if summary.Status == audit.RunStatusVerified {
+		if summary.Status == audit.RunStatusCompleted || summary.Status == audit.RunStatusVerified {
 			return ExitCodeSuccess
 		}
 		if summary.Status == audit.RunStatusNotRequired {
 			return ExitCodeSuccess
+		}
+		if summary.Status == audit.RunStatusBlocked {
+			return ExitCodeBlocked
+		}
+		if summary.Status == audit.RunStatusCompletedUnverified {
+			return ExitCodeUnverified
 		}
 		if summary.Status == audit.RunStatusFailed {
 			errStr := strings.ToLower(summary.Error)

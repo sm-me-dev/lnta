@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/sm-me-dev/lnta/main/scripts/install
 
 ### 2. Shell Integration
 
-Add LNTA to your shell profile to activate `lnta fix` and the `Ctrl+G` line-editor hotkey:
+Add LNTA to your shell profile to activate `lnta fix`, `Ctrl+G` command conversion, and the `Ctrl+X` then `Ctrl+G` fix shortcut:
 
 ```bash
 # For Zsh (~/.zshrc)
@@ -189,7 +189,7 @@ An honest assessment of how LNTA compares to raw shell wrappers and heavyweight 
 | **Verification Authority** | ❌ LLM self-reports | ⚠️ LLM self-reports | ✅ **Deterministic shell gate** (`verify_cmd` exit code 0 mandatory) |
 | **Rollback Capability** | ❌ None | ⚠️ Git only | ✅ **System-wide atomic snapshots** (`lnta undo`, `lnta sessions`) |
 | **Latency to First Token** | ~500ms | 3–10 seconds (daemon load) | ✅ **< 5ms** local fingerprint + pack routing |
-| **Interactive Hotkey** | ❌ Shell wrapper | ❌ Full terminal hijack | ✅ **In-line `Ctrl+G`** via native shell line editor |
+| **Interactive Hotkeys** | ❌ Shell wrapper | ❌ Full terminal hijack | ✅ **`Ctrl+G` conversion** and **`Ctrl+X`, `Ctrl+G` fix** |
 | **Local Offline LLMs** | ⚠️ Manual URL flag | ⚠️ Remote focused | ✅ **Auto-discovery** (`lnta --local` via Ollama) |
 | **Remote SSH Execution** | ❌ Run locally only | ❌ Requires remote daemon | ✅ **Native `--ssh`** with local approval attribution |
 
@@ -212,7 +212,7 @@ Dive deeper into LNTA's architecture, security controls, and extensibility:
 
 - **Blazing Fast Preflight**: Local system fingerprinting and n-gram pack routing complete in **under 5 milliseconds**.
 - **Unix Pipeline Friendly**: Preserves the first 16KB and last 48KB of piped context while redirecting approval prompts to `/dev/tty`.
-- **Command-Line Hotkey (`Ctrl+G`)**: Replaces natural language with verified commands directly in your Zsh, Bash, or Fish buffer.
+- **Command-Line Hotkeys**: `Ctrl+G` converts natural language into a command; `Ctrl+X`, then `Ctrl+G` runs `lnta_fix` in Zsh, Bash, and Fish.
 - **Explain Mode (`--explain`)**: Physically strips mutation tools from the agent's capability manifest for 100% read-only diagnostic reasoning.
 - **Dry-Run Preview (`--dry-run`)**: Generates unified color diffs and commands without touching the disk or executing mutations.
 - **Time Machine TUI (`lnta sessions`)**: Two-pane BubbleTea browser with fuzzy searching, run diff inspection, and single-keystroke rollbacks.
@@ -278,10 +278,10 @@ Direct asset downloads alone do not authenticate a release. Verify the detached 
 
 | Distribution | Architecture | Installation Command |
 |---|---|---|
-| **Ubuntu / Debian** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.5_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
-| **Fedora / RHEL / openSUSE** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.5-1.amd64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
-| **Arch Linux / Manjaro** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.5-1-amd64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
-| **Static Tarball (Any Linux)**| `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.5_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
+| **Ubuntu / Debian** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.6_linux_amd64.deb -o lnta.deb && sudo dpkg -i lnta.deb` |
+| **Fedora / RHEL / openSUSE** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.6-1.amd64.rpm -o lnta.rpm && sudo rpm -i lnta.rpm` |
+| **Arch Linux / Manjaro** | `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta-0.1.6-1-amd64.pkg.tar.zst -o lnta.pkg.tar.zst && sudo pacman -U --noconfirm lnta.pkg.tar.zst` |
+| **Static Tarball (Any Linux)**| `amd64` / `arm64` | `curl -fsSL https://github.com/sm-me-dev/lnta/releases/latest/download/lnta_0.1.6_linux_amd64.tar.gz \| tar -xz && sudo mv lnta /usr/local/bin/` |
 
 ---
 

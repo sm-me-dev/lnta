@@ -19,6 +19,7 @@ func TestGenerateInitScript_Zsh(t *testing.T) {
 		"lnta_fix",
 		"_lnta_ctrl_g_widget",
 		"bindkey '^G'",
+		"bindkey '^X^G' _lnta_ctrl_x_ctrl_g_fix_widget",
 		"add-zsh-hook precmd",
 	}
 	for _, s := range required {
@@ -120,6 +121,11 @@ func TestGenerateInitScript_Unknown(t *testing.T) {
 
 func TestGenerateInitScript_ValidSyntax(t *testing.T) {
 	// Verify all three shells produce non-empty output
+	fixBindings := map[string]string{
+		"zsh":  "bindkey '^X^G' _lnta_ctrl_x_ctrl_g_fix_widget",
+		"bash": "\\C-x\\C-g",
+		"fish": "bind \\cx\\cg _lnta_ctrl_x_ctrl_g_fix",
+	}
 	for _, shell := range []string{"zsh", "bash", "fish"} {
 		script, err := GenerateInitScript(shell, "test")
 		if err != nil {
@@ -128,6 +134,20 @@ func TestGenerateInitScript_ValidSyntax(t *testing.T) {
 		}
 		if script == "" {
 			t.Errorf("%s: generated empty script", shell)
+		}
+		if strings.Contains(script, "alias f=") {
+			t.Errorf("%s: must not define an f alias", shell)
+		}
+		if !strings.Contains(script, fixBindings[shell]) {
+			t.Errorf("%s: missing Ctrl+X, Ctrl+G lnta_fix binding", shell)
+		}
+		ctrlGBindings := map[string]string{
+			"zsh":  "bindkey '^G' _lnta_ctrl_g_widget",
+			"bash": "\\C-g",
+			"fish": "bind \\cg _lnta_ctrl_g_widget",
+		}
+		if !strings.Contains(script, ctrlGBindings[shell]) {
+			t.Errorf("%s: existing Ctrl+G conversion binding was lost", shell)
 		}
 		// Basic sanity: should contain lnta fix function
 		if !strings.Contains(script, "lnta_fix") {

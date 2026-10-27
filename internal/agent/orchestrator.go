@@ -77,9 +77,17 @@ type Orchestrator struct {
 	budgetTracker *BudgetTracker
 
 	// Run summary collection for time-machine TUI.
-	runCollector *audit.RunSummaryCollector
-	commandOnly  bool
-	mutations    map[string]struct{}
+	runCollector  *audit.RunSummaryCollector
+	commandOnly   bool
+	mutations     map[string]struct{}
+	history       []ConversationTurn
+	historyBudget int
+}
+
+// ConversationTurn is a completed user/assistant exchange retained by chat mode.
+type ConversationTurn struct {
+	User      string
+	Assistant string
 }
 
 // Option configures an Orchestrator.
@@ -116,9 +124,47 @@ func WithConfig(cfg *Config) Option {
 	return func(o *Orchestrator) { o.config = cfg }
 }
 
+// WithConversationHistory adds bounded completed exchanges before the current
+// prompt. Pack routing and verification still run independently for each Run.
+func WithConversationHistory(history []ConversationTurn, tokenBudget int) Option {
+	return func(o *Orchestrator) {
+		o.historyBudget = tokenBudget
+		o.history = BoundConversationHistory(history, tokenBudget)
+	}
+}
+
+// BoundConversationHistory retains the newest whole exchanges that fit the
+// approximate token budget. Three UTF-8 bytes per token is a conservative
+// bound for the retained text; role framing is charged eight tokens per turn.
+func BoundConversationHistory(history []ConversationTurn, tokenBudget int) []ConversationTurn {
+	if tokenBudget <= 0 || len(history) == 0 {
+		return nil
+	}
+	remaining := tokenBudget
+	start := len(history)
+	for start > 0 {
+		turn := history[start-1]
+		cost := (len(turn.User)+len(turn.Assistant)+2)/3 + 8
+		if cost > remaining {
+			break
+		}
+		remaining -= cost
+		start--
+	}
+	return append([]ConversationTurn(nil), history[start:]...)
+}
+
 // RunID returns the active run identifier.
 func (o *Orchestrator) RunID() string {
 	return o.runID
+}
+
+// SetExitCode persists the final CLI outcome on the run summary.
+func (o *Orchestrator) SetExitCode(code int) {
+	if o.runCollector != nil {
+		o.runCollector.SetExitCode(code)
+		_ = o.runCollector.Save()
+	}
 }
 
 // RunSummary returns the current snapshot of the run summary if available.
@@ -287,8 +333,14 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
+	for _, turn := range BoundConversationHistory(o.history, o.historyBudget) {
+		messages = append(messages,
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: turn.User},
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: turn.Assistant},
+		)
+	}
+	messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: userPrompt})
 
 	// Attach budget tracker to context for tool access
 	ctx = WithBudgetTracker(ctx, o.budgetTracker)
@@ -446,10 +498,28 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 			}
 
 			result, err := tool.Func(ctx, argsJSON, deps)
+			if err == nil && (strings.HasPrefix(result, "INSPECT_BLOCKED:") || strings.HasPrefix(result, "TASK_BLOCKED:")) {
+				if o.runCollector != nil {
+					o.runCollector.SetStatus(audit.RunStatusBlocked)
+					o.runCollector.SetError(result)
+					_ = o.runCollector.Save()
+				}
+				return result, nil
+			}
 
 			// Record tool call for circuit breaker detection
 			shouldBlock, hint := o.budgetTracker.RecordToolCall(p.name, argsJSON, err == nil && !strings.HasPrefix(result, "TOOL_ERROR:"), err)
 			if shouldBlock {
+				if p.name == "inspect_system" && strings.Contains(hint, "same inspect_system call") {
+					blocked := "INSPECT_BLOCKED: repeated inspection failures stopped this run. " +
+						"Check the project path and sandbox setup, then retry with a different safe diagnostic. " + hint
+					if o.runCollector != nil {
+						o.runCollector.SetStatus(audit.RunStatusBlocked)
+						o.runCollector.SetError(blocked)
+						_ = o.runCollector.Save()
+					}
+					return blocked, nil
+				}
 				// Circuit breaker triggered - inject hint and stop
 				if o.runCollector != nil {
 					o.runCollector.SetStatus(audit.RunStatusFailed)
@@ -463,7 +533,7 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 				toolResults = append(toolResults, toolResultMessage(p.id, "", err))
 				continue
 			}
-			if strings.HasPrefix(result, "TASK_COMPLETE:") {
+			if strings.HasPrefix(result, "TASK_COMPLETE:") || strings.HasPrefix(result, "TASK_COMPLETE_UNVERIFIED:") {
 				completed = true
 			}
 			toolResults = append(toolResults, toolResultMessage(p.id, result, nil))
@@ -480,12 +550,10 @@ func (o *Orchestrator) runLoop(ctx context.Context, systemPrompt, userPrompt str
 
 			// Save run summary on completion
 			if o.runCollector != nil {
-				if strings.Contains(last.Content, "TASK_COMPLETE:") {
-					if strings.Contains(last.Content, "verification_status: NOT_REQUIRED") {
-						o.runCollector.SetStatus(audit.RunStatusNotRequired)
-					} else {
-						o.runCollector.SetStatus(audit.RunStatusVerified)
-					}
+				if strings.HasPrefix(last.Content, "TASK_COMPLETE:") {
+					o.runCollector.SetStatus(audit.RunStatusCompleted)
+				} else if strings.HasPrefix(last.Content, "TASK_COMPLETE_UNVERIFIED:") {
+					o.runCollector.SetStatus(audit.RunStatusCompletedUnverified)
 				} else if strings.Contains(last.Content, "HARNESS_VERIFICATION_FAILED:") || strings.Contains(last.Content, "HARNESS_VERIFICATION_UNAVAILABLE:") {
 					o.runCollector.SetStatus(audit.RunStatusFailed)
 				}
@@ -639,6 +707,8 @@ func validateStreamedToolCalls(order []int, pending map[int]*streamingToolCall, 
 	ids := make(map[string]struct{}, len(order))
 	mutations := make(map[string]struct{})
 	completeCount := 0
+	inspects := 0
+	mutateCalls := 0
 	for _, idx := range order {
 		call := pending[idx]
 		if call == nil || call.id == "" || len(call.id) > 128 || strings.ContainsAny(call.id, "\r\n\x00") {
@@ -674,9 +744,18 @@ func validateStreamedToolCalls(order []int, pending map[int]*streamingToolCall, 
 		if call.name == "complete_task" {
 			completeCount++
 		}
+		if call.name == "inspect_system" {
+			inspects++
+		}
+		if call.name == "mutate_system" {
+			mutateCalls++
+		}
 	}
 	if completeCount > 0 && len(order) != 1 {
 		return fmt.Errorf("complete_task must be the only tool call in its provider response")
+	}
+	if inspects > 0 && mutateCalls > 0 {
+		return fmt.Errorf("inspect_system and mutate_system must be requested in separate turns")
 	}
 	return nil
 }
@@ -706,8 +785,20 @@ func decodeToolArgs(name, raw string) error {
 	}
 	switch args := target.(type) {
 	case *inspectInput:
-		if args.Command == "" && args.Cmd == "" {
-			return fmt.Errorf("inspect_system requires command")
+		if args.Scope == "" {
+			args.Scope = "project"
+		}
+		switch args.Scope {
+		case "project":
+			if args.Command == "" && args.Cmd == "" {
+				return fmt.Errorf("inspect_system project scope requires command")
+			}
+		case "host":
+			if args.Query != "ram" || args.Command != "" || args.Cmd != "" {
+				return fmt.Errorf("inspect_system host scope requires query=ram and does not accept command")
+			}
+		default:
+			return fmt.Errorf("inspect_system has unsupported scope %q", args.Scope)
 		}
 	case *writeInput:
 		if args.Path == "" {
@@ -718,8 +809,8 @@ func decodeToolArgs(name, raw string) error {
 			return fmt.Errorf("mutate_system requires command")
 		}
 	case *completeInput:
-		if args.Summary == "" || (args.TargetArtifacts == "" && args.Targets == "" && args.Artifact == "") {
-			return fmt.Errorf("complete_task requires summary and target_artifacts")
+		if args.Summary == "" || (args.Outcome != "completed" && args.Outcome != "blocked") {
+			return fmt.Errorf("complete_task requires outcome (completed or blocked) and summary")
 		}
 	}
 	return nil
@@ -811,10 +902,11 @@ func buildSystemPrompt(sysCtx fingerprint.SystemContext, pack packs.Pack, contex
 	}
 	b.WriteString("## Tool Rules\n")
 	b.WriteString("- Never run raw bash. Use inspect_system for read-only inspection.\n")
-	b.WriteString("- For inspect_system, command must be a full executable shell command string (e.g. \"ss -tulpn\", \"ps aux\", \"cat /path\"), never an isolated argument or option.\n")
+	b.WriteString("- Use inspect_system scope=project with a full executable command for project inspection. Use scope=host query=ram for host RAM and process RSS diagnostics; this reads only /proc/meminfo and /proc/<pid>/stat, never arguments or environments.\n")
+	b.WriteString("- If inspection returns INSPECT_BLOCKED, stop and call complete_task with outcome=blocked; do not retry or fall back to mutate_system.\n")
 	b.WriteString("- Use write_scoped_file for any file write within allowed_paths.\n")
 	b.WriteString("- Use mutate_system only for out-of-scope writes or host mutations, and only after user approval.\n")
-	b.WriteString("- When your inspection or task is complete, call complete_task with your findings and answer in summary.\n")
+	b.WriteString("- When your inspection or task is complete, call complete_task with outcome=completed, findings, and answer in summary. Use outcome=blocked when an unrecoverable blocker prevents completion.\n")
 	b.WriteString("- If complete_task returns HARNESS_VERIFICATION_FAILED, fix the issue and call complete_task again.\n")
 	return b.String()
 }
@@ -825,16 +917,17 @@ func baseSafetyPolicy() string {
 You are LNTA, a Linux Natural-Language Terminal Assistant. You never receive a
 raw, unrestricted shell. All actions go through four strictly typed tools:
 
-1. inspect_system — read-only sandboxed command execution (bwrap, read-only
-   root, masked secret dirs).
+1. inspect_system — read-only project commands in the sandbox, or a typed host
+   RAM query that reads /proc/meminfo and /proc/<pid>/stat only.
 2. write_scoped_file — atomic, scope-checked file writes (allowed_paths only).
 3. mutate_system — host mutations, gated behind explicit user approval.
-4. complete_task — task completion; the harness enforces verification before
-   the task is considered done.
+4. complete_task — explicit completed/blocked outcome; completed tasks pass
+   through harness verification before they are certified.
 
 Prefer read-only inspection. Do not attempt to read or exfiltrate secrets.
-Do not write outside allowed_paths without mutate_system approval. Confirm
-task completion only after verification passes.`
+Do not read process arguments or environments for host RAM queries.
+Do not write outside allowed_paths without mutate_system approval. Report
+unverified completion and blocked outcomes as such.`
 }
 
 // WithSignalCancellation returns a context cancelled on SIGINT / SIGTERM,

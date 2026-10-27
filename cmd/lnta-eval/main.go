@@ -213,11 +213,11 @@ Categories=Utility;
 			"path": target, "content": desktop, "reason": "create valid desktop launcher", "mode": "0644",
 		}))},
 		{toolCallResponse("complete_task", buildArgs(map[string]any{
-			"summary": "created valid .desktop launcher", "target_artifacts": target,
+			"outcome": "completed", "summary": "created valid .desktop launcher", "target_artifacts": target,
 			"verification_notes": "native Exec check + desktop-file-validate passed",
 		}))},
 	}, true, false, false, func(result string) bool {
-		return strings.Contains(result, "TASK_COMPLETE")
+		return strings.HasPrefix(result, "TASK_COMPLETE:")
 	}
 }
 
@@ -233,7 +233,7 @@ Type=Application
 			"path": target, "content": desktop, "reason": "desktop with missing exec",
 		}))},
 		{toolCallResponse("complete_task", buildArgs(map[string]any{
-			"summary": "attempted broken launcher", "target_artifacts": target,
+			"outcome": "completed", "summary": "attempted broken launcher", "target_artifacts": target,
 			"verification_notes": "expect native Exec verification to fail gracefully",
 		}))},
 		{textResponse("Verification failed: Exec binary /nonexistent/bin/does-not-exist not found in PATH")},
@@ -268,18 +268,18 @@ Type=Application
 			"path": target, "content": malformed, "reason": "malformed content",
 		}))},
 		{toolCallResponse("complete_task", buildArgs(map[string]any{
-			"summary": "malformed attempt", "target_artifacts": target,
+			"outcome": "completed", "summary": "malformed attempt", "target_artifacts": target,
 			"verification_notes": "expect verification to fail",
 		}))},
 		{toolCallResponse("write_scoped_file", buildArgs(map[string]any{
 			"path": target, "content": corrected, "reason": "corrected desktop launcher",
 		}))},
 		{toolCallResponse("complete_task", buildArgs(map[string]any{
-			"summary": "recovered with valid launcher", "target_artifacts": target,
+			"outcome": "completed", "summary": "recovered with valid launcher", "target_artifacts": target,
 			"verification_notes": "native Exec check + desktop-file-validate passed",
 		}))},
 	}, true, false, false, func(result string) bool {
-		return strings.Contains(result, "TASK_COMPLETE")
+		return strings.HasPrefix(result, "TASK_COMPLETE:")
 	}
 }
 
@@ -294,7 +294,7 @@ func scenarioExplainMode(tmpDir string) ([][]openai.ChatCompletionStreamResponse
 			"path": target, "content": "[Desktop Entry]\n", "reason": "should be unavailable in explain mode",
 		}))},
 		{toolCallResponse("complete_task", buildArgs(map[string]any{
-			"summary": "explain mode: no mutation", "target_artifacts": target,
+			"outcome": "completed", "summary": "explain mode: no mutation", "target_artifacts": target,
 			"verification_notes": "write tool removed; no state changed",
 		}))},
 	}, true, true, false, func(result string) bool {
@@ -315,7 +315,7 @@ Type=Application
 			"path": target, "content": desktop, "reason": "dry-run preview only",
 		}))},
 		{toolCallResponse("complete_task", buildArgs(map[string]any{
-			"summary": "dry-run preview", "target_artifacts": target,
+			"outcome": "completed", "summary": "dry-run preview", "target_artifacts": target,
 			"verification_notes": "no file actually written",
 		}))},
 	}, true, false, true, func(result string) bool {

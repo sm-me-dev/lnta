@@ -1,5 +1,24 @@
 # Release Notes
 
+## v0.1.6 — 2026-10-27
+
+### Diagnostics and outcomes
+
+- Add a typed host RAM query backed by `/proc/meminfo` and `/proc/<pid>/stat`, reporting process RSS and grouped totals without reading process arguments or environments.
+- Stop on unrecoverable or repeated inspection failures with an actionable blocked result; record blocked, completed, and completed-unverified outcomes distinctly in receipts, audit summaries, and exit codes.
+- Keep unverified completion from claiming that the verification gate passed.
+
+### Interactive experience
+
+- Replace token-scanned chat input with an editable prompt that supports full-line text, cursor navigation, pasted prompts, and in-session prompt history.
+- Retain bounded user/assistant context across chat prompts, add `/reset`, and keep each prompt's routing and verification run independent.
+- Bind `Ctrl+X`, then `Ctrl+G` to the existing `lnta_fix` function in Zsh, Bash, and Fish while retaining `Ctrl+G` command conversion.
+
+### Validation
+
+- Add coverage for synthetic `/proc` data, project symlink refusal, blocked-run handling, chat editing and history, outcome receipts, and all shell bindings.
+- Run the full test suite, race tests, build, vet, and configured lint checks.
+
 ## v0.1.5 — 2026-10-26
 
 ### Fixes
