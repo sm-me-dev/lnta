@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,15 +16,17 @@ func TestProcessLifecycleDetailsAreBoundedAndPrivate(t *testing.T) {
 	started := time.Now().Add(-23 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	start := processStartDetails("mutate_system", 1234)
-	complete := processCompletionDetails("mutate_system", "1234", started, ctx, 0, 15, 7)
-	for key, want := range map[string]string{"role": "mutate_system", "pid": "1234", "pgid": "1234"} {
+	pid := int(^uint(0) >> 1) // Outside the kernel PID range, regardless of CI runner processes.
+	pidText := strconv.Itoa(pid)
+	start := processStartDetails("mutate_system", pid)
+	complete := processCompletionDetails("mutate_system", pidText, started, ctx, 0, 15, 7)
+	for key, want := range map[string]string{"role": "mutate_system", "pid": pidText, "pgid": pidText} {
 		if start[key] != want {
 			t.Errorf("start details[%q]=%q want %q", key, start[key], want)
 		}
 	}
 	for key, want := range map[string]string{
-		"role": "mutate_system", "pid": "1234", "pgid": "1234", "exit_status": "0",
+		"role": "mutate_system", "pid": pidText, "pgid": pidText, "exit_status": "0",
 		"canceled": "false", "timed_out": "false", "stdout_bytes": "15", "stderr_bytes": "7",
 		"termination_reason": "completed", "cleanup_status": "not_recorded",
 	} {
