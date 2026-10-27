@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -18,9 +19,12 @@ import (
 )
 
 type failingReadExecutor struct {
-	result sandbox.CommandResult
-	err    error
-	calls  int
+	result      sandbox.CommandResult
+	err         error
+	calls       int
+	hostCalls   int
+	hostCommand string
+	hostCWD     string
 }
 
 func (e *failingReadExecutor) RunReadOnly(context.Context, string, string, string, time.Duration) (sandbox.CommandResult, error) {
@@ -29,6 +33,12 @@ func (e *failingReadExecutor) RunReadOnly(context.Context, string, string, strin
 }
 func (e *failingReadExecutor) RunReadOnlyEnv(ctx context.Context, command, root, cwd string, timeout time.Duration, _ []string) (sandbox.CommandResult, error) {
 	return e.RunReadOnly(ctx, command, root, cwd, timeout)
+}
+func (e *failingReadExecutor) RunReadOnlyHost(_ context.Context, command, cwd string, _ time.Duration) (sandbox.CommandResult, error) {
+	e.hostCalls++
+	e.hostCommand = command
+	e.hostCWD = cwd
+	return e.result, e.err
 }
 func (*failingReadExecutor) ReadFile(context.Context, string) ([]byte, os.FileInfo, error) {
 	return nil, nil, errors.New("not implemented")
@@ -44,6 +54,63 @@ func (*failingReadExecutor) TargetID() string                                { r
 func (*failingReadExecutor) IsRemote() bool                                  { return false }
 func (*failingReadExecutor) RemoteFingerprint() *transport.RemoteFingerprint { return nil }
 func (*failingReadExecutor) Preflight(context.Context) error                 { return nil }
+
+func TestHostCommandInspectionSkipsProjectExecutorAndUsesTargetedHostPath(t *testing.T) {
+	executor := &failingReadExecutor{result: sandbox.CommandResult{
+		Stdout: "\n/home/test/.agents/skills/example/SKILL.md\n", ExitCode: 0,
+	}}
+	result, err := inspectSystem(context.Background(), mustMarshal(map[string]any{
+		"scope": "host", "command": "find ~/.agents/skills -maxdepth 3 -name SKILL.md -print",
+		"cwd": "/home/test", "reason": "locate agent skills",
+	}), ToolDeps{Executor: executor, ProjectRoot: "/project/with/symlink", CWD: "/project"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "example/SKILL.md") {
+		t.Fatalf("host inspection result = %q", result)
+	}
+	if executor.hostCalls != 1 || executor.calls != 0 {
+		t.Fatalf("host calls=%d project calls=%d; want host-only execution", executor.hostCalls, executor.calls)
+	}
+	if executor.hostCommand != "find ~/.agents/skills -maxdepth 3 -name SKILL.md -print" || executor.hostCWD != "/home/test" {
+		t.Fatalf("host command/cwd = %q/%q", executor.hostCommand, executor.hostCWD)
+	}
+}
+
+func TestInspectToolArgsAllowCommandHostOrTypedRAM(t *testing.T) {
+	for name, args := range map[string]string{
+		"targeted host command": `{"scope":"host","command":"find ~/.agents/skills -maxdepth 2 -type f","cwd":"/home/test"}`,
+		"typed host RAM":        `{"scope":"host","query":"ram"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := decodeToolArgs("inspect_system", args); err != nil {
+				t.Fatalf("decodeToolArgs rejected valid host inspection: %v", err)
+			}
+		})
+	}
+	for _, args := range []string{
+		`{"scope":"host"}`,
+		`{"scope":"host","query":"ram","command":"ps"}`,
+	} {
+		if err := decodeToolArgs("inspect_system", args); err == nil {
+			t.Errorf("decodeToolArgs accepted invalid host inspection %s", args)
+		}
+	}
+}
+
+func TestInspectSystemSchemaDoesNotRequireACommandForHostRAM(t *testing.T) {
+	var schema struct {
+		Required []string `json:"required"`
+	}
+	if err := json.Unmarshal(CoreTools()[0].Parameters, &schema); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range schema.Required {
+		if field == "command" {
+			t.Fatal("inspect_system schema still requires a command, preventing typed host RAM queries")
+		}
+	}
+}
 
 func outcomeTestRouter(t *testing.T, dir, id, trigger string) *packs.Router {
 	t.Helper()

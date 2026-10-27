@@ -152,6 +152,12 @@ func (e *SSHExecutor) RunReadOnly(ctx context.Context, cmdStr string, projectRoo
 	return e.RunReadOnlyEnv(ctx, cmdStr, projectRoot, cwd, timeout, nil)
 }
 
+// RunReadOnlyHost runs a targeted command against the remote host using its
+// existing read-only Bubblewrap execution path, independent of the local tree.
+func (e *SSHExecutor) RunReadOnlyHost(ctx context.Context, cmdStr, cwd string, timeout time.Duration) (sandbox.CommandResult, error) {
+	return e.RunReadOnlyEnv(ctx, cmdStr, "", cwd, timeout, nil)
+}
+
 func (e *SSHExecutor) RunReadOnlyEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error) {
 	_ = projectRoot // project paths are local; remote execution is rooted by its remote CWD.
 	if e.fingerprint == nil || !e.fingerprint.HasBwrap {

@@ -1,5 +1,17 @@
 # Release Notes
 
+## v0.1.7 — 2026-10-27
+
+### Host diagnostics
+
+- Allow targeted host read-only commands to run in the sandbox without doing a project-tree or home-directory scan.
+- Keep project inspection fail-closed and retain the typed `/proc` RAM report, which reads process names and RSS without reading process arguments or environments.
+- Correct the `inspect_system` schema so a host query can use either a targeted command or the typed RAM query without the command/query mismatch.
+
+### Validation
+
+- Add regression coverage for host command routing, host tool argument validation, and project symlink refusal.
+
 ## v0.1.6 — 2026-10-27
 
 ### Diagnostics and outcomes

@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,6 +55,39 @@ func TestProjectSecretScanCoversIgnoredDirectoriesAndBothBackends(t *testing.T) 
 		if containsPath(cfg.ROFiles, secret) || containsPath(cfg.RODirs, secret) {
 			t.Errorf("Landlock grants credential path %q", secret)
 		}
+	}
+}
+
+func TestHostBwrapArgsSkipProjectScanButKeepHostSecretMasks(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "unsafe-link")); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.Mkdir(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	args, err := bwrapArgs(home, "", root, nil)
+	if err != nil {
+		t.Fatalf("host sandbox argument construction scanned the project tree: %v", err)
+	}
+	if !hasArgSequence(args, "--tmpfs", sshDir) {
+		t.Fatalf("host sandbox did not retain the standard home credential mask: %v", args)
+	}
+	cfg, err := buildLandlockConfig("", root, home, t.TempDir(), "true", nil)
+	if err != nil {
+		t.Fatalf("host Landlock configuration scanned the project tree: %v", err)
+	}
+	if !containsPath(cfg.RODirs, root) {
+		t.Fatalf("host Landlock configuration did not allow the selected working directory: %v", cfg.RODirs)
+	}
+	if _, err := bwrapArgs(home, root, root, nil); !errors.Is(err, ErrSecretScanIncomplete) {
+		t.Fatalf("project sandbox did not retain fail-closed symlink handling: %v", err)
+	}
+	if _, err := buildLandlockConfig(root, root, home, t.TempDir(), "true", nil); !errors.Is(err, ErrSecretScanIncomplete) {
+		t.Fatalf("project Landlock configuration did not retain fail-closed symlink handling: %v", err)
 	}
 }
 

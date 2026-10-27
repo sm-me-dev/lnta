@@ -794,8 +794,15 @@ func decodeToolArgs(name, raw string) error {
 				return fmt.Errorf("inspect_system project scope requires command")
 			}
 		case "host":
-			if args.Query != "ram" || args.Command != "" || args.Cmd != "" {
-				return fmt.Errorf("inspect_system host scope requires query=ram and does not accept command")
+			hasCommand := args.Command != "" || args.Cmd != ""
+			if args.Query == "ram" && hasCommand {
+				return fmt.Errorf("inspect_system host RAM query does not accept a command")
+			}
+			if args.Query != "" && args.Query != "ram" {
+				return fmt.Errorf("inspect_system has unsupported host query %q", args.Query)
+			}
+			if args.Query == "" && !hasCommand {
+				return fmt.Errorf("inspect_system host scope requires a targeted command or query=ram")
 			}
 		default:
 			return fmt.Errorf("inspect_system has unsupported scope %q", args.Scope)
@@ -902,7 +909,7 @@ func buildSystemPrompt(sysCtx fingerprint.SystemContext, pack packs.Pack, contex
 	}
 	b.WriteString("## Tool Rules\n")
 	b.WriteString("- Never run raw bash. Use inspect_system for read-only inspection.\n")
-	b.WriteString("- Use inspect_system scope=project with a full executable command for project inspection. Use scope=host query=ram for host RAM and process RSS diagnostics; this reads only /proc/meminfo and /proc/<pid>/stat, never arguments or environments.\n")
+	b.WriteString("- Use inspect_system scope=project with a full executable command for paths inside the active project. Use scope=host for paths outside the project and provide a specific read-only command that inspects only locations relevant to the request; do not crawl unrelated directories. Use scope=host query=ram with no command for host RAM and process RSS diagnostics; this reads only /proc/meminfo and /proc/<pid>/stat, never arguments or environments.\n")
 	b.WriteString("- If inspection returns INSPECT_BLOCKED, stop and call complete_task with outcome=blocked; do not retry or fall back to mutate_system.\n")
 	b.WriteString("- Use write_scoped_file for any file write within allowed_paths.\n")
 	b.WriteString("- Use mutate_system only for out-of-scope writes or host mutations, and only after user approval.\n")
@@ -917,15 +924,18 @@ func baseSafetyPolicy() string {
 You are LNTA, a Linux Natural-Language Terminal Assistant. You never receive a
 raw, unrestricted shell. All actions go through four strictly typed tools:
 
-1. inspect_system — read-only project commands in the sandbox, or a typed host
-   RAM query that reads /proc/meminfo and /proc/<pid>/stat only.
+1. inspect_system — read-only project commands in the project sandbox, targeted
+   host commands in a read-only host sandbox, or a typed RAM query that reads
+   /proc/meminfo and /proc/<pid>/stat only.
 2. write_scoped_file — atomic, scope-checked file writes (allowed_paths only).
 3. mutate_system — host mutations, gated behind explicit user approval.
 4. complete_task — explicit completed/blocked outcome; completed tasks pass
    through harness verification before they are certified.
 
-Prefer read-only inspection. Do not attempt to read or exfiltrate secrets.
-Do not read process arguments or environments for host RAM queries.
+Prefer read-only inspection. Use host scope for paths outside the active
+project. For host queries, choose commands and paths that answer the request
+without crawling unrelated directories. Do not attempt to read or exfiltrate
+secrets. Do not read process arguments or environments for host RAM queries.
 Do not write outside allowed_paths without mutate_system approval. Report
 unverified completion and blocked outcomes as such.`
 }

@@ -395,9 +395,13 @@ func resolveProjectAndCWD(projectRoot, cwd string) (string, string, error) {
 // without the trailing command). Project credential masking is rooted at
 // projectRoot; cwd remains the command's working directory.
 func bwrapArgs(home, projectRoot, cwd string, extraEnv []string) ([]string, error) {
-	projectSecrets, err := maskProjectSecrets(projectRoot)
-	if err != nil {
-		return nil, err
+	var projectSecrets []string
+	if projectRoot != "" {
+		var err error
+		projectSecrets, err = maskProjectSecrets(projectRoot)
+		if err != nil {
+			return nil, err
+		}
 	}
 	args := []string{
 		"--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-net",
@@ -493,7 +497,12 @@ func runBwrapEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, ti
 	if err != nil {
 		return res, ErrBwrapNotFound
 	}
-	absRoot, absCwd, err := resolveProjectAndCWD(projectRoot, cwd)
+	var absRoot, absCwd string
+	if projectRoot == "" {
+		absCwd, err = resolveCWD(cwd)
+	} else {
+		absRoot, absCwd, err = resolveProjectAndCWD(projectRoot, cwd)
+	}
 	if err != nil {
 		return res, err
 	}
@@ -635,6 +644,24 @@ func RunReadOnlyProjectEnv(ctx context.Context, cmdStr, projectRoot, cwd string,
 		return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v", ErrBwrapNotFound, landlockErr)
 	}
 	return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v", probeErr, landlockErr)
+}
+
+// RunReadOnlyHost runs a targeted host command in the read-only sandbox without
+// invoking the project credential scanner. Host commands still inherit the
+// standard home secret masks, network isolation, and output/time limits.
+func RunReadOnlyHost(ctx context.Context, cmdStr, cwd string, timeout time.Duration) (CommandResult, error) {
+	probeErr := probeBwrap()
+	if probeErr == nil {
+		return runBwrapEnv(ctx, cmdStr, "", cwd, timeout, nil)
+	}
+	landlockErr := LandlockProbe()
+	if landlockErr == nil {
+		return runLandlockProjectEnv(ctx, cmdStr, "", cwd, timeout, nil)
+	}
+	if errors.Is(probeErr, ErrBwrapNotFound) {
+		return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v; no command was run", ErrBwrapNotFound, landlockErr)
+	}
+	return CommandResult{}, fmt.Errorf("%w; Landlock also unavailable: %v; no command was run", probeErr, landlockErr)
 }
 
 // expandPath replaces a leading ~ with the HOME directory.

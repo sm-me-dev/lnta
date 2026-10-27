@@ -49,6 +49,12 @@ func (e *LocalExecutor) RunReadOnly(ctx context.Context, cmdStr string, projectR
 	return e.RunReadOnlyEnv(ctx, cmdStr, projectRoot, cwd, timeout, nil)
 }
 
+// RunReadOnlyHost executes a targeted host query without scanning the project
+// tree. The sandbox still mounts the host read-only and masks standard secrets.
+func (e *LocalExecutor) RunReadOnlyHost(ctx context.Context, cmdStr, cwd string, timeout time.Duration) (sandbox.CommandResult, error) {
+	return sandbox.RunReadOnlyHost(ctx, cmdStr, cwd, timeout)
+}
+
 func (e *LocalExecutor) RunReadOnlyEnv(ctx context.Context, cmdStr string, projectRoot, cwd string, timeout time.Duration, extraEnv []string) (sandbox.CommandResult, error) {
 	if projectRoot != "" && projectRoot != e.projectRoot {
 		return sandbox.CommandResult{}, fmt.Errorf("requested project root %q does not match launch-time root %q", projectRoot, e.projectRoot)

@@ -47,6 +47,12 @@ type TargetExecutor interface {
 	Preflight(ctx context.Context) error
 }
 
+// HostCommandExecutor is implemented by targets that can run a targeted host
+// command in a read-only sandbox without using the local project boundary.
+type HostCommandExecutor interface {
+	RunReadOnlyHost(ctx context.Context, cmdStr, cwd string, timeout time.Duration) (sandbox.CommandResult, error)
+}
+
 // RemoteFingerprint captures remote host identity for display/validation.
 type RemoteFingerprint struct {
 	Host            string            // user@host:port

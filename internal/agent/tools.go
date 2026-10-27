@@ -85,17 +85,17 @@ func CoreTools() []Tool {
 	return []Tool{
 		{
 			Name:        "inspect_system",
-			Description: "Read-only inspection. Use scope=project with a full shell command for project inspection, or scope=host with query=ram for typed RAM/process RSS diagnostics from /proc. Host queries never run shell commands and never read process arguments or environments. Project inspection remains sandboxed and fails closed if the project scan is incomplete.",
+			Description: "Read-only inspection. Use scope=project with a full shell command for paths inside the active project. Use scope=host for requested paths outside the project, with a specific read-only shell command that checks only locations relevant to the request instead of crawling unrelated directories. For RAM/process RSS diagnostics, use scope=host with query=ram and no command; this typed query reads /proc/meminfo and /proc/<pid>/stat only, never process arguments or environments. Host commands run in a read-only sandbox without scanning the project tree. Project inspection remains sandboxed and fails closed if the project scan is incomplete.",
 			Parameters: jsonSchema(`{
 				"type": "object",
 				"properties": {
 					"scope": {"type": "string", "enum": ["project", "host"], "description": "Inspection boundary. Defaults to project for compatibility."},
-					"query": {"type": "string", "enum": ["ram"], "description": "Typed host query. Required when scope is host."},
-					"command": {"type": "string", "description": "The shell command to execute (read-only), run via sh -c inside the sandbox."},
-					"cwd": {"type": "string", "description": "Working directory for the command."},
+					"query": {"type": "string", "enum": ["ram"], "description": "Typed host RAM query. Use only with scope=host and omit command."},
+					"command": {"type": "string", "description": "A specific read-only shell command. Required for project inspection and host inspection except the typed host RAM query."},
+					"cwd": {"type": "string", "description": "Working directory for a command. For host scope, use the narrowest relevant existing directory."},
 					"reason": {"type": "string", "description": "Why this inspection is needed."}
 				},
-				"required": ["command", "cwd", "reason"],
+				"required": ["scope"],
 				"additionalProperties": false
 			}`),
 			Func: inspectSystem,
@@ -184,26 +184,69 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 		in.Scope = "project"
 	}
 	if in.Scope == "host" {
-		if in.Query != "ram" {
-			return "", fmt.Errorf("inspect_system: host scope requires query=ram")
+		if in.Query == "ram" {
+			if in.Command != "" || in.Cmd != "" {
+				return "", fmt.Errorf("inspect_system: host RAM query does not accept a command")
+			}
+			if deps.Executor != nil && deps.Executor.IsRemote() {
+				return "INSPECT_BLOCKED: host RAM collection is available only for the local host. No command was run. Use project scope for the remote target or reconnect locally.", nil
+			}
+			result, err := collectHostMemory("/proc")
+			if err != nil {
+				return fmt.Sprintf("INSPECT_BLOCKED: host RAM inspection could not read a complete /proc snapshot (%v). No process was changed. Resolve /proc access or use another read-only diagnostic.", err), nil
+			}
+			if deps.RunCollector != nil {
+				deps.RunCollector.RecordCommand(audit.CommandRecord{
+					Command: "host RAM query", ExitCode: 0, Stdout: result,
+					Timestamp: time.Now().UTC(), Source: "inspect_system",
+				})
+			}
+			return result, nil
 		}
-		if in.Command != "" || in.Cmd != "" {
-			return "", fmt.Errorf("inspect_system: host scope does not accept shell commands")
+		if in.Query != "" {
+			return "", fmt.Errorf("inspect_system: unsupported host query %q", in.Query)
 		}
-		if deps.Executor != nil && deps.Executor.IsRemote() {
-			return "INSPECT_BLOCKED: host RAM collection is available only for the local host. No command was run. Use project scope for the remote target or reconnect locally.", nil
+		if in.Command == "" {
+			return "", fmt.Errorf("inspect_system: host scope requires a targeted read-only command or query=ram")
 		}
-		result, err := collectHostMemory("/proc")
-		if err != nil {
-			return fmt.Sprintf("INSPECT_BLOCKED: host RAM inspection could not read a complete /proc snapshot (%v). No process was changed. Resolve /proc access or use another read-only diagnostic.", err), nil
+		if in.CWD == "" {
+			in.CWD = deps.CWD
+		}
+		hostExecutor, ok := deps.Executor.(interface {
+			RunReadOnlyHost(context.Context, string, string, time.Duration) (sandbox.CommandResult, error)
+		})
+		if !ok {
+			return "INSPECT_BLOCKED: this executor does not support sandboxed host inspection. No command was run.", nil
+		}
+		res, err := hostExecutor.RunReadOnlyHost(ctx, in.Command, in.CWD, 0)
+		if err != nil || res.ExitCode != 0 {
+			errMsg := ""
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				errMsg = fmt.Sprintf("exit status %d", res.ExitCode)
+			}
+			var commandExit *exec.ExitError
+			failureText := strings.ToLower(errMsg + "\n" + res.Stderr)
+			sandboxFailure := strings.Contains(failureText, "bwrap") || strings.Contains(failureText, "bubblewrap") || strings.Contains(failureText, "sandbox")
+			if sandboxFailure || (err != nil && !errors.As(err, &commandExit) && ctx.Err() == nil) {
+				return fmt.Sprintf("INSPECT_BLOCKED: host inspection could not start its read-only sandbox (%s). No command was run. Check Bubblewrap availability and retry with a targeted command.", errMsg), nil
+			}
+			return fmt.Sprintf("TOOL_ERROR: host inspection command %q failed (%s)\nstderr: %s", in.Command, errMsg, res.Stderr), nil
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "scope=host exit_code=%d duration=%s\n", res.ExitCode, res.Duration)
+		b.WriteString(res.Stdout)
+		if res.Truncated {
+			b.WriteString("\n[output truncated]")
 		}
 		if deps.RunCollector != nil {
 			deps.RunCollector.RecordCommand(audit.CommandRecord{
-				Command: "host RAM query", ExitCode: 0, Stdout: result,
-				Timestamp: time.Now().UTC(), Source: "inspect_system",
+				Command: in.Command, ExitCode: res.ExitCode,
+				Stdout: res.Stdout, Stderr: res.Stderr, Timestamp: time.Now().UTC(), Source: "inspect_system",
 			})
 		}
-		return result, nil
+		return b.String(), nil
 	}
 	if in.Scope != "project" {
 		return "", fmt.Errorf("inspect_system: unsupported scope %q", in.Scope)
@@ -227,7 +270,7 @@ func inspectSystem(ctx context.Context, args json.RawMessage, deps ToolDeps) (st
 		sandboxFailure := strings.Contains(failureText, "bwrap") || strings.Contains(failureText, "bubblewrap") ||
 			strings.Contains(failureText, "landlock") || strings.Contains(failureText, "sandbox refused")
 		if errors.Is(err, sandbox.ErrSecretScanIncomplete) || sandboxFailure || (err != nil && !errors.As(err, &commandExit) && ctx.Err() == nil) {
-			return fmt.Sprintf("INSPECT_BLOCKED: project inspection could not complete its fail-closed sandbox setup (%s). No command was run. Remove or resolve the unsafe project entry, or use scope=host query=ram for host memory diagnostics.", errMsg), nil
+			return fmt.Sprintf("INSPECT_BLOCKED: project inspection could not complete its fail-closed sandbox setup (%s). No command was run. Remove or resolve the unsafe project entry, or use scope=host for a targeted host query that does not need project files.", errMsg), nil
 		}
 		return fmt.Sprintf("TOOL_ERROR: inspect_system failed for command %q (%s)\nstderr: %s\nHint: 'command' must be a full executable shell command (e.g. 'ss -tulpn', 'ps aux', 'lsof -i'), not an argument.", in.Command, errMsg, res.Stderr), nil
 	}

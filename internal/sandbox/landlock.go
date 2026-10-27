@@ -324,9 +324,13 @@ func buildLandlockConfig(projectRoot, cwd, home, tmp, cmdStr string, extraEnv []
 			deny[f] = true
 		}
 	}
-	projectSecrets, err := maskProjectSecrets(projectRoot)
-	if err != nil {
-		return landlockConfig{}, err
+	var projectSecrets []string
+	if projectRoot != "" {
+		secrets, err := maskProjectSecrets(projectRoot)
+		if err != nil {
+			return landlockConfig{}, err
+		}
+		projectSecrets = secrets
 	}
 	for _, f := range projectSecrets {
 		deny[f] = true
@@ -352,6 +356,18 @@ func buildLandlockConfig(projectRoot, cwd, home, tmp, cmdStr string, extraEnv []
 		}
 		if !covered {
 			roots = append(roots, projectRoot)
+		}
+	}
+	if projectRoot == "" && cwd != "" {
+		covered := false
+		for _, root := range roots {
+			if pathWithin(cwd, root) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			roots = append(roots, cwd)
 		}
 	}
 	seenRoots := make(map[string]bool, len(roots))
@@ -516,7 +532,13 @@ func runLandlockProjectEnv(ctx context.Context, cmdStr, projectRoot, cwd string,
 		}
 	}
 
-	absRoot, absCwd, err := resolveProjectAndCWD(projectRoot, cwd)
+	var absRoot, absCwd string
+	var err error
+	if projectRoot == "" {
+		absCwd, err = resolveCWD(cwd)
+	} else {
+		absRoot, absCwd, err = resolveProjectAndCWD(projectRoot, cwd)
+	}
 	if err != nil {
 		return res, err
 	}
