@@ -6,7 +6,7 @@
   <a href="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu"><img src="https://img.shields.io/badge/Ubuntu%2024.04%2F26.04-AppArmor%20Ready-brightgreen?logo=ubuntu" alt="Ubuntu 24.04/26.04 AppArmor Ready"></a>
   <a href="https://img.shields.io/badge/Go-1.27.2+-00ADD8?logo=go&logoColor=white"><img src="https://img.shields.io/badge/Go-1.27.2+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
-  <a href="https://m8ven.ai/mcp/sm-me-dev-lnta-1kw54a?s=readme"><img src="https://m8ven.ai/badge/mcp/sm-me-dev-lnta-1kw54a?v=e8456d5b9e01ccdc9bb18d58ef09fd15" alt="M8ven Score"></a>
+  <a href="https://m8ven.ai/mcp/sm-me-dev-lnta-1kw54a?s=readme"><img src="https://m8ven.ai/badge/mcp/sm-me-dev-lnta-1kw54a?variant=verified" alt="M8ven Badge"></a>
 </p>
 
 <p align="center">
